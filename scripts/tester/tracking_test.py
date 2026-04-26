@@ -49,7 +49,7 @@ UPPER_RED_1 = np.array([10, 255, 255], dtype=np.uint8)
 LOWER_RED_2 = np.array([170, 120, 70], dtype=np.uint8)
 UPPER_RED_2 = np.array([180, 255, 255], dtype=np.uint8)
 
-MIN_CONTOUR_AREA = 500
+MIN_CONTOUR_AREA = 800
 POINT_CLOUD_RADIUS = 2
 
 

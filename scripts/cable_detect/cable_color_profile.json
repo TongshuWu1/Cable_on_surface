@@ -1,0 +1,276 @@
+{
+  "profile_type": "multi_image_multi_sample_hsv",
+  "version": 3,
+  "created_at": "2026-04-26 16:17:33",
+  "camera_resolution": "HD2K",
+  "camera_fps": 15,
+  "camera_settings": {
+    "brightness": 4,
+    "contrast": 4,
+    "hue": 0,
+    "saturation": 4,
+    "sharpness": 4,
+    "gamma": 5,
+    "auto_white_balance": true,
+    "auto_exposure": true
+  },
+  "captured_images": [
+    {
+      "path": "calibration_images/cable_calib_20260426_160917_000.png",
+      "created_at": "2026-04-26 16:09:17"
+    },
+    {
+      "path": "calibration_images/cable_calib_20260426_161122_001.png",
+      "created_at": "2026-04-26 16:11:22"
+    }
+  ],
+  "num_samples": 3,
+  "samples": [
+    {
+      "created_at": "2026-04-26 16:10:15",
+      "source_name": "captured_image_1",
+      "source_path": "calibration_images/cable_calib_20260426_160917_000.png",
+      "roi_xywh": [
+        1717,
+        767,
+        9,
+        59
+      ],
+      "num_pixels_used": 301,
+      "rgb_median": [
+        244,
+        97,
+        5
+      ],
+      "rgb_std": [
+        11.742740631103516,
+        9.669107437133789,
+        2.195161819458008
+      ],
+      "hsv_median": [
+        11.362156867980957,
+        249.0,
+        244.0
+      ],
+      "hsv_std": [
+        0.3367323875427246,
+        2.2256557941436768,
+        11.742741584777832
+      ],
+      "hsv_percentile_10": [
+        10.0,
+        247.0,
+        222.0
+      ],
+      "hsv_percentile_90": [
+        12.0,
+        253.0,
+        250.0
+      ],
+      "hsv_margin": [
+        8,
+        60,
+        65
+      ],
+      "hsv_ranges": [
+        {
+          "lower": [
+            3,
+            189,
+            179
+          ],
+          "upper": [
+            19,
+            255,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "created_at": "2026-04-26 16:10:44",
+      "source_name": "captured_image_1",
+      "source_path": "calibration_images/cable_calib_20260426_160917_000.png",
+      "roi_xywh": [
+        1307,
+        512,
+        10,
+        44
+      ],
+      "num_pixels_used": 243,
+      "rgb_median": [
+        211,
+        82,
+        13
+      ],
+      "rgb_std": [
+        17.030227661132812,
+        9.952945709228516,
+        7.082362651824951
+      ],
+      "hsv_median": [
+        10.679045677185059,
+        238.0,
+        211.0
+      ],
+      "hsv_std": [
+        0.5544962882995605,
+        9.08338451385498,
+        17.030227661132812
+      ],
+      "hsv_percentile_10": [
+        10.0,
+        225.0,
+        178.1999969482422
+      ],
+      "hsv_percentile_90": [
+        12.0,
+        250.0,
+        224.0
+      ],
+      "hsv_margin": [
+        8,
+        60,
+        65
+      ],
+      "hsv_ranges": [
+        {
+          "lower": [
+            3,
+            178,
+            146
+          ],
+          "upper": [
+            19,
+            255,
+            255
+          ]
+        }
+      ]
+    },
+    {
+      "created_at": "2026-04-26 16:10:55",
+      "source_name": "captured_image_1",
+      "source_path": "calibration_images/cable_calib_20260426_160917_000.png",
+      "roi_xywh": [
+        1656,
+        71,
+        12,
+        26
+      ],
+      "num_pixels_used": 176,
+      "rgb_median": [
+        163,
+        60,
+        8
+      ],
+      "rgb_std": [
+        21.493450164794922,
+        9.911684036254883,
+        3.3031601905822754
+      ],
+      "hsv_median": [
+        10.062508583068848,
+        243.0,
+        163.0
+      ],
+      "hsv_std": [
+        0.4848054051399231,
+        4.821955680847168,
+        21.493452072143555
+      ],
+      "hsv_percentile_10": [
+        9.0,
+        239.0,
+        136.0
+      ],
+      "hsv_percentile_90": [
+        11.0,
+        252.0,
+        193.0
+      ],
+      "hsv_margin": [
+        8,
+        60,
+        65
+      ],
+      "hsv_ranges": [
+        {
+          "lower": [
+            2,
+            183,
+            98
+          ],
+          "upper": [
+            18,
+            255,
+            228
+          ]
+        }
+      ]
+    }
+  ],
+  "hsv_ranges": [
+    {
+      "lower": [
+        3,
+        189,
+        179
+      ],
+      "upper": [
+        19,
+        255,
+        255
+      ]
+    },
+    {
+      "lower": [
+        3,
+        178,
+        146
+      ],
+      "upper": [
+        19,
+        255,
+        255
+      ]
+    },
+    {
+      "lower": [
+        2,
+        183,
+        98
+      ],
+      "upper": [
+        18,
+        255,
+        228
+      ]
+    }
+  ],
+  "imported_ranges": [],
+  "notes": [
+    "This is a multi-image, multi-sample HSV cable profile.",
+    "Each selected cable ROI contributes one or more HSV ranges.",
+    "The detector can OR all hsv_ranges together.",
+    "OpenCV HSV uses H in [0, 179], S/V in [0, 255].",
+    "ZED image conversion should use BGRA2BGR."
+  ],
+  "summary": {
+    "hsv_median_mean": [
+      10.701236724853516,
+      243.3333282470703,
+      206.0
+    ],
+    "hsv_median_min": [
+      10.062508583068848,
+      238.0,
+      163.0
+    ],
+    "hsv_median_max": [
+      11.362156867980957,
+      249.0,
+      244.0
+    ]
+  }
+}
