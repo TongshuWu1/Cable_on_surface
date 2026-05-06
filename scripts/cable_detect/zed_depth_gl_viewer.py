@@ -1,0 +1,903 @@
+import ctypes
+from threading import Lock
+
+import numpy as np
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from OpenGL.GLUT import *
+
+
+_GLUT_INITIALIZED = False
+
+UI_BG = (0.015, 0.017, 0.020)
+UI_PANEL = (0.035, 0.040, 0.046)
+UI_PANEL_DARK = (0.022, 0.025, 0.030)
+UI_STROKE = (0.110, 0.125, 0.140)
+UI_TEXT = (0.910, 0.940, 0.965)
+UI_MUTED = (0.580, 0.640, 0.700)
+UI_SUBTLE = (0.360, 0.410, 0.465)
+VISIBLE_COLOR = (0.25, 1.00, 0.48)
+EXTENDED_COLOR = (1.00, 0.82, 0.16)
+OCCLUDED_COLOR = (1.00, 0.18, 0.20)
+CABLE_SAMPLE_COLOR = (1.00, 0.58, 0.08)
+
+POINT_VERTEX_SHADER = """
+#version 330 core
+layout(location = 0) in vec3 in_position;
+layout(location = 1) in vec3 in_color;
+uniform mat4 u_mvp;
+uniform float u_point_size;
+out vec3 v_color;
+
+void main() {
+    v_color = in_color;
+    gl_Position = u_mvp * vec4(in_position, 1.0);
+    gl_PointSize = u_point_size;
+}
+"""
+
+POINT_FRAGMENT_SHADER = """
+#version 330 core
+in vec3 v_color;
+out vec4 out_color;
+
+void main() {
+    out_color = vec4(v_color, 1.0);
+}
+"""
+
+
+class ZedDepthGLViewer:
+    """OpenGL UI with a 2D cable debug panel and a 3D ZED point-cloud panel."""
+
+    def __init__(
+        self,
+        width=1400,
+        height=900,
+        title="ZED Depth Point Cloud",
+        window_x=40,
+        window_y=40,
+        left_panel_width=0,
+    ):
+        self.width = int(width)
+        self.height = int(height)
+        self.title = title
+        self.window_x = int(window_x)
+        self.window_y = int(window_y)
+        self.left_panel_width = int(max(0, left_panel_width))
+        self.window_id = None
+        self.available = False
+
+        self.lock = Lock()
+        self.pending_rgb_image = None
+        self.pending_vertices = None
+        self.pending_status = "waiting for frames"
+        self.pending_cable_points = None
+        self.pending_cable_nodes = None
+        self.pending_cable_valid = None
+        self.pending_cable_visible = None
+        self.pending_cable_extended_visible = None
+        self.rgb_image = None
+        self.vertices = np.empty((0, 6), dtype=np.float32)
+        self.vertex_count = 0
+        self.cable_points = np.empty((0, 3), dtype=np.float32)
+        self.cable_nodes = np.empty((0, 3), dtype=np.float32)
+        self.cable_valid = np.empty(0, dtype=bool)
+        self.cable_visible = np.empty(0, dtype=bool)
+        self.cable_extended_visible = np.empty(0, dtype=bool)
+        self.status = "waiting for frames"
+
+        self.vbo = None
+        self.vao = None
+        self.rgb_texture = None
+        self.shader_program = None
+        self.mvp_loc = None
+        self.point_size_loc = None
+        self.view_mode = "camera"
+        self.yaw_deg = 0.0
+        self.pitch_deg = 0.0
+        self.zoom = 1.0
+        self.point_size = 2.0
+        self.fov_y_deg = 70.0
+        self.depth_max_m = 5.0
+
+        self.scene_center = np.array([0.0, 0.0, -2.0], dtype=np.float32)
+        self.scene_radius = 2.0
+        self.has_scene = False
+
+        self.rotating = False
+        self.last_mouse = (0, 0)
+
+    def init(self):
+        global _GLUT_INITIALIZED
+        if not _GLUT_INITIALIZED:
+            glutInit()
+            _GLUT_INITIALIZED = True
+
+        glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
+        glutInitWindowSize(self.width, self.height)
+        glutInitWindowPosition(self.window_x, self.window_y)
+        self.window_id = glutCreateWindow(self.title.encode("utf-8"))
+
+        try:
+            glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_CONTINUE_EXECUTION)
+        except Exception:
+            pass
+
+        glDisable(GL_LIGHTING)
+        self.vbo = glGenBuffers(1)
+        self.rgb_texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.rgb_texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        try:
+            self.vao = glGenVertexArrays(1)
+        except Exception:
+            self.vao = None
+        self.shader_program = self._create_point_shader()
+        if self.shader_program is not None:
+            self.mvp_loc = glGetUniformLocation(self.shader_program, "u_mvp")
+            self.point_size_loc = glGetUniformLocation(self.shader_program, "u_point_size")
+
+        glViewport(0, 0, self.width, self.height)
+        glClearColor(*UI_BG, 1.0)
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+        try:
+            glEnable(GL_PROGRAM_POINT_SIZE)
+        except Exception:
+            pass
+        glEnable(GL_POINT_SMOOTH)
+        glHint(GL_POINT_SMOOTH_HINT, GL_NICEST)
+
+        glutDisplayFunc(self._draw_callback)
+        glutReshapeFunc(self._reshape_callback)
+        glutKeyboardFunc(self._keyboard_callback)
+        glutSpecialFunc(self._special_key_callback)
+        glutMouseFunc(self._mouse_callback)
+        glutMotionFunc(self._motion_callback)
+        try:
+            glutCloseFunc(self._close_callback)
+        except Exception:
+            pass
+
+        self.available = True
+
+    def set_camera_fov(self, fov_y_deg):
+        if fov_y_deg is None:
+            return
+        self.fov_y_deg = float(np.clip(fov_y_deg, 35.0, 100.0))
+
+    def set_depth_max(self, depth_max_m):
+        self.depth_max_m = max(1.0, float(depth_max_m))
+
+    def is_available(self):
+        return self.available
+
+    def poll(self):
+        if not self.available:
+            return False
+        try:
+            glutSetWindow(self.window_id)
+            glutPostRedisplay()
+            glutMainLoopEvent()
+        except Exception:
+            self.available = False
+        return self.available
+
+    def close(self):
+        if not self.available:
+            return
+        self.available = False
+        try:
+            if self.shader_program is not None:
+                glDeleteProgram(self.shader_program)
+                self.shader_program = None
+            if self.vao:
+                glDeleteVertexArrays(1, [self.vao])
+                self.vao = None
+            if self.vbo:
+                glDeleteBuffers(1, [self.vbo])
+                self.vbo = None
+            if self.rgb_texture:
+                glDeleteTextures(1, [self.rgb_texture])
+                self.rgb_texture = None
+            if self.window_id is not None:
+                glutSetWindow(self.window_id)
+                glutDestroyWindow(self.window_id)
+        except Exception:
+            pass
+
+    def update_vertices(self, vertices, status="running"):
+        vertices = np.asarray(vertices, dtype=np.float32)
+        if vertices.ndim != 2 or vertices.shape[1] != 6:
+            vertices = np.empty((0, 6), dtype=np.float32)
+        else:
+            vertices = np.ascontiguousarray(vertices, dtype=np.float32)
+
+        center, radius = self._estimate_scene_bounds(vertices[:, :3])
+        self._smooth_scene_bounds(center, radius)
+
+        with self.lock:
+            self.pending_vertices = vertices
+            self.pending_status = str(status)[:96]
+
+    def update_rgb_image(self, rgb_image):
+        image = np.asarray(rgb_image)
+        if image.ndim != 3 or image.shape[2] < 3:
+            image = None
+        else:
+            image = image[:, :, :3]
+            if image.dtype != np.uint8:
+                image = np.clip(image, 0, 255).astype(np.uint8)
+            image = np.ascontiguousarray(image)
+
+        with self.lock:
+            self.pending_rgb_image = image
+
+    def update_cable(
+        self,
+        cable_points,
+        cable_nodes,
+        valid_nodes,
+        visible_nodes=None,
+        extended_visible_nodes=None,
+    ):
+        cable_points = self._as_points(cable_points)
+        cable_nodes = self._as_node_points(cable_nodes)
+        valid_nodes = self._as_node_mask(valid_nodes, len(cable_nodes), False)
+        visible_nodes = self._as_node_mask(visible_nodes, len(cable_nodes), valid_nodes)
+        extended_visible_nodes = self._as_node_mask(extended_visible_nodes, len(cable_nodes), visible_nodes)
+        extended_visible_nodes = extended_visible_nodes | visible_nodes
+
+        with self.lock:
+            self.pending_cable_points = cable_points
+            self.pending_cable_nodes = cable_nodes
+            self.pending_cable_valid = valid_nodes
+            self.pending_cable_visible = visible_nodes
+            self.pending_cable_extended_visible = extended_visible_nodes
+
+    def reset_view(self):
+        self.view_mode = "camera"
+        self.yaw_deg = 0.0
+        self.pitch_deg = 0.0
+        self.zoom = 1.0
+
+    def _draw_callback(self):
+        if not self.available:
+            return
+
+        self._consume_pending_vertices()
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        left_width, right_width = self._panel_sizes()
+        if left_width > 0:
+            self._draw_rgb_panel(left_width, self.height)
+
+        glViewport(left_width, 0, right_width, self.height)
+        glDisable(GL_TEXTURE_2D)
+        glEnable(GL_DEPTH_TEST)
+        mvp = self._set_camera(right_width, self.height)
+        if self.view_mode == "orbit":
+            self._draw_reference_grid()
+        self._draw_point_cloud(mvp)
+        self._draw_cable_overlay()
+        self._draw_overlay(right_width, self.height)
+        if left_width > 0:
+            self._draw_divider(left_width)
+
+        glutSwapBuffers()
+
+    def _consume_pending_vertices(self):
+        with self.lock:
+            rgb_image = self.pending_rgb_image
+            pending_vertices = self.pending_vertices
+            pending_status = self.pending_status
+            cable_points = self.pending_cable_points
+            cable_nodes = self.pending_cable_nodes
+            cable_valid = self.pending_cable_valid
+            cable_visible = self.pending_cable_visible
+            cable_extended_visible = self.pending_cable_extended_visible
+            self.pending_rgb_image = None
+            self.pending_vertices = None
+            self.pending_cable_points = None
+            self.pending_cable_nodes = None
+            self.pending_cable_valid = None
+            self.pending_cable_visible = None
+            self.pending_cable_extended_visible = None
+
+        if rgb_image is not None:
+            self.rgb_image = rgb_image
+        if cable_points is not None:
+            self.cable_points = cable_points
+        if cable_nodes is not None:
+            self.cable_nodes = cable_nodes
+        if cable_valid is not None:
+            self.cable_valid = cable_valid
+        if cable_visible is not None:
+            self.cable_visible = cable_visible
+        if cable_extended_visible is not None:
+            self.cable_extended_visible = cable_extended_visible
+
+        if pending_vertices is None:
+            return
+
+        self.vertices = pending_vertices
+        self.vertex_count = int(len(pending_vertices))
+        self.status = pending_status
+
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glBufferData(GL_ARRAY_BUFFER, self.vertices.nbytes, self.vertices, GL_STREAM_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def _set_camera(self, viewport_width=None, viewport_height=None):
+        viewport_width = self.width if viewport_width is None else max(1, int(viewport_width))
+        viewport_height = self.height if viewport_height is None else max(1, int(viewport_height))
+        aspect = viewport_width / viewport_height
+        zfar = max(8.0, self.depth_max_m + 2.0)
+        fov = float(np.clip(self.fov_y_deg * self.zoom, 28.0, 105.0))
+
+        projection = self._perspective(fov, aspect, 0.05, zfar)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(fov, aspect, 0.05, zfar)
+
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+
+        if self.view_mode == "camera":
+            modelview = self._rotation_x(self.pitch_deg * 0.2) @ self._rotation_y(self.yaw_deg * 0.2)
+            glRotatef(self.pitch_deg * 0.2, 1.0, 0.0, 0.0)
+            glRotatef(self.yaw_deg * 0.2, 0.0, 1.0, 0.0)
+            return projection @ modelview
+
+        distance = max(0.8, self.scene_radius * 2.4) * self.zoom
+        modelview = (
+            self._translation(0.0, 0.0, -distance)
+            @ self._rotation_x(self.pitch_deg)
+            @ self._rotation_y(self.yaw_deg)
+            @ self._translation(
+                -float(self.scene_center[0]),
+                -float(self.scene_center[1]),
+                -float(self.scene_center[2]),
+            )
+        )
+        glTranslatef(0.0, 0.0, -distance)
+        glRotatef(self.pitch_deg, 1.0, 0.0, 0.0)
+        glRotatef(self.yaw_deg, 0.0, 1.0, 0.0)
+        glTranslatef(
+            -float(self.scene_center[0]),
+            -float(self.scene_center[1]),
+            -float(self.scene_center[2]),
+        )
+        return projection @ modelview
+
+    def _draw_rgb_panel(self, width, height):
+        width = max(1, int(width))
+        height = max(1, int(height))
+        glViewport(0, 0, width, height)
+        glUseProgram(0)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_TEXTURE_2D)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, width, 0, height, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+
+        self._draw_rect_2d(0, 0, width, height, UI_PANEL_DARK)
+        self._draw_rect_2d(0, height - 46, width, 46, UI_PANEL)
+        self._draw_text_2d(16, height - 26, "RGB Segmentation", UI_TEXT)
+        self._draw_line_2d(0, height - 46, width, height - 46, UI_STROKE)
+
+        if self.rgb_image is None:
+            self._draw_text_2d(18, height - 72, "waiting for RGB frame", UI_MUTED)
+            return
+
+        image_h, image_w = self.rgb_image.shape[:2]
+        if image_w <= 0 or image_h <= 0:
+            return
+
+        margin = 16
+        available_w = max(1, width - 2 * margin)
+        available_h = max(1, height - 46 - 2 * margin)
+        scale = min(available_w / image_w, available_h / image_h)
+        draw_w = max(1, int(round(image_w * scale)))
+        draw_h = max(1, int(round(image_h * scale)))
+        x0 = int((width - draw_w) * 0.5)
+        y0 = int((height - 46 - draw_h) * 0.5)
+        x1 = x0 + draw_w
+        y1 = y0 + draw_h
+
+        glBindTexture(GL_TEXTURE_2D, self.rgb_texture)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGB,
+            image_w,
+            image_h,
+            0,
+            GL_RGB,
+            GL_UNSIGNED_BYTE,
+            self.rgb_image,
+        )
+
+        glEnable(GL_TEXTURE_2D)
+        glColor3f(1.0, 1.0, 1.0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 1.0)
+        glVertex2f(float(x0), float(y0))
+        glTexCoord2f(1.0, 1.0)
+        glVertex2f(float(x1), float(y0))
+        glTexCoord2f(1.0, 0.0)
+        glVertex2f(float(x1), float(y1))
+        glTexCoord2f(0.0, 0.0)
+        glVertex2f(float(x0), float(y1))
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        self._draw_line_2d(x0, y0, x1, y0, UI_STROKE)
+        self._draw_line_2d(x1, y0, x1, y1, UI_STROKE)
+        self._draw_line_2d(x1, y1, x0, y1, UI_STROKE)
+        self._draw_line_2d(x0, y1, x0, y0, UI_STROKE)
+
+    def _draw_point_cloud(self, mvp):
+        if self.vertex_count == 0:
+            return
+
+        if self.shader_program is not None:
+            self._draw_point_cloud_shader(mvp)
+            return
+
+        self._draw_point_cloud_fixed()
+
+    def _draw_point_cloud_shader(self, mvp):
+        glPointSize(float(self.point_size))
+        glUseProgram(self.shader_program)
+        if self.mvp_loc is not None and self.mvp_loc >= 0:
+            glUniformMatrix4fv(
+                self.mvp_loc,
+                1,
+                GL_TRUE,
+                np.ascontiguousarray(mvp, dtype=np.float32),
+            )
+        if self.point_size_loc is not None and self.point_size_loc >= 0:
+            glUniform1f(self.point_size_loc, float(self.point_size))
+
+        if self.vao:
+            glBindVertexArray(self.vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        stride = 6 * 4
+        glEnableVertexAttribArray(0)
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+        glDrawArrays(GL_POINTS, 0, self.vertex_count)
+        glDisableVertexAttribArray(1)
+        glDisableVertexAttribArray(0)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        if self.vao:
+            glBindVertexArray(0)
+        glUseProgram(0)
+
+    def _draw_point_cloud_fixed(self):
+        glPointSize(float(self.point_size))
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glEnableClientState(GL_COLOR_ARRAY)
+        stride = 6 * 4
+        glVertexPointer(3, GL_FLOAT, stride, ctypes.c_void_p(0))
+        glColorPointer(3, GL_FLOAT, stride, ctypes.c_void_p(12))
+        glDrawArrays(GL_POINTS, 0, self.vertex_count)
+        glDisableClientState(GL_COLOR_ARRAY)
+        glDisableClientState(GL_VERTEX_ARRAY)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def _draw_cable_overlay(self):
+        glDisable(GL_DEPTH_TEST)
+
+        if len(self.cable_points) > 0:
+            glPointSize(7.0)
+            glColor3f(*CABLE_SAMPLE_COLOR)
+            glBegin(GL_POINTS)
+            for point in self.cable_points:
+                glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+            glEnd()
+
+        if self._has_cable_node_state():
+            glLineWidth(8.0)
+            glBegin(GL_LINES)
+            for idx in range(len(self.cable_nodes) - 1):
+                if not (self.cable_valid[idx] and self.cable_valid[idx + 1]):
+                    continue
+
+                p0 = self.cable_nodes[idx]
+                p1 = self.cable_nodes[idx + 1]
+                if not (np.all(np.isfinite(p0)) and np.all(np.isfinite(p1))):
+                    continue
+
+                glColor3f(*self._segment_color(idx))
+                glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
+                glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
+            glEnd()
+
+            glPointSize(14.0)
+            glBegin(GL_POINTS)
+            for idx, point in enumerate(self.cable_nodes):
+                if self.cable_valid[idx] and np.all(np.isfinite(point)):
+                    glColor3f(*self._node_color(idx))
+                    glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+            glEnd()
+
+        glEnable(GL_DEPTH_TEST)
+
+    @staticmethod
+    def _compile_shader(shader_type, source):
+        shader_id = glCreateShader(shader_type)
+        glShaderSource(shader_id, source)
+        glCompileShader(shader_id)
+        if glGetShaderiv(shader_id, GL_COMPILE_STATUS) != GL_TRUE:
+            info = glGetShaderInfoLog(shader_id)
+            glDeleteShader(shader_id)
+            raise RuntimeError(info.decode("utf-8", errors="replace"))
+        return shader_id
+
+    def _create_point_shader(self):
+        try:
+            vertex_id = self._compile_shader(GL_VERTEX_SHADER, POINT_VERTEX_SHADER)
+            fragment_id = self._compile_shader(GL_FRAGMENT_SHADER, POINT_FRAGMENT_SHADER)
+            program_id = glCreateProgram()
+            glAttachShader(program_id, vertex_id)
+            glAttachShader(program_id, fragment_id)
+            glBindAttribLocation(program_id, 0, "in_position")
+            glBindAttribLocation(program_id, 1, "in_color")
+            glLinkProgram(program_id)
+            glDeleteShader(vertex_id)
+            glDeleteShader(fragment_id)
+
+            if glGetProgramiv(program_id, GL_LINK_STATUS) != GL_TRUE:
+                info = glGetProgramInfoLog(program_id)
+                glDeleteProgram(program_id)
+                raise RuntimeError(info.decode("utf-8", errors="replace"))
+            return program_id
+        except Exception as exc:
+            print(f"Point-cloud shader unavailable; using fixed-function fallback ({exc})")
+            return None
+
+    @staticmethod
+    def _perspective(fov_y_deg, aspect, znear, zfar):
+        f = 1.0 / np.tan(np.deg2rad(fov_y_deg) * 0.5)
+        matrix = np.zeros((4, 4), dtype=np.float32)
+        matrix[0, 0] = f / aspect
+        matrix[1, 1] = f
+        matrix[2, 2] = (zfar + znear) / (znear - zfar)
+        matrix[2, 3] = (2.0 * zfar * znear) / (znear - zfar)
+        matrix[3, 2] = -1.0
+        return matrix
+
+    @staticmethod
+    def _translation(x, y, z):
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[0, 3] = float(x)
+        matrix[1, 3] = float(y)
+        matrix[2, 3] = float(z)
+        return matrix
+
+    @staticmethod
+    def _rotation_x(deg):
+        rad = np.deg2rad(float(deg))
+        c = np.cos(rad)
+        s = np.sin(rad)
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[1, 1] = c
+        matrix[1, 2] = -s
+        matrix[2, 1] = s
+        matrix[2, 2] = c
+        return matrix
+
+    @staticmethod
+    def _rotation_y(deg):
+        rad = np.deg2rad(float(deg))
+        c = np.cos(rad)
+        s = np.sin(rad)
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[0, 0] = c
+        matrix[0, 2] = s
+        matrix[2, 0] = -s
+        matrix[2, 2] = c
+        return matrix
+
+    def _draw_reference_grid(self):
+        center = self.scene_center
+        radius = max(0.5, self.scene_radius)
+        floor_y = float(center[1] - radius * 0.6)
+        grid_radius = radius * 1.2
+        step = max(0.1, grid_radius / 10.0)
+        count = int(np.ceil(grid_radius / step))
+
+        glDisable(GL_DEPTH_TEST)
+        glLineWidth(1.0)
+        glColor3f(0.16, 0.18, 0.20)
+        glBegin(GL_LINES)
+        for idx in range(-count, count + 1):
+            offset = idx * step
+            glVertex3f(float(center[0] - grid_radius), floor_y, float(center[2] + offset))
+            glVertex3f(float(center[0] + grid_radius), floor_y, float(center[2] + offset))
+            glVertex3f(float(center[0] + offset), floor_y, float(center[2] - grid_radius))
+            glVertex3f(float(center[0] + offset), floor_y, float(center[2] + grid_radius))
+        glEnd()
+        glEnable(GL_DEPTH_TEST)
+
+    def _draw_overlay(self, width=None, height=None):
+        width = self.width if width is None else max(1, int(width))
+        height = self.height if height is None else max(1, int(height))
+        node_count = int(np.count_nonzero(self.cable_valid))
+        visible_count = int(np.count_nonzero(self.cable_valid & self.cable_visible))
+        extended_count = int(np.count_nonzero(self.cable_valid & self.cable_extended_visible & ~self.cable_visible))
+        occluded_count = int(np.count_nonzero(self.cable_valid & ~self.cable_extended_visible))
+        glDisable(GL_DEPTH_TEST)
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, width, 0, height, -1, 1)
+
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        header_h = 96
+        self._draw_rect_2d(0, height - header_h, width, header_h, (0.018, 0.021, 0.025))
+        self._draw_rect_2d(0, height - header_h, width, 1, UI_STROKE)
+        self._draw_text_2d(18, height - 30, "TrackDLO Spatial Reconstruction", UI_TEXT)
+        self._draw_text_2d(18, height - 54, self._compact_status(self.status, width), UI_MUTED, GLUT_BITMAP_HELVETICA_12)
+
+        metric_y = height - 84
+        metric_x = 18
+        metric_x = self._draw_metric(metric_x, metric_y, "ENV", self.vertex_count, (0.54, 0.72, 0.92))
+        metric_x = self._draw_metric(metric_x, metric_y, "CABLE", len(self.cable_points), CABLE_SAMPLE_COLOR)
+        metric_x = self._draw_metric(metric_x, metric_y, "NODES", node_count, (0.70, 0.78, 0.84))
+        metric_x = self._draw_metric(metric_x, metric_y, "VISIBLE", visible_count, VISIBLE_COLOR)
+        metric_x = self._draw_metric(metric_x, metric_y, "EXTENDED", extended_count, EXTENDED_COLOR)
+        self._draw_metric(metric_x, metric_y, "INFERRED", occluded_count, OCCLUDED_COLOR)
+
+        footer_h = 34
+        self._draw_rect_2d(0, 0, width, footer_h, (0.018, 0.021, 0.025))
+        self._draw_rect_2d(0, footer_h - 1, width, 1, UI_STROKE)
+        footer = f"View: {self.view_mode.upper()}    Point size: {self.point_size:.1f}    Depth range: {self.depth_max_m:.1f} m"
+        self._draw_text_2d(18, 13, footer, UI_MUTED, GLUT_BITMAP_HELVETICA_12)
+
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glEnable(GL_DEPTH_TEST)
+
+    def _draw_divider(self, x):
+        glViewport(0, 0, self.width, self.height)
+        glUseProgram(0)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_TEXTURE_2D)
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, self.width, 0, self.height, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        self._draw_rect_2d(x - 1, 0, 2, self.height, UI_STROKE)
+
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glEnable(GL_DEPTH_TEST)
+
+    def _draw_text_2d(self, x, y, text, color, font=GLUT_BITMAP_HELVETICA_18):
+        glColor3f(float(color[0]), float(color[1]), float(color[2]))
+        glRasterPos2f(float(x), float(y))
+        for char in str(text):
+            glutBitmapCharacter(font, ord(char))
+
+    def _draw_rect_2d(self, x, y, width, height, color):
+        glColor3f(float(color[0]), float(color[1]), float(color[2]))
+        x0 = float(x)
+        y0 = float(y)
+        x1 = float(x + width)
+        y1 = float(y + height)
+        glBegin(GL_QUADS)
+        glVertex2f(x0, y0)
+        glVertex2f(x1, y0)
+        glVertex2f(x1, y1)
+        glVertex2f(x0, y1)
+        glEnd()
+
+    def _draw_line_2d(self, x0, y0, x1, y1, color):
+        glColor3f(float(color[0]), float(color[1]), float(color[2]))
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        glVertex2f(float(x0), float(y0))
+        glVertex2f(float(x1), float(y1))
+        glEnd()
+
+    def _draw_metric(self, x, y, label, value, color):
+        width = 112 if len(label) <= 5 else 134
+        height = 22
+        self._draw_rect_2d(x, y, width, height, UI_PANEL)
+        self._draw_rect_2d(x, y, 4, height, color)
+        self._draw_text_2d(x + 10, y + 7, str(label), UI_MUTED, GLUT_BITMAP_HELVETICA_12)
+        self._draw_text_2d(x + width - 42, y + 7, str(value), UI_TEXT, GLUT_BITMAP_HELVETICA_12)
+        return x + width + 8
+
+    @staticmethod
+    def _compact_status(status, width):
+        status = str(status).replace("LIVE depth fallback", "LIVE depth").replace("FUSED spatial map", "FUSED map")
+        max_chars = max(42, int(width / 10))
+        if len(status) <= max_chars:
+            return status
+        return status[: max_chars - 3] + "..."
+
+    def _panel_sizes(self):
+        if self.left_panel_width <= 0:
+            return 0, max(1, self.width)
+
+        left = min(max(1, self.left_panel_width), max(1, self.width - 320))
+        right = max(1, self.width - left)
+        return left, right
+
+    def _reshape_callback(self, width, height):
+        self.width = max(1, int(width))
+        self.height = max(1, int(height))
+        glViewport(0, 0, self.width, self.height)
+
+    def _keyboard_callback(self, key, _x, _y):
+        if key in (b"q", b"\x1b"):
+            self.close()
+            return
+        if key == b"r":
+            self.reset_view()
+        elif key == b"m":
+            self.view_mode = "orbit" if self.view_mode == "camera" else "camera"
+            if self.view_mode == "orbit" and self.yaw_deg == 0.0 and self.pitch_deg == 0.0:
+                self.yaw_deg = -25.0
+                self.pitch_deg = 18.0
+        elif key in (b"+", b"="):
+            self.point_size = min(8.0, self.point_size + 0.5)
+        elif key in (b"-", b"_"):
+            self.point_size = max(1.0, self.point_size - 0.5)
+
+    def _special_key_callback(self, key, _x, _y):
+        if key == GLUT_KEY_LEFT:
+            self.yaw_deg -= 4.0
+        elif key == GLUT_KEY_RIGHT:
+            self.yaw_deg += 4.0
+        elif key == GLUT_KEY_UP:
+            self.pitch_deg = min(85.0, self.pitch_deg + 4.0)
+        elif key == GLUT_KEY_DOWN:
+            self.pitch_deg = max(-85.0, self.pitch_deg - 4.0)
+
+    def _mouse_callback(self, button, state, x, y):
+        if button == GLUT_LEFT_BUTTON:
+            self.rotating = state == GLUT_DOWN
+            self.last_mouse = (int(x), int(y))
+            return
+
+        if state != GLUT_DOWN:
+            return
+
+        if button == 3:
+            self.zoom = max(0.35, self.zoom * 0.9)
+        elif button == 4:
+            self.zoom = min(3.5, self.zoom * 1.1)
+
+    def _motion_callback(self, x, y):
+        if not self.rotating:
+            return
+
+        last_x, last_y = self.last_mouse
+        dx = int(x) - last_x
+        dy = int(y) - last_y
+        self.yaw_deg += dx * 0.35
+        self.pitch_deg = float(np.clip(self.pitch_deg + dy * 0.25, -85.0, 85.0))
+        self.last_mouse = (int(x), int(y))
+
+    def _close_callback(self):
+        self.available = False
+
+    def _smooth_scene_bounds(self, center, radius):
+        if not self.has_scene:
+            self.scene_center = center
+            self.scene_radius = radius
+            self.has_scene = True
+            return
+
+        alpha = 0.1
+        self.scene_center = ((1.0 - alpha) * self.scene_center + alpha * center).astype(np.float32)
+        self.scene_radius = float((1.0 - alpha) * self.scene_radius + alpha * radius)
+
+    @staticmethod
+    def _estimate_scene_bounds(points):
+        if len(points) == 0:
+            return np.array([0.0, 0.0, -2.0], dtype=np.float32), 2.0
+
+        finite = points[np.all(np.isfinite(points), axis=1)]
+        if len(finite) == 0:
+            return np.array([0.0, 0.0, -2.0], dtype=np.float32), 2.0
+
+        center = np.median(finite, axis=0).astype(np.float32)
+        distances = np.linalg.norm(finite - center, axis=1)
+        radius = float(np.percentile(distances, 95)) if len(distances) else 2.0
+        return center, float(np.clip(radius, 0.5, 12.0))
+
+    def _has_cable_node_state(self):
+        count = len(self.cable_nodes)
+        return (
+            count > 0
+            and len(self.cable_valid) == count
+            and len(self.cable_visible) == count
+            and len(self.cable_extended_visible) == count
+        )
+
+    def _node_color(self, idx):
+        if self.cable_visible[idx]:
+            return VISIBLE_COLOR
+        if self.cable_extended_visible[idx]:
+            return EXTENDED_COLOR
+        return OCCLUDED_COLOR
+
+    def _segment_color(self, idx):
+        p0_visible = self.cable_visible[idx]
+        p1_visible = self.cable_visible[idx + 1]
+        p0_extended = self.cable_extended_visible[idx]
+        p1_extended = self.cable_extended_visible[idx + 1]
+
+        if p0_visible and p1_visible:
+            return 0.12, 0.95, 0.42
+        if p0_extended and p1_extended:
+            return 1.0, 0.74, 0.12
+        return OCCLUDED_COLOR
+
+    @staticmethod
+    def _as_points(points):
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 3:
+            return np.empty((0, 3), dtype=np.float32)
+
+        points = points[:, :3]
+        valid = np.all(np.isfinite(points), axis=1)
+        return np.ascontiguousarray(points[valid], dtype=np.float32)
+
+    @staticmethod
+    def _as_node_points(points):
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 3:
+            return np.empty((0, 3), dtype=np.float32)
+
+        return np.ascontiguousarray(points[:, :3], dtype=np.float32)
+
+    @staticmethod
+    def _as_node_mask(mask, node_count, default):
+        node_count = int(max(0, node_count))
+        if isinstance(default, np.ndarray):
+            fallback = np.asarray(default, dtype=bool).reshape(-1)
+            if len(fallback) == node_count:
+                fallback = fallback.copy()
+            else:
+                fallback = np.zeros(node_count, dtype=bool)
+        else:
+            fallback = np.full(node_count, bool(default), dtype=bool)
+
+        if mask is None:
+            return fallback
+
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        if len(mask) != node_count:
+            return fallback
+        return mask.copy()

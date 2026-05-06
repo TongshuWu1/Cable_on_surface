@@ -19,7 +19,7 @@ CALIB_IMAGE_DIR = Path(__file__).with_name("calibration_images")
 # ZED camera settings
 # ============================================================
 
-CAMERA_RESOLUTION = sl.RESOLUTION.HD1080
+CAMERA_RESOLUTION = sl.RESOLUTION.HD720
 CAMERA_FPS = 60
 
 BRIGHTNESS = 4
