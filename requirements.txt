@@ -1,0 +1,6 @@
+numpy
+opencv-python
+PyOpenGL
+
+# Provided by the Stereolabs ZED SDK, not PyPI:
+# pyzed.sl

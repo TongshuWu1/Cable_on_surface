@@ -19,6 +19,7 @@ CALIB_IMAGE_DIR = Path(__file__).with_name("calibration_images")
 # ZED camera settings
 # ============================================================
 
+CAMERA_RESOLUTION_NAME = "HD720"
 CAMERA_RESOLUTION = sl.RESOLUTION.HD720
 CAMERA_FPS = 60
 
@@ -568,7 +569,7 @@ def build_profile(state):
         "version": 3,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
 
-        "camera_resolution": "HD2K",
+        "camera_resolution": CAMERA_RESOLUTION_NAME,
         "camera_fps": CAMERA_FPS,
 
         "camera_settings": {

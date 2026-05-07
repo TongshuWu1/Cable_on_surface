@@ -48,7 +48,7 @@ while True:
         zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)
 
         left_np = left_image.get_data()
-        left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGBA2BGR)
+        left_bgr = cv2.cvtColor(left_np, cv2.COLOR_BGRA2BGR)
 
         depth_np = depth_map.get_data()
         depth_vis = make_close_range_depth_vis(depth_np, dmin=0.30, dmax=1.20)
