@@ -1,0 +1,95 @@
+{
+  "profile_type": "sphere_color_hsv",
+  "version": 1,
+  "created_at": "2026-05-13 13:40:45",
+  "samples": [
+    {
+      "created_at": "2026-05-13 13:40:37",
+      "source_name": "captured_image_1",
+      "source_path": "/home/tongshuwu/PycharmProjects/Cable_on_surface/particle_filter_project/tools/calibration_images/sphere_calib_20260513_134028_000.png",
+      "roi_xywh": [
+        974,
+        379,
+        88,
+        77
+      ],
+      "num_pixels_used": 4239,
+      "rgb_median": [
+        34,
+        79,
+        31
+      ],
+      "rgb_std": [
+        4.249265670776367,
+        5.0377984046936035,
+        3.0197763442993164
+      ],
+      "hsv_median": [
+        58.37996292114258,
+        154.0,
+        79.0
+      ],
+      "hsv_percentile_10": [
+        55.0,
+        148.0,
+        72.0
+      ],
+      "hsv_percentile_90": [
+        61.0,
+        162.0,
+        85.0
+      ],
+      "hsv_margin": [
+        7,
+        35,
+        40
+      ],
+      "hsv_ranges": [
+        {
+          "lower": [
+            51,
+            119,
+            39
+          ],
+          "upper": [
+            65,
+            189,
+            119
+          ]
+        }
+      ]
+    }
+  ],
+  "imported_ranges": [],
+  "hsv_ranges": [
+    {
+      "lower": [
+        51,
+        119,
+        39
+      ],
+      "upper": [
+        65,
+        189,
+        119
+      ]
+    }
+  ],
+  "range_expansion": {
+    "h_extra": 4,
+    "s_extra": 20,
+    "v_extra": 20
+  },
+  "blob_filter": {
+    "min_area": 250,
+    "min_circularity": 0.55,
+    "max_aspect_ratio": 1.6,
+    "open_kernel": 3,
+    "close_kernel": 7
+  },
+  "notes": [
+    "OpenCV HSV uses H in [0, 179] and S/V in [0, 255].",
+    "Use multiple samples from different distances and lighting conditions.",
+    "The tracker should OR all hsv_ranges, apply range_expansion, then filter blobs by blob_filter."
+  ]
+}
