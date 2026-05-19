@@ -1,0 +1,10 @@
+numpy
+opencv-python
+PyOpenGL
+
+# PIDNet detector/training dependency. Install the CUDA build that matches your
+# machine from https://pytorch.org/get-started/locally/.
+# torch
+
+# Provided by the Stereolabs ZED SDK, not PyPI:
+# pyzed.sl

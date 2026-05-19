@@ -1,0 +1,1241 @@
+from collections import deque
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+
+@dataclass
+class CableDetection2D:
+    mask: np.ndarray
+    skeleton: np.ndarray
+    centerline_xy: np.ndarray
+    component_count: int
+    branch_count: int
+    centerline_paths_xy: tuple[np.ndarray, ...] = ()
+
+
+@dataclass
+class CableEstimate3D:
+    points_xyz: np.ndarray
+    source_points: np.ndarray
+    residual_m: float
+    method: str
+    centerline_xy: np.ndarray | None = None
+    valid_centerline_mask: np.ndarray | None = None
+
+
+class CableMaskDetector:
+    """Base class for cable mask detectors.
+
+    Subclasses provide ``create_mask``. This class only handles ROI/scale,
+    cleanup, skeletonization, and ordered centerline extraction.
+    """
+
+    def __init__(
+        self,
+        min_area=80,
+        keep_largest_component=False,
+        max_components=0,
+        allow_occluded_fragments=True,
+        open_kernel=3,
+        close_kernel=5,
+        skeleton_prune_px=10,
+        skeleton_prune_passes=2,
+        centerline_smooth_window=9,
+    ):
+        self.min_area = int(min_area)
+        self.keep_largest_component = bool(keep_largest_component)
+        self.max_components = int(max_components)
+        self.allow_occluded_fragments = bool(allow_occluded_fragments)
+        self.open_kernel = odd_kernel_size(open_kernel)
+        self.close_kernel = odd_kernel_size(close_kernel)
+        self.skeleton_prune_px = max(0, int(skeleton_prune_px))
+        self.skeleton_prune_passes = max(0, int(skeleton_prune_passes))
+        self.centerline_smooth_window = max(1, int(centerline_smooth_window))
+
+    def create_mask(self, bgr):
+        raise NotImplementedError("Subclasses must return a binary cable mask.")
+
+    def clean_mask(self, raw_mask):
+        mask = np.asarray(raw_mask, dtype=np.uint8)
+        if self.open_kernel > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.open_kernel, self.open_kernel))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        if self.close_kernel > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.close_kernel, self.close_kernel))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return remove_small_components(
+            mask,
+            min_area=self.min_area,
+            keep_largest_component=self.keep_largest_component and not self.allow_occluded_fragments,
+            max_components=0 if self.allow_occluded_fragments else self.max_components,
+        )
+
+    def detect(self, bgr, roi_bbox=None, scale=1.0, extract_geometry=True):
+        bgr = np.asarray(bgr, dtype=np.uint8)
+        if roi_bbox is None and float(scale) >= 0.999:
+            return self._detect_crop(bgr, extract_geometry=extract_geometry)
+
+        crop, bbox = crop_bgr_to_bbox(bgr, roi_bbox)
+        if crop.size == 0:
+            return empty_detection(bgr.shape[:2])
+
+        original_h, original_w = crop.shape[:2]
+        scale = float(np.clip(scale, 0.10, 1.0))
+        if scale < 0.999:
+            scaled_w = max(2, int(round(original_w * scale)))
+            scaled_h = max(2, int(round(original_h * scale)))
+            detector_input = cv2.resize(crop, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+            detection = self._detect_crop(detector_input, extract_geometry=extract_geometry)
+            detection = resize_detection(detection, (original_h, original_w))
+        else:
+            detection = self._detect_crop(crop, extract_geometry=extract_geometry)
+
+        return offset_detection(detection, bgr.shape[:2], bbox)
+
+    def _detect_crop(self, bgr, extract_geometry=True):
+        raw_mask = self.create_mask(bgr)
+        mask, component_count = self.clean_mask(raw_mask)
+        if not extract_geometry:
+            skeleton = np.zeros_like(mask, dtype=np.uint8)
+            return CableDetection2D(
+                mask=mask,
+                skeleton=skeleton,
+                centerline_xy=np.empty((0, 2), dtype=np.float32),
+                component_count=component_count,
+                branch_count=0,
+                centerline_paths_xy=(),
+            )
+        skeleton = skeletonize_mask(mask)
+        skeleton = prune_short_skeleton_branches(
+            skeleton,
+            max_branch_length=self.skeleton_prune_px,
+            max_passes=self.skeleton_prune_passes,
+        )
+        centerline_paths_xy, branch_count = skeleton_centerline_paths(skeleton)
+        centerline_xy = stitch_centerline_paths(centerline_paths_xy)
+        centerline_xy = smooth_polyline_xy(centerline_xy, self.centerline_smooth_window)
+        return CableDetection2D(
+            mask=mask,
+            skeleton=skeleton,
+            centerline_xy=centerline_xy,
+            component_count=component_count,
+            branch_count=branch_count,
+            centerline_paths_xy=tuple(centerline_paths_xy),
+        )
+
+
+class HsvCableDetector(CableMaskDetector):
+    """HSV range or Gaussian detector for baseline cable segmentation.
+
+    OpenCV HSV uses H in [0, 179] and S/V in [0, 255]. If h_min > h_max, the
+    hue range wraps around zero, which is useful for red cables.
+    """
+
+    def __init__(
+        self,
+        h_min=50,
+        h_max=80,
+        s_min=80,
+        s_max=255,
+        v_min=80,
+        v_max=255,
+        mode="range",
+        gaussian_threshold=0.0,
+        gaussian_positive_mean=None,
+        gaussian_positive_std=None,
+        gaussian_negative_mean=None,
+        gaussian_negative_std=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.mode = str(mode).lower()
+        self.h_min = int(np.clip(h_min, 0, 179))
+        self.h_max = int(np.clip(h_max, 0, 179))
+        self.s_min = int(np.clip(s_min, 0, 255))
+        self.s_max = int(np.clip(s_max, 0, 255))
+        self.v_min = int(np.clip(v_min, 0, 255))
+        self.v_max = int(np.clip(v_max, 0, 255))
+        self.gaussian_threshold = float(gaussian_threshold)
+        self.gaussian_positive_mean = vector_or_none(gaussian_positive_mean, 4)
+        self.gaussian_positive_std = vector_or_none(gaussian_positive_std, 4)
+        self.gaussian_negative_mean = vector_or_none(gaussian_negative_mean, 4)
+        self.gaussian_negative_std = vector_or_none(gaussian_negative_std, 4)
+
+    def create_mask(self, bgr):
+        bgr = np.asarray(bgr, dtype=np.uint8)
+        if bgr.ndim != 3 or bgr.shape[2] < 3:
+            return np.zeros(bgr.shape[:2], dtype=np.uint8)
+
+        hsv = cv2.cvtColor(bgr[:, :, :3], cv2.COLOR_BGR2HSV)
+        if self.mode == "gaussian" and self.has_gaussian_model():
+            score = hsv_gaussian_score(
+                hsv,
+                self.gaussian_positive_mean,
+                self.gaussian_positive_std,
+                self.gaussian_negative_mean,
+                self.gaussian_negative_std,
+            )
+            return (score >= self.gaussian_threshold).astype(np.uint8) * 255
+
+        hue = hsv[:, :, 0]
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+
+        if self.h_min <= self.h_max:
+            hue_mask = (hue >= self.h_min) & (hue <= self.h_max)
+        else:
+            hue_mask = (hue >= self.h_min) | (hue <= self.h_max)
+        mask = (
+            hue_mask
+            & (saturation >= self.s_min)
+            & (saturation <= self.s_max)
+            & (value >= self.v_min)
+            & (value <= self.v_max)
+        )
+        return mask.astype(np.uint8) * 255
+
+    def has_gaussian_model(self):
+        return self.gaussian_positive_mean is not None and self.gaussian_positive_std is not None
+
+    def description(self):
+        if self.mode == "gaussian" and self.has_gaussian_model():
+            return f"HSV Gaussian threshold {self.gaussian_threshold:.3f}"
+        return (
+            f"HSV H {self.h_min}-{self.h_max} "
+            f"S {self.s_min}-{self.s_max} V {self.v_min}-{self.v_max}"
+        )
+
+
+def crop_bgr_to_bbox(bgr, roi_bbox=None):
+    bgr = np.asarray(bgr, dtype=np.uint8)
+    height, width = bgr.shape[:2]
+    if roi_bbox is None:
+        return bgr, (0, 0, width, height)
+
+    x0, y0, x1, y1 = [int(round(float(v))) for v in roi_bbox]
+    x0 = int(np.clip(x0, 0, width))
+    x1 = int(np.clip(x1, 0, width))
+    y0 = int(np.clip(y0, 0, height))
+    y1 = int(np.clip(y1, 0, height))
+    if x1 <= x0 or y1 <= y0:
+        return bgr[:0, :0], (0, 0, 0, 0)
+    return bgr[y0:y1, x0:x1], (x0, y0, x1, y1)
+
+
+def empty_detection(image_shape):
+    height, width = [int(v) for v in image_shape[:2]]
+    empty_mask = np.zeros((height, width), dtype=np.uint8)
+    return CableDetection2D(
+        mask=empty_mask,
+        skeleton=empty_mask.copy(),
+        centerline_xy=np.empty((0, 2), dtype=np.float32),
+        component_count=0,
+        branch_count=0,
+        centerline_paths_xy=(),
+    )
+
+
+def resize_detection(detection, output_shape):
+    output_h, output_w = [int(v) for v in output_shape[:2]]
+    input_h, input_w = detection.mask.shape[:2]
+    if input_h == output_h and input_w == output_w:
+        return detection
+
+    scale_x = output_w / max(float(input_w), 1.0)
+    scale_y = output_h / max(float(input_h), 1.0)
+    mask = cv2.resize(detection.mask, (output_w, output_h), interpolation=cv2.INTER_NEAREST)
+    skeleton = cv2.resize(detection.skeleton, (output_w, output_h), interpolation=cv2.INTER_NEAREST)
+    centerline_xy = scale_xy_points(detection.centerline_xy, scale_x, scale_y)
+    paths = tuple(scale_xy_points(path, scale_x, scale_y) for path in detection.centerline_paths_xy)
+    return CableDetection2D(
+        mask=np.ascontiguousarray(mask, dtype=np.uint8),
+        skeleton=np.ascontiguousarray(skeleton, dtype=np.uint8),
+        centerline_xy=centerline_xy,
+        component_count=int(detection.component_count),
+        branch_count=int(detection.branch_count),
+        centerline_paths_xy=paths,
+    )
+
+
+def offset_detection(detection, image_shape, bbox):
+    height, width = [int(v) for v in image_shape[:2]]
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    if x0 == 0 and y0 == 0 and x1 == width and y1 == height:
+        return detection
+
+    full_mask = np.zeros((height, width), dtype=np.uint8)
+    full_skeleton = np.zeros((height, width), dtype=np.uint8)
+    if x1 > x0 and y1 > y0:
+        crop_h = y1 - y0
+        crop_w = x1 - x0
+        mask = detection.mask
+        skeleton = detection.skeleton
+        if mask.shape[:2] != (crop_h, crop_w):
+            mask = cv2.resize(mask, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
+        if skeleton.shape[:2] != (crop_h, crop_w):
+            skeleton = cv2.resize(skeleton, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
+        full_mask[y0:y1, x0:x1] = mask
+        full_skeleton[y0:y1, x0:x1] = skeleton
+
+    centerline_xy = translate_xy_points(detection.centerline_xy, x0, y0)
+    paths = tuple(translate_xy_points(path, x0, y0) for path in detection.centerline_paths_xy)
+    return CableDetection2D(
+        mask=full_mask,
+        skeleton=full_skeleton,
+        centerline_xy=centerline_xy,
+        component_count=int(detection.component_count),
+        branch_count=int(detection.branch_count),
+        centerline_paths_xy=paths,
+    )
+
+
+def scale_xy_points(points_xy, scale_x, scale_y):
+    points = np.asarray(points_xy, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 2 or len(points) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    output = points[:, :2].copy()
+    output[:, 0] *= float(scale_x)
+    output[:, 1] *= float(scale_y)
+    return np.ascontiguousarray(output, dtype=np.float32)
+
+
+def translate_xy_points(points_xy, offset_x, offset_y):
+    points = np.asarray(points_xy, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 2 or len(points) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    output = points[:, :2].copy()
+    output[:, 0] += float(offset_x)
+    output[:, 1] += float(offset_y)
+    return np.ascontiguousarray(output, dtype=np.float32)
+
+
+def fit_cable_segments_from_zed_point_cloud(
+    point_cloud,
+    detection,
+    segment_count=12,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    node_search_px=4,
+    source_point_mode="centerline",
+    max_centerline_points=0,
+    max_local_depth_std_m=0.0,
+    reference_nodes=None,
+    reference_gate_m=0.0,
+    reference_min_points=0,
+):
+    if detection is None:
+        return None
+
+    centerline_xy = np.asarray(detection.centerline_xy, dtype=np.float32)
+    if centerline_xy.ndim != 2 or centerline_xy.shape[1] < 2 or len(centerline_xy) < 2:
+        return None
+    centerline_xy = sample_centerline_xy(centerline_xy, max_centerline_points)
+
+    centerline_xyz, valid_centerline = centerline_points_to_3d(
+        point_cloud,
+        centerline_xy,
+        depth_min=depth_min,
+        depth_max=depth_max,
+        confidence_map=confidence_map,
+        max_confidence=max_confidence,
+        search_px=node_search_px,
+        max_local_depth_std_m=max_local_depth_std_m,
+    )
+    ordered_points = centerline_xyz[valid_centerline]
+    if len(ordered_points) < 2:
+        return None
+    ordered_points = gate_points_to_reference(
+        ordered_points,
+        reference_nodes,
+        gate_m=reference_gate_m,
+        min_points=reference_min_points,
+    )
+    if len(ordered_points) < 2:
+        return None
+
+    nodes = fit_polyline_segments(ordered_points, segment_count=segment_count)
+    if nodes is None:
+        return None
+
+    if source_point_mode == "mask":
+        source_points = masked_point_cloud_points(
+            point_cloud,
+            detection.mask,
+            depth_min=depth_min,
+            depth_max=depth_max,
+            confidence_map=confidence_map,
+            max_confidence=max_confidence,
+        )
+    else:
+        source_points = ordered_points
+    residual = polyline_residual(source_points if len(source_points) else ordered_points, nodes)
+    return CableEstimate3D(
+        points_xyz=np.ascontiguousarray(nodes, dtype=np.float32),
+        source_points=np.ascontiguousarray(source_points, dtype=np.float32),
+        residual_m=float(residual),
+        method=f"{int(segment_count)}-segment cable skeleton from RGB mask + ZED {source_point_mode} points",
+        centerline_xy=np.ascontiguousarray(centerline_xy, dtype=np.float32),
+        valid_centerline_mask=np.asarray(valid_centerline, dtype=bool),
+    )
+
+
+def cable_measurement_from_mask_points(
+    point_cloud,
+    detection,
+    segment_count=12,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    max_points=512,
+    reference_nodes=None,
+    reference_gate_m=0.0,
+    reference_min_points=0,
+):
+    if detection is None or detection.mask is None:
+        return None
+
+    source_points = sampled_masked_point_cloud_points(
+        point_cloud,
+        detection.mask,
+        depth_min=depth_min,
+        depth_max=depth_max,
+        confidence_map=confidence_map,
+        max_confidence=max_confidence,
+        max_points=max_points,
+    )
+    source_points = gate_points_to_reference(
+        source_points,
+        reference_nodes,
+        gate_m=reference_gate_m,
+        min_points=reference_min_points,
+    )
+    if len(source_points) < max(2, int(reference_min_points)):
+        return None
+
+    residual = 0.0
+    if reference_nodes is not None:
+        residual = polyline_residual(source_points, reference_nodes)
+    return CableEstimate3D(
+        points_xyz=np.empty((0, 3), dtype=np.float32),
+        source_points=np.ascontiguousarray(source_points, dtype=np.float32),
+        residual_m=float(residual),
+        method=f"mask-only cable point support from RGB mask + ZED points | segments={int(segment_count)}",
+        centerline_xy=np.empty((0, 2), dtype=np.float32),
+        valid_centerline_mask=np.zeros(0, dtype=bool),
+    )
+
+
+def centerline_points_to_3d(
+    point_cloud,
+    centerline_xy,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    search_px=4,
+    max_local_depth_std_m=0.0,
+):
+    try:
+        point_data = np.asarray(point_cloud.get_data())
+    except Exception:
+        point_data = np.asarray(point_cloud)
+
+    if point_data.ndim != 3 or point_data.shape[2] < 3:
+        return np.empty((0, 3), dtype=np.float32), np.zeros(0, dtype=bool)
+
+    target_shape = point_data.shape[:2]
+    confidence = confidence_array(confidence_map, target_shape)
+    points, valid = median_points_near_pixels(
+        point_data,
+        centerline_xy,
+        depth_min=depth_min,
+        depth_max=depth_max,
+        confidence=confidence,
+        max_confidence=max_confidence,
+        search_px=search_px,
+        max_local_depth_std_m=max_local_depth_std_m,
+    )
+
+    return points, valid
+
+
+def sample_centerline_xy(centerline_xy, max_points=0):
+    points = np.asarray(centerline_xy, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 2 or len(points) < 2:
+        return np.empty((0, 2), dtype=np.float32)
+    points = points[:, :2]
+    max_points = max(0, int(max_points))
+    if max_points <= 0 or len(points) <= max_points:
+        return np.ascontiguousarray(points, dtype=np.float32)
+    max_points = max(2, max_points)
+    indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+    return np.ascontiguousarray(points[indices], dtype=np.float32)
+
+
+def gate_points_to_reference(points_xyz, reference_nodes, gate_m=0.0, min_points=0):
+    points = np.asarray(points_xyz, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    points = points[np.all(np.isfinite(points[:, :3]), axis=1), :3]
+    gate_m = float(gate_m)
+    if gate_m <= 0.0 or reference_nodes is None:
+        return np.ascontiguousarray(points, dtype=np.float32)
+
+    reference = np.asarray(reference_nodes, dtype=np.float32)
+    if reference.ndim != 2 or reference.shape[1] < 3 or len(reference) < 2:
+        return np.ascontiguousarray(points, dtype=np.float32)
+    distances = point_to_polyline_distances(points, reference)
+    if len(distances) != len(points):
+        return np.empty((0, 3), dtype=np.float32)
+    keep = distances <= gate_m
+    if int(np.count_nonzero(keep)) < max(2, int(min_points)):
+        return np.empty((0, 3), dtype=np.float32)
+    return np.ascontiguousarray(points[keep], dtype=np.float32)
+
+
+def median_point_near_pixel(
+    point_data,
+    xy,
+    depth_min=0.05,
+    depth_max=None,
+    confidence=None,
+    max_confidence=None,
+    search_px=4,
+    max_local_depth_std_m=0.0,
+):
+    radius = max(0, int(search_px))
+    samples = point_samples_near_pixel(
+        point_data,
+        xy,
+        radius,
+        depth_min=depth_min,
+        depth_max=depth_max,
+        confidence=confidence,
+        max_confidence=max_confidence,
+    )
+    if len(samples) > 0:
+        if float(max_local_depth_std_m) > 0.0 and not local_depth_is_stable(samples, max_local_depth_std_m):
+            return None
+        return np.median(samples, axis=0).astype(np.float32)
+    return None
+
+
+def median_points_near_pixels(
+    point_data,
+    xy_points,
+    depth_min=0.05,
+    depth_max=None,
+    confidence=None,
+    max_confidence=None,
+    search_px=4,
+    max_local_depth_std_m=0.0,
+):
+    xy_points = np.asarray(xy_points, dtype=np.float32)
+    if xy_points.ndim != 2 or xy_points.shape[1] < 2 or len(xy_points) == 0:
+        return np.empty((0, 3), dtype=np.float32), np.zeros(0, dtype=bool)
+
+    point_data = np.asarray(point_data)
+    if point_data.ndim != 3 or point_data.shape[2] < 3:
+        return np.empty((0, 3), dtype=np.float32), np.zeros(len(xy_points), dtype=bool)
+
+    height, width = point_data.shape[:2]
+    radius = max(0, int(search_px))
+    offsets_y, offsets_x = np.mgrid[-radius : radius + 1, -radius : radius + 1]
+    offsets_x = offsets_x.reshape(-1)
+    offsets_y = offsets_y.reshape(-1)
+
+    centers = np.rint(xy_points[:, :2]).astype(np.int64)
+    xs = centers[:, 0:1] + offsets_x[None, :]
+    ys = centers[:, 1:2] + offsets_y[None, :]
+    inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+    xs = np.clip(xs, 0, max(0, width - 1))
+    ys = np.clip(ys, 0, max(0, height - 1))
+
+    samples = point_data[ys, xs, :3].astype(np.float32, copy=False)
+    keep = inside & np.all(np.isfinite(samples), axis=2)
+    distances = np.linalg.norm(samples, axis=2)
+    if depth_min is not None:
+        keep &= distances >= float(depth_min)
+    if depth_max is not None:
+        keep &= distances <= float(depth_max)
+    if confidence is not None and max_confidence is not None:
+        conf = np.asarray(confidence, dtype=np.float32)[ys, xs]
+        keep &= conf <= float(max_confidence)
+
+    counts = np.count_nonzero(keep, axis=1)
+    masked = samples.copy()
+    masked[~keep] = np.nan
+    points = np.full((len(xy_points), 3), np.nan, dtype=np.float32)
+    rows_with_samples = counts > 0
+    if np.any(rows_with_samples):
+        with np.errstate(invalid="ignore"):
+            points[rows_with_samples] = np.nanmedian(masked[rows_with_samples], axis=1).astype(np.float32)
+    valid = (counts > 0) & np.all(np.isfinite(points), axis=1)
+
+    if float(max_local_depth_std_m) > 0.0 and np.any(valid):
+        deltas = masked - points[:, None, :]
+        deviations = np.linalg.norm(deltas, axis=2)
+        deviations[~keep] = np.nan
+        robust_spread = np.full(len(xy_points), np.inf, dtype=np.float32)
+        with np.errstate(invalid="ignore"):
+            robust_spread[valid] = np.nanpercentile(deviations[valid], 75.0, axis=1).astype(np.float32)
+        stable = (counts < 2) | (robust_spread <= float(max_local_depth_std_m))
+        valid &= stable
+        points[~valid] = np.nan
+
+    points[~valid] = np.nan
+    return np.ascontiguousarray(points, dtype=np.float32), np.asarray(valid, dtype=bool)
+
+
+def local_depth_is_stable(samples, max_local_depth_std_m):
+    samples = np.asarray(samples, dtype=np.float32)
+    if samples.ndim != 2 or samples.shape[1] < 3 or len(samples) < 2:
+        return True
+    center = np.median(samples[:, :3], axis=0)
+    deviations = np.linalg.norm(samples[:, :3] - center[None, :], axis=1)
+    robust_spread = float(np.percentile(deviations, 75.0))
+    return robust_spread <= float(max_local_depth_std_m)
+
+
+def point_samples_near_pixel(
+    point_data,
+    xy,
+    search_px,
+    depth_min=0.05,
+    depth_max=None,
+    confidence=None,
+    max_confidence=None,
+):
+    height, width = point_data.shape[:2]
+    x = int(round(float(xy[0])))
+    y = int(round(float(xy[1])))
+    x0 = max(0, x - search_px)
+    x1 = min(width, x + search_px + 1)
+    y0 = max(0, y - search_px)
+    y1 = min(height, y + search_px + 1)
+    if x1 <= x0 or y1 <= y0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    xyz = point_data[y0:y1, x0:x1, :3].reshape(-1, 3).astype(np.float32)
+    finite = np.all(np.isfinite(xyz), axis=1)
+    keep = finite.copy()
+    distances = np.linalg.norm(xyz, axis=1)
+    if depth_min is not None:
+        keep &= distances >= float(depth_min)
+    if depth_max is not None:
+        keep &= distances <= float(depth_max)
+    if confidence is not None and max_confidence is not None:
+        conf = confidence[y0:y1, x0:x1].reshape(-1)
+        if len(conf) == len(keep):
+            keep &= conf <= float(max_confidence)
+    return np.ascontiguousarray(xyz[keep], dtype=np.float32)
+
+
+def masked_point_cloud_points(
+    point_cloud,
+    mask,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    max_points=0,
+):
+    try:
+        point_data = np.asarray(point_cloud.get_data())
+    except Exception:
+        point_data = np.asarray(point_cloud)
+
+    if point_data.ndim != 3 or point_data.shape[2] < 3:
+        return np.empty((0, 3), dtype=np.float32)
+
+    mask = np.asarray(mask, dtype=np.uint8)
+    if mask.shape[:2] != point_data.shape[:2]:
+        mask = cv2.resize(mask, (point_data.shape[1], point_data.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    selected = mask > 0
+    xyz = point_data[:, :, :3].astype(np.float32)
+    finite = np.all(np.isfinite(xyz), axis=2)
+    selected &= finite
+    distances = np.linalg.norm(xyz, axis=2)
+    if depth_min is not None:
+        selected &= distances >= float(depth_min)
+    if depth_max is not None:
+        selected &= distances <= float(depth_max)
+    confidence = confidence_array(confidence_map, point_data.shape[:2])
+    if confidence is not None and max_confidence is not None:
+        selected &= confidence <= float(max_confidence)
+
+    points = xyz[selected]
+    max_points = max(0, int(max_points))
+    if max_points > 0 and len(points) > max_points:
+        indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+        points = points[indices]
+    return np.ascontiguousarray(points, dtype=np.float32)
+
+
+def sampled_masked_point_cloud_points(
+    point_cloud,
+    mask,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    max_points=512,
+    oversample=4,
+):
+    try:
+        point_data = np.asarray(point_cloud.get_data())
+    except Exception:
+        point_data = np.asarray(point_cloud)
+
+    if point_data.ndim != 3 or point_data.shape[2] < 3:
+        return np.empty((0, 3), dtype=np.float32)
+
+    max_points = max(0, int(max_points))
+    if max_points <= 0:
+        return masked_point_cloud_points(
+            point_cloud,
+            mask,
+            depth_min=depth_min,
+            depth_max=depth_max,
+            confidence_map=confidence_map,
+            max_confidence=max_confidence,
+            max_points=0,
+        )
+
+    mask = np.asarray(mask, dtype=np.uint8)
+    if mask.shape[:2] != point_data.shape[:2]:
+        mask = cv2.resize(mask, (point_data.shape[1], point_data.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    height, width = point_data.shape[:2]
+    flat_indices = np.flatnonzero(mask.reshape(-1) > 0)
+    if len(flat_indices) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    candidate_count = min(len(flat_indices), max(max_points, int(max_points) * max(1, int(oversample))))
+    candidate_indices = evenly_sample_indices(flat_indices, candidate_count)
+    points = filtered_points_at_flat_indices(
+        point_data,
+        candidate_indices,
+        width,
+        depth_min=depth_min,
+        depth_max=depth_max,
+        confidence_map=confidence_map,
+        max_confidence=max_confidence,
+    )
+
+    if len(points) < max_points and candidate_count < len(flat_indices):
+        retry_count = min(len(flat_indices), max(max_points * 12, candidate_count * 3))
+        if retry_count > candidate_count:
+            candidate_indices = evenly_sample_indices(flat_indices, retry_count)
+            points = filtered_points_at_flat_indices(
+                point_data,
+                candidate_indices,
+                width,
+                depth_min=depth_min,
+                depth_max=depth_max,
+                confidence_map=confidence_map,
+                max_confidence=max_confidence,
+            )
+
+    if len(points) > max_points:
+        indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+        points = points[indices]
+    return np.ascontiguousarray(points, dtype=np.float32)
+
+
+def evenly_sample_indices(indices, count):
+    indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+    count = max(0, int(count))
+    if count <= 0 or len(indices) == 0:
+        return np.empty(0, dtype=np.int64)
+    if count >= len(indices):
+        return indices
+    positions = np.linspace(0, len(indices) - 1, count, dtype=np.int64)
+    return indices[positions]
+
+
+def filtered_points_at_flat_indices(
+    point_data,
+    flat_indices,
+    width,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+):
+    flat_indices = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    if len(flat_indices) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    ys = flat_indices // int(width)
+    xs = flat_indices - ys * int(width)
+    xyz = point_data[ys, xs, :3].astype(np.float32, copy=False)
+    keep = np.all(np.isfinite(xyz), axis=1)
+    distances = np.linalg.norm(xyz, axis=1)
+    if depth_min is not None:
+        keep &= distances >= float(depth_min)
+    if depth_max is not None:
+        keep &= distances <= float(depth_max)
+    if confidence_map is not None and max_confidence is not None:
+        confidence = confidence_values_at_pixels(confidence_map, point_data.shape[:2], ys, xs)
+        if confidence is not None and len(confidence) == len(keep):
+            keep &= confidence <= float(max_confidence)
+    return np.ascontiguousarray(xyz[keep], dtype=np.float32)
+
+
+def confidence_values_at_pixels(confidence_map, target_shape, ys, xs):
+    try:
+        data = np.asarray(confidence_map.get_data())
+    except Exception:
+        data = np.asarray(confidence_map)
+    if data.ndim == 3:
+        data = data[:, :, 0]
+    if data.ndim != 2:
+        return None
+    if data.shape[:2] != tuple(target_shape):
+        data = cv2.resize(
+            data.astype(np.float32),
+            (int(target_shape[1]), int(target_shape[0])),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return np.asarray(data[ys, xs], dtype=np.float32)
+
+
+def vector_or_none(value, expected_count):
+    if value is None:
+        return None
+    vector = np.asarray(value, dtype=np.float32).reshape(-1)
+    if len(vector) != int(expected_count) or not np.all(np.isfinite(vector)):
+        return None
+    return np.ascontiguousarray(vector, dtype=np.float32)
+
+
+def hsv_gaussian_features(hsv):
+    hsv = np.asarray(hsv, dtype=np.float32)
+    if hsv.ndim < 2 or hsv.shape[-1] < 3:
+        return np.empty((*hsv.shape[:-1], 4), dtype=np.float32)
+    radians = hsv[..., 0] * (2.0 * np.pi / 180.0)
+    saturation = hsv[..., 1] / 255.0
+    value = hsv[..., 2] / 255.0
+    features = np.stack(
+        [
+            np.sin(radians),
+            np.cos(radians),
+            saturation,
+            value,
+        ],
+        axis=-1,
+    )
+    return np.ascontiguousarray(features, dtype=np.float32)
+
+
+def diagonal_gaussian_logpdf(features, mean, std):
+    features = np.asarray(features, dtype=np.float32)
+    mean = np.asarray(mean, dtype=np.float32).reshape(4)
+    std = np.maximum(np.asarray(std, dtype=np.float32).reshape(4), 1e-4)
+    normalized = (features - mean) / std
+    return -0.5 * np.sum(normalized * normalized + np.log(2.0 * np.pi * std * std), axis=-1)
+
+
+def hsv_gaussian_score(hsv, positive_mean, positive_std, negative_mean=None, negative_std=None):
+    features = hsv_gaussian_features(hsv)
+    positive = diagonal_gaussian_logpdf(features, positive_mean, positive_std)
+    if negative_mean is None or negative_std is None:
+        return positive
+    negative = diagonal_gaussian_logpdf(features, negative_mean, negative_std)
+    return positive - negative
+
+
+def fit_polyline_segments(points_xyz, segment_count=12):
+    points = np.asarray(points_xyz, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] < 3:
+        return None
+    points = points[np.all(np.isfinite(points[:, :3]), axis=1), :3]
+    if len(points) < 2:
+        return None
+    return resample_polyline(points, max(2, int(segment_count) + 1)).astype(np.float32)
+
+
+def resample_polyline(points_xyz, output_count):
+    points = np.asarray(points_xyz, dtype=np.float64)
+    output_count = max(2, int(output_count))
+    if len(points) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    if len(points) == 1:
+        return np.repeat(points[:, :3], output_count, axis=0).astype(np.float32)
+
+    deltas = np.linalg.norm(np.diff(points[:, :3], axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(deltas)])
+    total = float(cumulative[-1])
+    if not np.isfinite(total) or total <= 1e-9:
+        return np.repeat(points[:1, :3], output_count, axis=0).astype(np.float32)
+
+    target = np.linspace(0.0, total, output_count)
+    output = np.empty((output_count, 3), dtype=np.float64)
+    for axis in range(3):
+        output[:, axis] = np.interp(target, cumulative, points[:, axis])
+    return output.astype(np.float32)
+
+
+def polyline_residual(points, nodes):
+    distances = point_to_polyline_distances(points, nodes)
+    if len(distances) == 0:
+        return 0.0
+    return float(np.median(distances))
+
+
+def point_to_polyline_distances(points, nodes):
+    points = np.asarray(points, dtype=np.float64)
+    nodes = np.asarray(nodes, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] < 3 or nodes.ndim != 2 or nodes.shape[1] < 3 or len(nodes) < 2:
+        return np.empty((0,), dtype=np.float64)
+    points = points[np.all(np.isfinite(points[:, :3]), axis=1), :3]
+    nodes = nodes[np.all(np.isfinite(nodes[:, :3]), axis=1), :3]
+    if len(points) == 0 or len(nodes) < 2:
+        return np.empty((0,), dtype=np.float64)
+
+    best = np.full(len(points), np.inf, dtype=np.float64)
+    for start, end in zip(nodes[:-1], nodes[1:]):
+        segment = end - start
+        length_sq = float(np.dot(segment, segment))
+        if length_sq <= 1e-12:
+            candidate = np.linalg.norm(points - start[None, :], axis=1)
+        else:
+            t = np.clip(((points - start[None, :]) @ segment) / length_sq, 0.0, 1.0)
+            projection = start[None, :] + t[:, None] * segment[None, :]
+            candidate = np.linalg.norm(points - projection, axis=1)
+        best = np.minimum(best, candidate)
+    return best[np.isfinite(best)]
+
+
+def remove_small_components(mask, min_area=80, keep_largest_component=False, max_components=0):
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return np.zeros_like(mask), 0
+
+    components = []
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area >= int(min_area):
+            components.append((area, label))
+
+    if not components:
+        return np.zeros_like(mask), 0
+
+    components.sort(reverse=True)
+    if keep_largest_component:
+        components = components[:1]
+    elif int(max_components) > 0:
+        components = components[: int(max_components)]
+
+    cleaned = np.zeros_like(mask)
+    for _area, label in components:
+        cleaned[labels == label] = 255
+    return cleaned, len(components)
+
+
+def skeletonize_mask(mask, max_iterations=200):
+    image = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8)
+    if not np.any(image):
+        return np.zeros_like(mask, dtype=np.uint8)
+
+    image = np.pad(image, 1, mode="constant", constant_values=0)
+    for _ in range(int(max_iterations)):
+        changed = False
+        for subiteration in (0, 1):
+            p2 = image[:-2, 1:-1]
+            p3 = image[:-2, 2:]
+            p4 = image[1:-1, 2:]
+            p5 = image[2:, 2:]
+            p6 = image[2:, 1:-1]
+            p7 = image[2:, :-2]
+            p8 = image[1:-1, :-2]
+            p9 = image[:-2, :-2]
+            p1 = image[1:-1, 1:-1]
+
+            neighbor_count = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+            transition_count = (
+                ((p2 == 0) & (p3 == 1)).astype(np.uint8)
+                + ((p3 == 0) & (p4 == 1)).astype(np.uint8)
+                + ((p4 == 0) & (p5 == 1)).astype(np.uint8)
+                + ((p5 == 0) & (p6 == 1)).astype(np.uint8)
+                + ((p6 == 0) & (p7 == 1)).astype(np.uint8)
+                + ((p7 == 0) & (p8 == 1)).astype(np.uint8)
+                + ((p8 == 0) & (p9 == 1)).astype(np.uint8)
+                + ((p9 == 0) & (p2 == 1)).astype(np.uint8)
+            )
+
+            if subiteration == 0:
+                marker = (
+                    (p1 == 1)
+                    & (neighbor_count >= 2)
+                    & (neighbor_count <= 6)
+                    & (transition_count == 1)
+                    & ((p2 * p4 * p6) == 0)
+                    & ((p4 * p6 * p8) == 0)
+                )
+            else:
+                marker = (
+                    (p1 == 1)
+                    & (neighbor_count >= 2)
+                    & (neighbor_count <= 6)
+                    & (transition_count == 1)
+                    & ((p2 * p4 * p8) == 0)
+                    & ((p2 * p6 * p8) == 0)
+                )
+
+            if np.any(marker):
+                p1[marker] = 0
+                changed = True
+        if not changed:
+            break
+
+    return (image[1:-1, 1:-1] * 255).astype(np.uint8)
+
+
+def build_skeleton_graph(skeleton):
+    coords_yx = np.argwhere(np.asarray(skeleton) > 0)
+    coord_to_idx = {tuple(coord): idx for idx, coord in enumerate(coords_yx)}
+    neighbors = [[] for _ in range(len(coords_yx))]
+    for idx, (y, x) in enumerate(coords_yx):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                neighbor_idx = coord_to_idx.get((y + dy, x + dx))
+                if neighbor_idx is not None:
+                    neighbors[idx].append(neighbor_idx)
+    return coords_yx, neighbors
+
+
+def prune_short_skeleton_branches(skeleton, max_branch_length=10, max_passes=2):
+    pruned = (np.asarray(skeleton, dtype=np.uint8) > 0).astype(np.uint8)
+    max_branch_length = max(0, int(max_branch_length))
+    max_passes = max(0, int(max_passes))
+    if max_branch_length <= 0 or max_passes <= 0 or not np.any(pruned):
+        return (pruned * 255).astype(np.uint8)
+
+    for _ in range(max_passes):
+        coords_yx, neighbors = build_skeleton_graph(pruned)
+        if len(coords_yx) == 0:
+            break
+        degrees = np.array([len(item) for item in neighbors], dtype=np.int32)
+        endpoints = np.flatnonzero(degrees == 1)
+        remove_indices = set()
+
+        for endpoint in endpoints:
+            endpoint = int(endpoint)
+            path = [endpoint]
+            previous = -1
+            current = endpoint
+
+            while True:
+                next_nodes = [idx for idx in neighbors[current] if idx != previous]
+                if not next_nodes:
+                    break
+                if len(next_nodes) > 1:
+                    break
+                previous, current = current, int(next_nodes[0])
+                path.append(current)
+                if degrees[current] != 2:
+                    break
+                if len(path) > max_branch_length + 1:
+                    break
+
+            if len(path) <= max_branch_length + 1 and degrees[current] > 2:
+                remove_indices.update(path[:-1])
+
+        if not remove_indices:
+            break
+        remove_yx = coords_yx[np.fromiter(remove_indices, dtype=np.int64)]
+        pruned[remove_yx[:, 0], remove_yx[:, 1]] = 0
+
+    return (pruned * 255).astype(np.uint8)
+
+
+def skeleton_centerline_paths(skeleton):
+    skeleton = np.asarray(skeleton, dtype=np.uint8)
+    if not np.any(skeleton):
+        return [], 0
+
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats((skeleton > 0).astype(np.uint8), connectivity=8)
+    paths = []
+    total_branch_count = 0
+    components = []
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area > 0:
+            components.append((area, label))
+    components.sort(reverse=True)
+
+    for _area, label in components:
+        component_skeleton = np.zeros_like(skeleton, dtype=np.uint8)
+        component_skeleton[labels == label] = 255
+        coords_yx, neighbors = build_skeleton_graph(component_skeleton)
+        path_xy, branch_count = longest_skeleton_path(coords_yx, neighbors)
+        total_branch_count += branch_count
+        if len(path_xy) >= 2:
+            paths.append(path_xy)
+
+    return paths, int(total_branch_count)
+
+
+def stitch_centerline_paths(paths):
+    remaining = [
+        np.asarray(path, dtype=np.float32)[:, :2]
+        for path in paths
+        if np.asarray(path).ndim == 2 and np.asarray(path).shape[1] >= 2 and len(path) >= 2
+    ]
+    if not remaining:
+        return np.empty((0, 2), dtype=np.float32)
+
+    start_index = int(np.argmax([polyline_length(path) for path in remaining]))
+    stitched = remaining.pop(start_index).copy()
+
+    while remaining:
+        best = None
+        for index, path in enumerate(remaining):
+            candidates = (
+                (np.linalg.norm(stitched[-1] - path[0]), "append", False),
+                (np.linalg.norm(stitched[-1] - path[-1]), "append", True),
+                (np.linalg.norm(stitched[0] - path[-1]), "prepend", False),
+                (np.linalg.norm(stitched[0] - path[0]), "prepend", True),
+            )
+            distance, side, reverse = min(candidates, key=lambda item: item[0])
+            if best is None or distance < best[0]:
+                best = (distance, index, side, reverse)
+
+        _distance, index, side, reverse = best
+        path = remaining.pop(index)
+        if reverse:
+            path = path[::-1].copy()
+        if side == "append":
+            stitched = np.vstack([stitched, path])
+        else:
+            stitched = np.vstack([path, stitched])
+
+    return np.ascontiguousarray(stitched, dtype=np.float32)
+
+
+def smooth_polyline_xy(points_xy, window=9):
+    points = np.asarray(points_xy, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 2 or len(points) < 3:
+        return np.empty((0, 2), dtype=np.float32) if len(points) == 0 else np.ascontiguousarray(points[:, :2], dtype=np.float32)
+
+    window = max(1, int(window))
+    if window <= 1:
+        return np.ascontiguousarray(points[:, :2], dtype=np.float32)
+    if window % 2 == 0:
+        window += 1
+    window = min(window, len(points) if len(points) % 2 == 1 else len(points) - 1)
+    if window <= 1:
+        return np.ascontiguousarray(points[:, :2], dtype=np.float32)
+
+    radius = window // 2
+    padded = np.pad(points[:, :2], ((radius, radius), (0, 0)), mode="edge")
+    kernel = np.full(window, 1.0 / window, dtype=np.float32)
+    smoothed = np.empty((len(points), 2), dtype=np.float32)
+    for axis in range(2):
+        smoothed[:, axis] = np.convolve(padded[:, axis], kernel, mode="valid")
+    smoothed[0] = points[0, :2]
+    smoothed[-1] = points[-1, :2]
+    return np.ascontiguousarray(smoothed, dtype=np.float32)
+
+
+def polyline_length(points_xy):
+    points = np.asarray(points_xy, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 2 or len(points) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(points[:, :2], axis=0), axis=1)))
+
+
+def longest_skeleton_path(coords_yx, neighbors):
+    if len(coords_yx) == 0:
+        return np.empty((0, 2), dtype=np.float32), 0
+
+    degrees = np.array([len(item) for item in neighbors], dtype=np.int32)
+    endpoint_indices = np.flatnonzero(degrees == 1)
+    branch_count = int(np.count_nonzero(degrees > 2))
+
+    starts = endpoint_indices if len(endpoint_indices) >= 2 else np.arange(len(coords_yx))
+    best_path = []
+    best_distance = -1
+    for start in starts:
+        distances, parents = bfs_path(neighbors, int(start))
+        candidate_ends = endpoint_indices if len(endpoint_indices) >= 2 else np.arange(len(coords_yx))
+        for end in candidate_ends:
+            end = int(end)
+            if end == int(start) or distances[end] <= best_distance:
+                continue
+            path = reconstruct_path(parents, int(start), end)
+            if path:
+                best_path = path
+                best_distance = distances[end]
+
+    if not best_path:
+        best_path = list(range(len(coords_yx)))
+
+    path_yx = coords_yx[np.asarray(best_path, dtype=np.int64)]
+    path_xy = np.column_stack([path_yx[:, 1], path_yx[:, 0]])
+    return np.ascontiguousarray(path_xy, dtype=np.float32), branch_count
+
+
+def bfs_path(neighbors, start_idx):
+    distances = [-1] * len(neighbors)
+    parents = [-1] * len(neighbors)
+    queue = deque([start_idx])
+    distances[start_idx] = 0
+    while queue:
+        current = queue.popleft()
+        for neighbor in neighbors[current]:
+            if distances[neighbor] != -1:
+                continue
+            distances[neighbor] = distances[current] + 1
+            parents[neighbor] = current
+            queue.append(neighbor)
+    return distances, parents
+
+
+def reconstruct_path(parents, start_idx, end_idx):
+    path = [end_idx]
+    current = end_idx
+    while current != start_idx:
+        current = parents[current]
+        if current == -1:
+            return []
+        path.append(current)
+    path.reverse()
+    return path
+
+
+def confidence_array(confidence_map, target_shape):
+    if confidence_map is None:
+        return None
+    try:
+        data = np.asarray(confidence_map.get_data())
+    except Exception:
+        data = np.asarray(confidence_map)
+    if data.ndim == 3:
+        data = data[:, :, 0]
+    if data.ndim != 2:
+        return None
+    if data.shape[:2] != tuple(target_shape):
+        data = cv2.resize(
+            data.astype(np.float32),
+            (int(target_shape[1]), int(target_shape[0])),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return np.asarray(data, dtype=np.float32)
+
+
+def odd_kernel_size(value):
+    value = int(max(0, value))
+    if value <= 1:
+        return 0
+    return value if value % 2 == 1 else value + 1
