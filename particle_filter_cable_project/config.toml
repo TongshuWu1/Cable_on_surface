@@ -36,11 +36,15 @@ point_size = 2.0
 # Options: "segmentation", "tracking", "mask".
 rgb_view = "segmentation"
 
+# Display-only persistence. This prevents the 3D cable overlay/support points
+# from blinking when measurement frames are skipped for speed or briefly invalid.
+hold_frames = 8
+
 [pidnet]
 # Relative paths are resolved from this config file.
 checkpoint = "models/pidnet_cable_best.pt"
 device = "cuda"
-threshold = 0.40
+threshold = 0.4
 base_channels = 24
 
 [detector]
@@ -59,18 +63,18 @@ roi_padding_px = 96
 full_frame_every = 12
 
 # Run RGB segmentation + 3D measurement every N frames. Skipped frames use the
-# particle filter prediction and do not count as lost tracking.
-update_every = 1
+# particle filter prediction and do not count as lost tracking. 2 gives a 30 Hz
+# measurement path on a 60 FPS camera and keeps the UI smoother.
+update_every = 2
 
 # Binary mask cleanup after the selected detector. Increase min_area_px to ignore
 # small noise; increase close_kernel to bridge tiny mask gaps.
 min_area_px = 80
-open_kernel = 3
-close_kernel = 5
+open_kernel = 7
+close_kernel = 1
 
-# Remove short skeleton leaf branches before selecting the ordered cable path.
-# This reduces centerline jitter from small mask burrs without assuming the
-# cable is on a surface.
+# Used by HSV/legacy centerline geometry frames. The default PIDNet path scores
+# masked ZED cable points directly and does not require skeleton extraction.
 skeleton_prune_px = 10
 skeleton_prune_passes = 2
 centerline_smooth_window = 9
@@ -107,15 +111,15 @@ gaussian_negative_std = [0.71042, 0.557233, 0.042556, 0.089174]
 # display faster without changing particle-filter scoring.
 stride = 4
 max_points = 100000
-cloud_update_every = 1
+cloud_update_every = 2
 
 # Retrieve the ZED confidence map every N frames. Use 0 to disable confidence
 # filtering, or increase to 2-3 if confidence retrieval becomes expensive.
-confidence_update_every = 1
+confidence_update_every = 2
 
 [cable]
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
-segments = 10
+segments = 12
 
 # Fixed segment length in meters. 0 estimates the length once from the first
 # valid 3D measurement and then keeps it fixed.
@@ -125,19 +129,20 @@ segment_length_m = 0.0
 max_visual_points = 8000
 
 [measurement]
-# ZED lookup radius around each 2D centerline pixel.
+# Used by HSV/legacy centerline lifting.
 node_search_px = 2
 
-# Maximum ordered 2D centerline pixels lifted into 3D before fitting. This keeps
-# cost bounded and avoids giving dense masks too much weight.
+# Maximum ordered 2D centerline pixels lifted into 3D before fitting on the
+# HSV/legacy centerline path.
 centerline_points = 48
 
 # Reject a local ZED lookup window when local depth is too spread out. This
 # removes edge/background depth. Use 0 to disable.
 local_depth_spread_m = 0.06
 
-# Smooth fitted 3D measurement nodes before proposal injection. This damps small
-# detector/skeleton jitter while still letting raw support points score particles.
+# Smooth fitted 3D measurement nodes before proposal injection when a fitted
+# centerline measurement is available. The PIDNet mask-point path scores raw
+# support points directly.
 smoothing = true
 smoothing_alpha = 0.30
 smoothing_gate_m = 0.040
@@ -150,16 +155,13 @@ prediction_gate_m = 0.12
 # tracker can reacquire from the full RGB segmentation.
 gate_reacquire_after = 4
 
-# Options: "centerline" is faster/stabler, "mask" uses more RGB mask pixels.
-source_points = "centerline"
-
 # ZED confidence max for accepted cable depth samples. Use a negative value to
 # disable confidence filtering.
 confidence_max = 85.0
 
 [particle_filter]
 enabled = true
-particles = 300
+particles = 500
 
 # Initial spread when the first valid cable measurement initializes particles.
 initial_node_std_m = 0.025
@@ -167,26 +169,59 @@ initial_direction_std = 0.10
 
 # Per-frame process noise on cable vertices, in meters.
 process_node_std_m = 0.006
-process_direction_std = 0.035
+process_direction_std = 0.020
+
+# Smooth adjacent segment directions inside each particle so the chain cannot
+# fold wildly while still following the masked cable cloud.
+direction_smooth_passes = 1
 
 # Measurement likelihood width, in meters. Smaller values trust ZED points more;
 # larger values make the filter smoother but slower to react.
 measurement_node_std_m = 0.030
 
-# Maximum lifted 3D support points used to score particles by point-to-segment
+# Maximum masked ZED cable points used to score particles by point-to-segment
 # distance. This is the main particle-score cost knob.
-measurement_points = 96
+measurement_points = 1024
+
+# Particle scoring uses tensor parallelism on CUDA when available.
+scoring_backend = "auto"
+score_chunk_points = 512
+
+# During PF initialization/reacquisition, order the masked 3D cloud by
+# estimating cable endpoints on a k-nearest-neighbor graph. The raw unordered
+# cloud is still used for particle scoring.
+endpoint_ordering = true
+ordering_max_points = 384
+ordering_knn = 8
+
+# Periodic endpoint graph refresh can correct drift, but it can also cause
+# sudden jumps. Keep it off during stable tracking unless reacquisition is bad.
+endpoint_refresh_interval = 0
+
+# After initialization, order new masked points by projection onto the current
+# filtered chain. This avoids rebuilding the expensive endpoint graph every
+# frame and keeps start/end identity stable.
+reference_ordering = true
+reference_ordering_gate_m = 0.08
+
+# Keep the particle start/end close to the current measured endpoints. This is
+# the main guard against segment-order flips in a good unordered point cloud.
+endpoint_penalty_weight = 1.0
+
+# Reset the PF from the current valid masked-cloud fit when the mean node
+# disagreement is this large. Use 0 to disable.
+measurement_reset_error_m = 0.25
 
 # Adaptive measurement proposals reduce detector jitter: when the measured cable
 # is already close to the filtered estimate, only stable_ratio particles are
-# regenerated. The ratio ramps to measurement_proposal_ratio as mean node error
-# grows from start_error_m to full_error_m.
-measurement_proposal_ratio = 0.15
-measurement_proposal_stable_ratio = 0.02
+# regenerated. Because the PIDNet mask cloud is the trusted measurement, the
+# maximum ratio is intentionally high enough to recover from bad particles.
+measurement_proposal_ratio = 0.30
+measurement_proposal_stable_ratio = 0.04
 measurement_proposal_start_error_m = 0.015
 measurement_proposal_full_error_m = 0.060
 measurement_proposal_node_std_m = 0.012
-measurement_proposal_direction_std = 0.045
+measurement_proposal_direction_std = 0.025
 
 # Robust scoring keeps this fraction of the lowest point-to-segment distances,
 # so a few bad depth points do not dominate the weight.
@@ -196,6 +231,14 @@ score_keep_fraction = 0.80
 # Use 0 to disable.
 coverage_penalty_m = 0.025
 coverage_min_fraction = 0.05
+
+# Penalize sharp adjacent-segment bends during scoring. This keeps the PF from
+# explaining good cable points with a chain that folds through the cloud.
+bend_penalty_m = 0.030
+
+# When particle weights collapse, display the best actual particle instead of a
+# direction average that may not correspond to any valid chain hypothesis.
+map_estimate_effective_ratio = 0.35
 
 # Minimum support required before a measurement update is trusted.
 min_measurement_points = 12

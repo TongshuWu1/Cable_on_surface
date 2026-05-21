@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+DEFAULT_IMAGE_SIZE = "1280x720"
 
 
 def parse_args():
@@ -29,7 +30,12 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=PROJECT_DIR / "models/pidnet_cable_best.pt")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--imgsz", type=int, default=512)
+    parser.add_argument(
+        "--imgsz",
+        type=parse_image_size,
+        default=parse_image_size(DEFAULT_IMAGE_SIZE),
+        help="Training image size. Use 1280x720 for full ZED HD720, or a single value like 512 for square training.",
+    )
     parser.add_argument("--base-channels", type=int, default=24)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -43,9 +49,9 @@ def parse_args():
 
 
 class CableMaskDataset(Dataset):
-    def __init__(self, pairs, image_size=512, augment=False):
+    def __init__(self, pairs, image_size=DEFAULT_IMAGE_SIZE, augment=False):
         self.pairs = list(pairs)
-        self.image_size = int(image_size)
+        self.image_size = parse_image_size(image_size)
         self.augment = bool(augment)
         self.mean = np.asarray(IMAGENET_MEAN, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.asarray(IMAGENET_STD, dtype=np.float32).reshape(1, 1, 3)
@@ -118,15 +124,50 @@ def split_pairs(pairs, val_split, seed):
     return pairs[val_count:], pairs[:val_count]
 
 
+def parse_image_size(value):
+    if isinstance(value, (tuple, list)):
+        if len(value) != 2:
+            raise argparse.ArgumentTypeError("Image size tuple must be (width, height).")
+        width, height = value
+    else:
+        text = str(value).strip().lower()
+        if text in {"720p", "hd720"}:
+            return 1280, 720
+        text = text.replace(",", "x").replace("*", "x")
+        if "x" in text:
+            parts = [part.strip() for part in text.split("x") if part.strip()]
+            if len(parts) != 2:
+                raise argparse.ArgumentTypeError("Use image size as WIDTHxHEIGHT, for example 1280x720.")
+            width, height = parts
+        else:
+            width = height = text
+
+    try:
+        width = int(width)
+        height = int(height)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("Image size must be an integer or WIDTHxHEIGHT.") from exc
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("Image width and height must be positive.")
+    return width, height
+
+
+def image_size_text(image_size):
+    width, height = parse_image_size(image_size)
+    return f"{width}x{height}" if width != height else str(width)
+
+
 def resize_pair(image, mask, image_size):
+    target_w, target_h = parse_image_size(image_size)
     h, w = image.shape[:2]
-    scale = image_size / max(h, w)
+    scale = min(target_w / max(w, 1), target_h / max(h, 1))
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
-    image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    image_interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    image = cv2.resize(image, (new_w, new_h), interpolation=image_interpolation)
     mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-    pad_x = image_size - new_w
-    pad_y = image_size - new_h
+    pad_x = target_w - new_w
+    pad_y = target_h - new_h
     left = pad_x // 2
     right = pad_x - left
     top = pad_y // 2
@@ -244,7 +285,10 @@ def train(args):
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else str(device)
-    print(f"Training on {len(train_pairs)} images, validating on {len(val_pairs)} images, device={device_name}, amp={use_amp}")
+    print(
+        f"Training on {len(train_pairs)} images, validating on {len(val_pairs)} images, "
+        f"imgsz={image_size_text(args.imgsz)}, device={device_name}, amp={use_amp}"
+    )
     for epoch in range(1, int(args.epochs) + 1):
         start = time.time()
         model.train()
@@ -276,7 +320,18 @@ def train(args):
                     "config": {
                         "model": "pidnet_small_binary",
                         "base_channels": int(args.base_channels),
-                        "imgsz": int(args.imgsz),
+                        "imgsz": image_size_text(args.imgsz),
+                    },
+                    "training": {
+                        "epochs": int(args.epochs),
+                        "batch_size": int(args.batch_size),
+                        "lr": float(args.lr),
+                        "weight_decay": float(args.weight_decay),
+                        "val_split": float(args.val_split),
+                        "num_workers": int(args.num_workers),
+                        "boundary_weight": float(args.boundary_weight),
+                        "amp": bool(use_amp),
+                        "seed": int(args.seed),
                     },
                     "metrics": metrics,
                 },

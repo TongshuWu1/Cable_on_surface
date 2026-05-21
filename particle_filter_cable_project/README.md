@@ -1,6 +1,7 @@
 # Particle Filter Cable Project
 
-Starter project for particle-filter cable skeleton reconstruction and tracking.
+Particle-filter 3D cable reconstruction and tracking from a PIDNet cable mask
+and ZED point cloud.
 
 Run the live tracker with no arguments:
 
@@ -29,23 +30,32 @@ Current pipeline:
 1. Segment the cable in RGB using the PIDNet-S binary cable segmenter.
 2. Clean the mask while preserving multiple visible fragments by default,
    because there is only one physical cable and gaps usually mean occlusion.
-3. Skeletonize each visible fragment, then stitch the fragment centerlines into
-   one ordered cable path for initialization.
-4. Use the ordered RGB centerline to sample the ZED point cloud.
-5. Use those ordered 3D points only to initialize the chain.
-6. Score each particle by distance from a small support set of lifted skeleton
-   centerline points to the closest segment in that particle. The support cap is
-   `particle_filter.measurement_points`; `measurement.source_points = "mask"`
-   can switch back to sampled masked RGB points for comparison. The score keeps
-   the best `particle_filter.score_keep_fraction` distances, so sparse bad depth
-   points do not dominate the particle weight.
-7. During occlusion, assign visible points to the closest predicted segment and
+3. Use the PIDNet mask to select ZED point-cloud samples that belong to the
+   cable.
+4. On initialization/reacquisition, estimate cable start/end from the masked 3D
+   cloud with a k-nearest-neighbor graph, then resample the endpoint-to-endpoint
+   path into ordered cable nodes.
+5. On normal tracking frames, order the masked 3D points by projection onto the
+   current filtered chain. This is cheaper than rebuilding the graph every frame
+   and keeps start/end identity stable.
+6. Treat the same masked 3D points as the measurement support set for the particle
+   filter. The support cap is `particle_filter.measurement_points`.
+7. Each particle is one connected fixed-length 3D segment chain.
+8. Score each particle by the distance from every masked cable point to the
+   closest segment in that particle. CUDA tensor scoring is used automatically
+   when available.
+9. Add an endpoint penalty so the particle start/end stay close to the measured
+   cable start/end instead of flipping segment order.
+10. Keep the best `particle_filter.score_keep_fraction` point distances, so
+   sparse bad depth points do not dominate the particle weight.
+11. During occlusion, assign visible points to the closest predicted segment and
    only mark those segments as observed; hidden segments continue by prediction.
-8. Add a coverage penalty when expected visible segments do not own enough
+12. Add a coverage penalty when expected visible segments do not own enough
    support points.
-9. Regenerate a fraction of particles around the current measured 3D cable fit,
-   then score the mixed particle set with the same point-to-segment distance.
-10. Track the fixed-length connected segment chain with the particle filter.
+13. Regenerate a fraction of particles around the current ordered masked-cloud
+   fit, then score the mixed particle set with the same point-to-segment
+   distance.
+14. Track the fixed-length connected segment chain with the particle filter.
 
 Label masks and train the PIDNet-S detector on CUDA:
 
@@ -58,9 +68,17 @@ The GUI workflow is:
 1. Open/capture RGB frames.
 2. Paint only the cable pixels in the binary mask. Every unpainted pixel is
    background.
-3. Save labels to `datasets/cable_pidnet/images/...` and `datasets/cable_pidnet/masks/...`.
-4. Click `Train PIDNet-S on CUDA`.
-5. Run live tracking with the saved checkpoint.
+3. Use `Label Open` / `Label Close` only when cleaning a hand-painted training
+   mask.
+4. Save labels to `datasets/cable_pidnet/images/...` and `datasets/cable_pidnet/masks/...`.
+5. Use `Live PIDNet cleanup` to tune the same threshold, open kernel, close
+   kernel, and min-area cleanup used by `main.py`, then save those values to
+   `config.toml`.
+6. Use `Check Dataset`, tune the PIDNet training values, and save/load those
+   values with `Save Params` / `Load Params`.
+7. Click `Train PIDNet-S on CUDA`, then test the checkpoint on current, train,
+   and validation frames.
+8. Run live tracking with the saved checkpoint.
 
 Live ZED split view:
 
@@ -109,7 +127,7 @@ prints IoU/Dice on the labeled set, and updates only the `[hsv]` values in
 Headless PIDNet-S training:
 
 ```bash
-../.venv/bin/python tools/train_pidnet_cable.py --dataset /path/to/cable_dataset --output models/pidnet_cable_best.pt --epochs 80 --batch-size 8 --imgsz 512 --device cuda
+../.venv/bin/python tools/train_pidnet_cable.py --dataset /path/to/cable_dataset --output models/pidnet_cable_best.pt --epochs 80 --batch-size 8 --imgsz 1280x720 --device cuda
 ```
 
 Dataset layout:
@@ -126,16 +144,16 @@ The `val` split is optional. A flat `images/` and `masks/` layout also works,
 and the trainer will create a validation split by filename stem. Masks are
 binary cable masks where nonzero pixels are cable and zero pixels are
 background. You do not paint background explicitly. The PIDNet path feeds the
-same downstream tracking output: binary mask, skeleton, ordered centerline,
-lifted 3D points, then particle-filter segment scoring.
+downstream tracker as binary mask, masked ZED cable points, then particle-filter
+segment scoring.
 
 The live UI shows RGB on the left and the ZED point cloud on the right. The
-default cable model is `cable.segments = 2`, so the tracked skeleton has 3
-nodes. Important tuning sections:
+cable model is controlled by `cable.segments`; `N` segments means `N + 1`
+connected 3D nodes. Important tuning sections:
 
 - `pidnet`: model checkpoint, CUDA device, probability threshold.
 - `detector`: PIDNet/HSV backend, resized inference, ROI reacquisition.
 - `hsv`: range/Gaussian HSV baseline and fast mask-only tracking path.
-- `measurement`: RGB centerline lifting, depth rejection, prediction gating.
+- `measurement`: masked ZED point selection, depth rejection, prediction gating.
 - `particle_filter`: particle count, process noise, scoring, occlusion.
 - `point_cloud`: viewer point-cloud sampling and confidence-map cadence.

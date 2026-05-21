@@ -96,6 +96,7 @@ def parse_args():
     parser.add_argument("--rgb-width", type=int, default=config_value(config, "viewer", "rgb_width", 620))
     parser.add_argument("--cloud-width", type=int, default=config_value(config, "viewer", "cloud_width", 1180))
     parser.add_argument("--height", type=int, default=config_value(config, "viewer", "height", 900))
+    parser.add_argument("--viewer-hold-frames", type=int, default=config_value(config, "viewer", "hold_frames", 8), help="Keep the last drawn cable overlay for this many frames when a measurement frame is skipped or briefly invalid.")
     parser.add_argument(
         "--rgb-view",
         choices=("segmentation", "tracking", "mask"),
@@ -157,12 +158,6 @@ def parse_args():
         default=config_value(config, "measurement", "gate_reacquire_after", 4),
         help="Disable prediction gating after this many prediction-only frames so the tracker can reacquire.",
     )
-    parser.add_argument(
-        "--zed-measurement-points",
-        choices=("centerline", "mask"),
-        default=config_value(config, "measurement", "source_points", "centerline"),
-        help="Use lifted skeleton centerline points or all masked RGB points for 3D PF scoring.",
-    )
     parser.add_argument("--cable-confidence-max", type=float, default=config_value(config, "measurement", "confidence_max", 85.0), help="Use <0 to disable.")
     parser.add_argument("--cable-segment-length", type=float, default=config_value(config, "cable", "segment_length_m", 0.0), help="Fixed segment length in meters. 0 estimates once from the first measurement.")
     parser.add_argument("--particle-filter", action=argparse.BooleanOptionalAction, default=config_value(config, "particle_filter", "enabled", True))
@@ -171,18 +166,79 @@ def parse_args():
     parser.add_argument("--pf-initial-direction-std", type=float, default=config_value(config, "particle_filter", "initial_direction_std", pf_defaults.initial_direction_std))
     parser.add_argument("--pf-process-std", type=float, default=config_value(config, "particle_filter", "process_node_std_m", pf_defaults.process_node_std_m))
     parser.add_argument("--pf-process-direction-std", type=float, default=config_value(config, "particle_filter", "process_direction_std", pf_defaults.process_direction_std))
+    parser.add_argument("--pf-direction-smooth-passes", type=int, default=config_value(config, "particle_filter", "direction_smooth_passes", pf_defaults.direction_smooth_passes))
     parser.add_argument("--pf-measurement-std", type=float, default=config_value(config, "particle_filter", "measurement_node_std_m", pf_defaults.measurement_node_std_m))
     parser.add_argument(
         "--pf-measurement-points",
         type=int,
         default=config_value(config, "particle_filter", "measurement_points", pf_defaults.measurement_max_points),
-        help="Maximum support points used to score particles. These are sampled from the lifted centerline by default.",
+        help="Maximum masked ZED cable points used to score particles.",
+    )
+    parser.add_argument(
+        "--pf-scoring-backend",
+        choices=("auto", "cuda", "cpu"),
+        default=config_value(config, "particle_filter", "scoring_backend", pf_defaults.scoring_backend),
+        help="Particle scoring backend. auto uses CUDA tensors when available.",
+    )
+    parser.add_argument(
+        "--pf-score-chunk-points",
+        type=int,
+        default=config_value(config, "particle_filter", "score_chunk_points", pf_defaults.score_chunk_points),
+        help="Point chunk size for tensor particle scoring.",
+    )
+    parser.add_argument(
+        "--pf-endpoint-ordering",
+        action=argparse.BooleanOptionalAction,
+        default=config_value(config, "particle_filter", "endpoint_ordering", pf_defaults.endpoint_ordering),
+        help="Order masked 3D cable points by graph endpoints for PF initialization/reacquisition.",
+    )
+    parser.add_argument(
+        "--pf-ordering-max-points",
+        type=int,
+        default=config_value(config, "particle_filter", "ordering_max_points", pf_defaults.ordering_max_points),
+        help="Maximum masked cable points used for endpoint/geodesic ordering.",
+    )
+    parser.add_argument(
+        "--pf-ordering-knn",
+        type=int,
+        default=config_value(config, "particle_filter", "ordering_knn", pf_defaults.ordering_knn),
+        help="K-nearest neighbors for endpoint/geodesic ordering graph.",
+    )
+    parser.add_argument(
+        "--pf-endpoint-refresh-interval",
+        type=int,
+        default=config_value(config, "particle_filter", "endpoint_refresh_interval", pf_defaults.endpoint_refresh_interval),
+        help="Run the endpoint graph ordering every N measurement updates to correct reference-order drift. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--pf-reference-ordering",
+        action=argparse.BooleanOptionalAction,
+        default=config_value(config, "particle_filter", "reference_ordering", pf_defaults.reference_ordering),
+        help="After initialization, order masked points against the current filtered chain instead of rebuilding the endpoint graph.",
+    )
+    parser.add_argument(
+        "--pf-reference-ordering-gate",
+        type=float,
+        default=config_value(config, "particle_filter", "reference_ordering_gate_m", pf_defaults.reference_ordering_gate_m),
+        help="Max distance from the current chain for points used to build the ordered measurement fit.",
+    )
+    parser.add_argument(
+        "--pf-endpoint-penalty-weight",
+        type=float,
+        default=config_value(config, "particle_filter", "endpoint_penalty_weight", pf_defaults.endpoint_penalty_weight),
+        help="Extra score weight that keeps particle start/end near measured cable endpoints.",
     )
     parser.add_argument(
         "--pf-measurement-proposal-ratio",
         type=float,
         default=config_value(config, "particle_filter", "measurement_proposal_ratio", pf_defaults.measurement_proposal_ratio),
         help="Maximum fraction of particles regenerated around the current measured cable fit.",
+    )
+    parser.add_argument(
+        "--pf-measurement-reset-error",
+        type=float,
+        default=config_value(config, "particle_filter", "measurement_reset_error_m", pf_defaults.measurement_reset_error_m),
+        help="Reset the PF from a valid measured cable fit when mean node disagreement exceeds this many meters. Use 0 to disable.",
     )
     parser.add_argument(
         "--pf-measurement-proposal-stable-ratio",
@@ -232,6 +288,8 @@ def parse_args():
         default=config_value(config, "particle_filter", "coverage_min_fraction", pf_defaults.coverage_min_fraction),
         help="Minimum fraction of support points each expected visible segment should own.",
     )
+    parser.add_argument("--pf-bend-penalty", type=float, default=config_value(config, "particle_filter", "bend_penalty_m", pf_defaults.bend_penalty_m))
+    parser.add_argument("--pf-map-estimate-effective-ratio", type=float, default=config_value(config, "particle_filter", "map_estimate_effective_ratio", pf_defaults.map_estimate_effective_ratio))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
     parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
     parser.add_argument("--pf-occlusion-gate", type=float, default=config_value(config, "particle_filter", "occlusion_gate_m", pf_defaults.occlusion_assignment_max_distance_m))
@@ -252,12 +310,16 @@ def parse_args():
     args.detector_skeleton_prune_px = max(0, int(args.detector_skeleton_prune_px))
     args.detector_skeleton_prune_passes = max(0, int(args.detector_skeleton_prune_passes))
     args.detector_centerline_smooth_window = max(1, int(args.detector_centerline_smooth_window))
+    args.viewer_hold_frames = max(0, int(args.viewer_hold_frames))
     args.hsv_geometry_every = max(0, int(args.hsv_geometry_every))
     args.hsv_mask_points = max(2, int(args.hsv_mask_points))
     args.measurement_centerline_points = max(2, int(args.measurement_centerline_points))
     args.measurement_smoothing_alpha = float(np.clip(args.measurement_smoothing_alpha, 0.0, 1.0))
     args.measurement_smoothing_gate = max(0.0, float(args.measurement_smoothing_gate))
     args.measurement_gate_reacquire_after = max(0, int(args.measurement_gate_reacquire_after))
+    args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
+    args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
+    args.pf_reference_ordering_gate = max(0.0, float(args.pf_reference_ordering_gate))
     return args
 
 
@@ -364,8 +426,19 @@ def make_particle_filter_config(args):
         initial_direction_std=float(args.pf_initial_direction_std),
         process_node_std_m=float(args.pf_process_std),
         process_direction_std=float(args.pf_process_direction_std),
+        direction_smooth_passes=int(args.pf_direction_smooth_passes),
         measurement_node_std_m=float(args.pf_measurement_std),
         measurement_max_points=int(args.pf_measurement_points),
+        scoring_backend=str(args.pf_scoring_backend),
+        score_chunk_points=int(args.pf_score_chunk_points),
+        endpoint_ordering=bool(args.pf_endpoint_ordering),
+        ordering_max_points=int(args.pf_ordering_max_points),
+        ordering_knn=int(args.pf_ordering_knn),
+        endpoint_refresh_interval=int(args.pf_endpoint_refresh_interval),
+        reference_ordering=bool(args.pf_reference_ordering),
+        reference_ordering_gate_m=float(args.pf_reference_ordering_gate),
+        endpoint_penalty_weight=float(args.pf_endpoint_penalty_weight),
+        measurement_reset_error_m=float(args.pf_measurement_reset_error),
         measurement_proposal_ratio=float(args.pf_measurement_proposal_ratio),
         measurement_proposal_stable_ratio=float(args.pf_measurement_proposal_stable_ratio),
         measurement_proposal_start_error_m=float(args.pf_measurement_proposal_start_error),
@@ -375,6 +448,8 @@ def make_particle_filter_config(args):
         score_keep_fraction=float(args.pf_score_keep_fraction),
         coverage_penalty_m=float(args.pf_coverage_penalty),
         coverage_min_fraction=float(args.pf_coverage_min_fraction),
+        bend_penalty_m=float(args.pf_bend_penalty),
+        map_estimate_effective_ratio=float(args.pf_map_estimate_effective_ratio),
         min_measurement_points=int(args.pf_min_measurement_points),
         min_segment_points=int(args.pf_min_segment_points),
         occlusion_assignment_max_distance_m=float(args.pf_occlusion_gate),
@@ -435,7 +510,13 @@ def run_live(args):
     last_smoothed_measurement_nodes = None
     last_detection_hint_xy = None
     last_filter_nodes = None
+    last_filter_estimate = None
+    last_filter_result = None
     last_filter_lost_frames = 0
+    last_visual_measurement = None
+    last_visual_estimate = None
+    last_visual_filter_result = None
+    last_visual_age = 0
     latest_cable_status = "cable detector unavailable" if cable_detector is None else "waiting for cable"
     stage_seconds = {
         "capture": 0.0,
@@ -502,17 +583,20 @@ def run_live(args):
                         last_filter_nodes,
                         last_filter_lost_frames,
                     )
+                    pidnet_mask_point_measurement = args.detector_backend == "pidnet"
+                    extract_geometry = not (mask_only_detection or pidnet_mask_point_measurement)
                     detection = cable_detector.detect(
                         bgr,
                         roi_bbox=roi_bbox,
                         scale=args.detector_scale,
-                        extract_geometry=not mask_only_detection,
+                        extract_geometry=extract_geometry,
                     )
-                    if roi_bbox is not None and not mask_only_detection and len(detection.centerline_xy) < 2:
+                    if roi_bbox is not None and extract_geometry and len(detection.centerline_xy) < 2:
                         detection = cable_detector.detect(bgr, scale=args.detector_scale)
-                    if detection is not None and len(detection.centerline_xy) >= 2:
+                    if detection is not None and (pidnet_mask_point_measurement or len(detection.centerline_xy) >= 2):
                         latest_detection = detection
-                        last_detection_hint_xy = detection.centerline_xy
+                        if len(detection.centerline_xy) >= 2:
+                            last_detection_hint_xy = detection.centerline_xy
                     stage_seconds["detect"] += time.monotonic() - stage_start
                     stage_start = time.monotonic()
                     reference_nodes = measurement_reference_nodes(
@@ -524,7 +608,7 @@ def run_live(args):
                         args.measurement_prediction_gate,
                         last_filter_lost_frames,
                     )
-                    if mask_only_detection:
+                    if mask_only_detection or pidnet_mask_point_measurement:
                         measurement = cable_measurement_from_mask_points(
                             point_cloud,
                             detection,
@@ -533,7 +617,7 @@ def run_live(args):
                             depth_max=args.depth_max,
                             confidence_map=confidence_measure,
                             max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
-                            max_points=args.hsv_mask_points,
+                            max_points=args.hsv_mask_points if mask_only_detection else args.pf_measurement_points,
                             reference_nodes=reference_nodes,
                             reference_gate_m=reference_gate,
                             reference_min_points=args.pf_min_measurement_points,
@@ -548,7 +632,7 @@ def run_live(args):
                             confidence_map=confidence_measure,
                             max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
                             node_search_px=args.node_search_px,
-                            source_point_mode=args.zed_measurement_points,
+                            source_point_mode="centerline",
                             max_centerline_points=args.measurement_centerline_points,
                             max_local_depth_std_m=args.measurement_local_depth_spread,
                             reference_nodes=reference_nodes,
@@ -583,43 +667,65 @@ def run_live(args):
                     )
                     if estimate is not None:
                         last_filter_nodes = np.asarray(estimate.points_xyz, dtype=np.float32)
+                        last_filter_estimate = estimate
+                        last_filter_result = filter_result
                     elif particle_filter is None:
                         last_filter_nodes = None
+                        last_filter_estimate = None
+                        last_filter_result = None
                     if filter_result is not None:
                         last_filter_lost_frames = int(filter_result.lost_frames)
                     elif estimate is not None:
                         last_filter_lost_frames = 0
                 elif cable_detector is not None:
                     detection = latest_detection
-                    now = time.monotonic()
-                    filter_dt = 1.0 / max(float(args.fps), 1.0) if last_filter_time is None else now - last_filter_time
-                    last_filter_time = now
-                    if particle_filter is not None:
-                        stage_start = time.monotonic()
-                        filter_result = particle_filter.step(None, filter_dt, count_lost=False)
-                        estimate = filtered_cable_estimate(None, filter_result)
-                        stage_seconds["filter"] += time.monotonic() - stage_start
-                    if estimate is not None:
-                        last_filter_nodes = np.asarray(estimate.points_xyz, dtype=np.float32)
-                    if filter_result is not None:
-                        last_filter_lost_frames = int(filter_result.lost_frames)
+                    estimate = last_filter_estimate
+                    filter_result = last_filter_result
 
                 stage_start = time.monotonic()
+                if measurement is not None:
+                    last_visual_measurement = measurement
+                if estimate is not None:
+                    last_visual_estimate = estimate
+                    last_visual_filter_result = filter_result
+                    last_visual_age = 0
+                else:
+                    last_visual_age += 1
+                    if last_visual_age > args.viewer_hold_frames:
+                        last_visual_estimate = None
+                        last_visual_filter_result = None
+                        if measurement is None:
+                            last_visual_measurement = None
+
+                display_measurement = measurement
+                display_estimate = estimate
+                display_filter_result = filter_result
+                if display_measurement is None and display_estimate is not None:
+                    display_measurement = last_visual_measurement
+                if (
+                    display_estimate is None
+                    and last_visual_estimate is not None
+                    and last_visual_age <= args.viewer_hold_frames
+                ):
+                    display_measurement = last_visual_measurement
+                    display_estimate = last_visual_estimate
+                    display_filter_result = last_visual_filter_result
+
                 debug_bgr = draw_cable_rgb_panel(
                     bgr,
                     detection=detection,
-                    measurement=measurement,
-                    estimate=estimate,
+                    measurement=display_measurement,
+                    estimate=display_estimate,
                     segment_count=args.cable_segments,
                     mode=args.rgb_view,
                     detector_description=detector_description(args),
                 )
-                update_viewer_cable(viewer, measurement, estimate, filter_result, args.cable_max_points)
+                update_viewer_cable(viewer, display_measurement, display_estimate, display_filter_result, args.cable_max_points)
                 latest_cable_status = cable_status(
                     detection,
-                    measurement,
-                    estimate,
-                    filter_result,
+                    display_measurement,
+                    display_estimate,
+                    display_filter_result,
                     args.cable_segments,
                     detector_name=args.detector_backend,
                     diagnostics=tracking_diagnostics,
@@ -900,6 +1006,9 @@ def cable_status(detection, measurement, estimate, filter_result, segment_count,
             if visible_segments is not None:
                 mode += f" visible={int(np.count_nonzero(visible_segments))}/{len(visible_segments)}"
             mode += f" support={int(getattr(filter_result, 'measurement_point_count', 0))}"
+            segment_length = float(getattr(filter_result, "segment_length_m", np.nan))
+            if np.isfinite(segment_length):
+                mode += f" seglen={format_mm(segment_length)}"
         diag_text = format_tracking_diagnostics(diagnostics)
         return (
             f"{prefix} | {segment_count} segments | {mode} | residual {residual:.4f}m | "

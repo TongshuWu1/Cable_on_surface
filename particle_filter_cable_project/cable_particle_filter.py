@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import heapq
 
 import numpy as np
 
@@ -8,26 +9,44 @@ from cable_detection import (
     polyline_residual,
 )
 
+try:
+    import torch
+except Exception:  # pragma: no cover - torch is optional for CPU-only use
+    torch = None
+
 
 @dataclass
 class CableParticleFilterConfig:
-    particle_count: int = 300
+    particle_count: int = 200
     segment_length_m: float = 0.0
     initial_node_std_m: float = 0.025
     initial_direction_std: float = 0.10
     process_node_std_m: float = 0.006
-    process_direction_std: float = 0.035
-    measurement_node_std_m: float = 0.025
-    measurement_max_points: int = 96
+    process_direction_std: float = 0.020
+    direction_smooth_passes: int = 1
+    measurement_node_std_m: float = 0.030
+    measurement_max_points: int = 1024
+    scoring_backend: str = "auto"
+    score_chunk_points: int = 512
+    endpoint_ordering: bool = True
+    ordering_max_points: int = 384
+    ordering_knn: int = 8
+    endpoint_refresh_interval: int = 0
+    reference_ordering: bool = True
+    reference_ordering_gate_m: float = 0.08
+    endpoint_penalty_weight: float = 1.0
+    measurement_reset_error_m: float = 0.25
     measurement_proposal_ratio: float = 0.30
-    measurement_proposal_stable_ratio: float = 0.02
+    measurement_proposal_stable_ratio: float = 0.04
     measurement_proposal_start_error_m: float = 0.015
     measurement_proposal_full_error_m: float = 0.060
-    measurement_proposal_node_std_m: float = 0.020
-    measurement_proposal_direction_std: float = 0.080
+    measurement_proposal_node_std_m: float = 0.012
+    measurement_proposal_direction_std: float = 0.025
     score_keep_fraction: float = 0.80
     coverage_penalty_m: float = 0.025
     coverage_min_fraction: float = 0.05
+    bend_penalty_m: float = 0.030
+    map_estimate_effective_ratio: float = 0.35
     min_measurement_points: int = 12
     min_segment_points: int = 4
     occlusion_assignment_max_distance_m: float = 0.12
@@ -75,6 +94,8 @@ class CableParticleFilter:
         self.last_visible_nodes = np.zeros(self.node_count, dtype=bool)
         self.last_measurement_point_count = 0
         self.last_measurement_proposal_ratio = 0.0
+        self.last_ordered_measurement_nodes = None
+        self.measurement_update_count = 0
 
     def step(self, measurement, dt=1.0 / 30.0, count_lost=True):
         dt = float(np.clip(dt, 1e-3, 0.20))
@@ -90,8 +111,13 @@ class CableParticleFilter:
             else:
                 self._predict(dt, noise_scale=1.0)
                 measurement_nodes = self._measurement_nodes(measurement, measurement_points)
+                if self._should_reset_to_measurement(measurement_nodes):
+                    self.initialized = False
+                    self._initialize(measurement, measurement_points)
+                    self.lost_frames = 0
+                    return self._estimate(measurement_used=True, prediction_only=False)
                 self._inject_measurement_proposals(measurement_nodes)
-                measurement_points, segment_indices, visible_segments = self._associate_visible_points(
+                measurement_points, _segment_indices, visible_segments = self._associate_visible_points(
                     measurement_points,
                     candidate_nodes=measurement_nodes,
                 )
@@ -99,9 +125,16 @@ class CableParticleFilter:
                     self.last_measurement_point_count = 0
                     return self._prediction_only_after_update_drop()
                 self.last_measurement_point_count = int(len(measurement_points))
-                self._weight(measurement_points, segment_indices)
+                self._weight(
+                    measurement_points,
+                    visible_segments=visible_segments,
+                    measurement_nodes=measurement_nodes,
+                )
                 self._set_visibility(visible_segments)
+                result = self._estimate(measurement_used=True, prediction_only=False)
                 self._maybe_resample(noise_scale=self.last_motion_noise_scale)
+                self.lost_frames = 0
+                return result
 
             self.lost_frames = 0
             return self._estimate(measurement_used=True, prediction_only=False)
@@ -123,8 +156,9 @@ class CableParticleFilter:
         self._predict(dt, self.last_motion_noise_scale)
         if count_lost:
             self._set_visibility(np.zeros(self.segment_count, dtype=bool))
+        result = self._estimate(measurement_used=False, prediction_only=True)
         self._maybe_resample(force=self.lost_frames > 1, noise_scale=self.last_motion_noise_scale)
-        return self._estimate(measurement_used=False, prediction_only=True)
+        return result
 
     def _initialize(self, measurement, measurement_points):
         nodes = self._initial_nodes(measurement, measurement_points)
@@ -136,6 +170,7 @@ class CableParticleFilter:
         nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
         if nodes is None:
             return
+        self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
         directions = chain_directions(nodes)
         count = max(32, int(self.config.particle_count))
 
@@ -149,12 +184,16 @@ class CableParticleFilter:
             float(self.config.initial_direction_std),
             (count, self.segment_count, 3),
         )
-        particle_directions = normalize_vectors(directions[None, :, :] + direction_noise)
+        particle_directions = smooth_particle_directions(
+            normalize_vectors(directions[None, :, :] + direction_noise),
+            passes=int(getattr(self.config, "direction_smooth_passes", 1)),
+        )
         self.particles = build_chains(starts, particle_directions, self.segment_length_m)
         self.weights = np.full(count, 1.0 / count, dtype=np.float64)
         self.initialized = True
         self.last_motion_noise_scale = 1.0
         self.last_measurement_proposal_ratio = 0.0
+        self.measurement_update_count = 1
         _points, _indices, visible_segments = self._associate_visible_points(measurement_points)
         self._set_visibility(visible_segments)
 
@@ -177,23 +216,38 @@ class CableParticleFilter:
                 directions.shape,
             )
         )
+        directions = smooth_particle_directions(
+            directions,
+            passes=int(getattr(self.config, "direction_smooth_passes", 1)),
+        )
         self.particles = build_chains(starts, directions, self.segment_length_m)
 
-    def _weight(self, measurement_points, segment_indices=None):
+    def _weight(self, measurement_points, visible_segments=None, measurement_nodes=None):
         sigma = max(float(self.config.measurement_node_std_m), 1e-5)
         outlier_distance = max(float(self.config.outlier_distance_m), sigma)
+        expected_segments = None
+        if visible_segments is not None:
+            visible_segments = np.asarray(visible_segments, dtype=bool).reshape(-1)
+            expected_segments = np.flatnonzero(visible_segments)
         scores = particle_distance_scores(
             measurement_points,
             self.particles,
-            segment_indices=segment_indices,
             outlier_distance=outlier_distance,
             score_keep_fraction=float(self.config.score_keep_fraction),
             coverage_penalty_m=float(self.config.coverage_penalty_m),
             coverage_min_fraction=float(self.config.coverage_min_fraction),
+            bend_penalty_m=float(getattr(self.config, "bend_penalty_m", 0.0)),
+            expected_segments=expected_segments,
+            backend=str(getattr(self.config, "scoring_backend", "auto")),
+            chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
         )
 
         if not np.any(np.isfinite(scores)):
             return
+
+        endpoint_weight = float(getattr(self.config, "endpoint_penalty_weight", 0.0))
+        if endpoint_weight > 0.0 and measurement_nodes is not None:
+            scores = scores + endpoint_order_penalty(self.particles, measurement_nodes, weight=endpoint_weight)
 
         finite_scores = np.where(np.isfinite(scores), scores, np.nanmax(scores[np.isfinite(scores)]) + outlier_distance**2)
         log_likelihood = -0.5 * finite_scores / (sigma * sigma)
@@ -235,6 +289,10 @@ class CableParticleFilter:
                 (len(self.particles), self.segment_count, 3),
             )
         )
+        directions = smooth_particle_directions(
+            directions,
+            passes=int(getattr(self.config, "direction_smooth_passes", 1)),
+        )
         self.particles = build_chains(starts, directions, self.segment_length_m)
 
     def _estimate(self, measurement_used, prediction_only):
@@ -256,6 +314,11 @@ class CableParticleFilter:
         )
 
     def _estimate_nodes(self):
+        map_ratio = float(getattr(self.config, "map_estimate_effective_ratio", 0.0))
+        if map_ratio > 0.0 and self.particles is not None and self.weights is not None and len(self.weights):
+            effective_ratio = self._effective_sample_size() / max(len(self.weights), 1)
+            if effective_ratio <= map_ratio:
+                return np.asarray(self.particles[int(np.argmax(self.weights))], dtype=np.float32)
         starts = self.particles[:, 0, :]
         start = np.average(starts, axis=0, weights=self.weights)
         directions = np.average(particle_directions(self.particles), axis=0, weights=self.weights)
@@ -281,14 +344,23 @@ class CableParticleFilter:
         candidate = getattr(measurement, "points_xyz", None)
         nodes = fit_polyline_segments(candidate, segment_count=self.segment_count) if candidate is not None else None
         if nodes is None:
-            nodes = fit_polyline_segments(measurement_points, segment_count=self.segment_count)
+            nodes = self._fit_measurement_point_chain(measurement_points)
         return nodes
 
     def _measurement_nodes(self, measurement, measurement_points):
         candidate = valid_points(getattr(measurement, "points_xyz", None))
-        if len(candidate) < 2:
-            return None
-        nodes = fit_polyline_segments(candidate, segment_count=self.segment_count)
+        if len(candidate) >= 2:
+            nodes = fit_polyline_segments(candidate, segment_count=self.segment_count)
+        else:
+            reference_nodes = self._estimate_nodes() if self.initialized and self.particles is not None else None
+            force_endpoint = self._should_refresh_endpoint_ordering()
+            nodes = self._fit_measurement_point_chain(
+                measurement_points,
+                reference_nodes=reference_nodes,
+                allow_endpoint_fallback=self.lost_frames > 0 or force_endpoint,
+                force_endpoint=force_endpoint,
+            )
+            self.measurement_update_count += 1
         if nodes is None or self.segment_length_m is None:
             return None
         nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
@@ -296,7 +368,62 @@ class CableParticleFilter:
             return None
         if self.initialized and self.particles is not None:
             nodes = align_polyline_orientation(self._estimate_nodes(), nodes)
+        self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
         return np.ascontiguousarray(nodes, dtype=np.float64)
+
+    def _fit_measurement_point_chain(
+        self,
+        measurement_points,
+        reference_nodes=None,
+        allow_endpoint_fallback=True,
+        force_endpoint=False,
+    ):
+        if bool(force_endpoint):
+            nodes = fit_unordered_point_cloud_chain(
+                measurement_points,
+                segment_count=self.segment_count,
+                endpoint_ordering=bool(getattr(self.config, "endpoint_ordering", True)),
+                max_points=int(getattr(self.config, "ordering_max_points", 768)),
+                knn=int(getattr(self.config, "ordering_knn", 10)),
+            )
+            if nodes is not None:
+                return nodes
+
+        if bool(getattr(self.config, "reference_ordering", True)) and reference_nodes is not None:
+            nodes = fit_reference_ordered_point_cloud_chain(
+                measurement_points,
+                reference_nodes=reference_nodes,
+                segment_count=self.segment_count,
+                gate_m=float(getattr(self.config, "reference_ordering_gate_m", 0.08)),
+                min_points=int(getattr(self.config, "min_measurement_points", 12)),
+            )
+            if nodes is not None:
+                return nodes
+            if not bool(allow_endpoint_fallback):
+                return None
+
+        nodes = fit_unordered_point_cloud_chain(
+            measurement_points,
+            segment_count=self.segment_count,
+            endpoint_ordering=bool(getattr(self.config, "endpoint_ordering", True)),
+            max_points=int(getattr(self.config, "ordering_max_points", 768)),
+            knn=int(getattr(self.config, "ordering_knn", 10)),
+        )
+        if nodes is not None:
+            return nodes
+        if reference_nodes is not None:
+            cached = valid_points(self.last_ordered_measurement_nodes)
+            if len(cached) == self.node_count:
+                return cached.copy()
+        return None
+
+    def _should_refresh_endpoint_ordering(self):
+        interval = int(getattr(self.config, "endpoint_refresh_interval", 0))
+        if interval <= 0 or not bool(getattr(self.config, "endpoint_ordering", True)):
+            return False
+        if self.lost_frames > 0:
+            return True
+        return int(self.measurement_update_count) > 0 and int(self.measurement_update_count) % interval == 0
 
     def _inject_measurement_proposals(self, measurement_nodes):
         if measurement_nodes is None or self.particles is None or self.weights is None or self.segment_length_m is None:
@@ -318,6 +445,7 @@ class CableParticleFilter:
             self.rng,
             node_std_m=float(self.config.measurement_proposal_node_std_m),
             direction_std=float(self.config.measurement_proposal_direction_std),
+            direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
         )
         replace_indices = self.rng.choice(total_count, size=proposal_count, replace=False)
         self.particles[replace_indices] = proposals
@@ -329,6 +457,14 @@ class CableParticleFilter:
             self.weights /= total
         else:
             self.weights.fill(1.0 / total_count)
+
+    def _should_reset_to_measurement(self, measurement_nodes):
+        threshold = float(getattr(self.config, "measurement_reset_error_m", 0.0))
+        if threshold <= 0.0 or measurement_nodes is None or not self.initialized:
+            return False
+        current_nodes = self._estimate_nodes()
+        error_m = mean_node_distance(current_nodes, measurement_nodes)
+        return bool(np.isfinite(error_m) and error_m > threshold)
 
     def _adaptive_measurement_proposal_ratio(self, measurement_nodes):
         max_ratio = float(np.clip(self.config.measurement_proposal_ratio, 0.0, 1.0))
@@ -398,8 +534,9 @@ class CableParticleFilter:
         if self.lost_frames > int(self.config.max_prediction_frames):
             self.initialized = False
             return None
+        result = self._estimate(measurement_used=False, prediction_only=True)
         self._maybe_resample(force=self.lost_frames > 1, noise_scale=self.last_motion_noise_scale)
-        return self._estimate(measurement_used=False, prediction_only=True)
+        return result
 
     def _systematic_resample(self):
         count = len(self.weights)
@@ -478,6 +615,297 @@ def fixed_segment_length_from_config(config):
     return length if length > 0.0 else None
 
 
+def fit_reference_ordered_point_cloud_chain(
+    points_xyz,
+    reference_nodes,
+    segment_count=12,
+    gate_m=0.08,
+    min_points=12,
+):
+    points = valid_points(points_xyz)
+    reference = valid_points(reference_nodes)
+    if len(points) < 2 or len(reference) < 2:
+        return None
+
+    _segment_indices, distances, arclength = assign_points_to_reference_arclength(points, reference)
+    if len(distances) != len(points):
+        return None
+
+    keep = np.isfinite(distances) & np.isfinite(arclength)
+    gate_m = float(gate_m)
+    if gate_m > 0.0:
+        keep &= distances <= gate_m
+    if int(np.count_nonzero(keep)) < max(2, int(min_points)):
+        return None
+
+    centerline = binned_centerline_from_ordered_points(
+        points[keep],
+        arclength[keep],
+        segment_count=segment_count,
+    )
+    if centerline is None or len(centerline) < 2:
+        return None
+
+    nodes = fit_polyline_segments(centerline, segment_count=segment_count)
+    if nodes is None:
+        return None
+    return align_polyline_orientation(reference, nodes)
+
+
+def fit_unordered_point_cloud_chain(
+    points_xyz,
+    segment_count=12,
+    endpoint_ordering=True,
+    max_points=768,
+    knn=10,
+):
+    points = valid_points(points_xyz)
+    if len(points) < 2:
+        return None
+
+    if bool(endpoint_ordering):
+        nodes = fit_endpoint_ordered_point_cloud_chain(
+            points,
+            segment_count=segment_count,
+            max_points=max_points,
+            knn=knn,
+        )
+        if nodes is not None:
+            return nodes
+
+    return fit_pca_binned_point_cloud_chain(points, segment_count=segment_count)
+
+
+def fit_endpoint_ordered_point_cloud_chain(points_xyz, segment_count=12, max_points=768, knn=10):
+    points = valid_points(points_xyz)
+    if len(points) < 2:
+        return None
+
+    max_points = max(max(64, int(segment_count) * 16), int(max_points))
+    points = sample_points(points, max_points)
+    if len(points) < 2:
+        return None
+
+    neighbors, weights = knn_graph(points, k=knn)
+    if not neighbors:
+        return None
+
+    start_hint, end_hint = pca_endpoint_hints(points)
+    dist0, _parents0 = dijkstra_graph(neighbors, weights, start_hint)
+    start = farthest_reachable_index(dist0)
+    if start < 0:
+        start = int(start_hint)
+    dist1, parents1 = dijkstra_graph(neighbors, weights, start)
+    end = farthest_reachable_index(dist1)
+    if end < 0 or end == start:
+        end = int(end_hint)
+
+    path_indices = reconstruct_index_path(parents1, start, end)
+    if len(path_indices) < 2:
+        return None
+
+    path_points = points[np.asarray(path_indices, dtype=np.int64)]
+    path_points = remove_large_centerline_jumps(path_points)
+    path_points = smooth_centerline_points(path_points)
+    if len(path_points) < 2:
+        return None
+    return fit_polyline_segments(path_points, segment_count=segment_count)
+
+
+def fit_pca_binned_point_cloud_chain(points_xyz, segment_count=12):
+    points = valid_points(points_xyz)
+    if len(points) < 2:
+        return None
+
+    points = sample_points(points, max(256, int(segment_count) * 96))
+    center = np.mean(points, axis=0)
+    centered = points - center[None, :]
+    try:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+        axis = vh[0]
+    except np.linalg.LinAlgError:
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    axis_norm = float(np.linalg.norm(axis))
+    if not np.isfinite(axis_norm) or axis_norm <= 1e-12:
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        axis = axis / axis_norm
+
+    projection = centered @ axis
+    order = np.argsort(projection)
+    ordered_points = points[order]
+    ordered_projection = projection[order]
+    centerline = binned_centerline_from_ordered_points(
+        ordered_points,
+        ordered_projection,
+        segment_count=segment_count,
+    )
+    if centerline is None or len(centerline) < 2:
+        return None
+    return fit_polyline_segments(centerline, segment_count=segment_count)
+
+
+def pca_endpoint_hints(points):
+    points = valid_points(points)
+    if len(points) < 2:
+        return 0, 0
+    centered = points - np.mean(points, axis=0, keepdims=True)
+    try:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+        axis = vh[0]
+    except np.linalg.LinAlgError:
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    projection = centered @ axis
+    return int(np.argmin(projection)), int(np.argmax(projection))
+
+
+def knn_graph(points, k=10):
+    points = valid_points(points)
+    count = len(points)
+    if count < 2:
+        return [], []
+
+    k = int(np.clip(int(k), 1, max(1, count - 1)))
+    deltas = points[:, None, :] - points[None, :, :]
+    squared = np.sum(deltas * deltas, axis=2)
+    np.fill_diagonal(squared, np.inf)
+    neighbor_idx = np.argpartition(squared, kth=k - 1, axis=1)[:, :k]
+
+    adjacency = [dict() for _ in range(count)]
+    for index in range(count):
+        for neighbor in neighbor_idx[index]:
+            neighbor = int(neighbor)
+            weight = float(np.sqrt(squared[index, neighbor]))
+            if not np.isfinite(weight):
+                continue
+            current = adjacency[index].get(neighbor)
+            if current is None or weight < current:
+                adjacency[index][neighbor] = weight
+                adjacency[neighbor][index] = weight
+
+    neighbors = []
+    weights = []
+    for item in adjacency:
+        ordered = sorted(item.items(), key=lambda pair: pair[1])
+        neighbors.append([int(index) for index, _weight in ordered])
+        weights.append([float(weight) for _index, weight in ordered])
+    return neighbors, weights
+
+
+def dijkstra_graph(neighbors, weights, start):
+    count = len(neighbors)
+    start = int(start)
+    distances = np.full(count, np.inf, dtype=np.float64)
+    parents = np.full(count, -1, dtype=np.int64)
+    if count == 0 or start < 0 or start >= count:
+        return distances, parents
+
+    distances[start] = 0.0
+    queue = [(0.0, start)]
+    while queue:
+        distance, node = heapq.heappop(queue)
+        if distance > distances[node]:
+            continue
+        for neighbor, weight in zip(neighbors[node], weights[node]):
+            candidate = distance + float(weight)
+            if candidate < distances[neighbor]:
+                distances[neighbor] = candidate
+                parents[neighbor] = node
+                heapq.heappush(queue, (candidate, int(neighbor)))
+    return distances, parents
+
+
+def farthest_reachable_index(distances):
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    finite = np.flatnonzero(np.isfinite(distances))
+    if len(finite) == 0:
+        return -1
+    return int(finite[np.argmax(distances[finite])])
+
+
+def reconstruct_index_path(parents, start, end):
+    parents = np.asarray(parents, dtype=np.int64).reshape(-1)
+    start = int(start)
+    end = int(end)
+    if start < 0 or end < 0 or start >= len(parents) or end >= len(parents):
+        return []
+    path = [end]
+    current = end
+    seen = {end}
+    while current != start:
+        current = int(parents[current])
+        if current < 0 or current in seen:
+            return []
+        seen.add(current)
+        path.append(current)
+    path.reverse()
+    return path
+
+
+def binned_centerline_from_ordered_points(points, projection, segment_count=12):
+    points = valid_points(points)
+    projection = np.asarray(projection, dtype=np.float64).reshape(-1)
+    if len(points) < 2 or len(projection) != len(points):
+        return None
+
+    order = np.argsort(projection)
+    points = points[order]
+    projection = projection[order]
+
+    # Collapse the thick unordered cable cloud into robust slice medians before
+    # resampling. This avoids fitting a long zigzag through cable-mask thickness
+    # and ZED depth jitter.
+    bin_count = int(np.clip(max(int(segment_count) * 6, int(segment_count) + 1), 4, len(points)))
+    edges = np.linspace(0, len(points), bin_count + 1, dtype=np.int64)
+    centers = []
+    for start, end in zip(edges[:-1], edges[1:]):
+        if end <= start:
+            continue
+        chunk = points[start:end]
+        if len(chunk) == 0:
+            continue
+        centers.append(np.median(chunk, axis=0))
+
+    if len(centers) < 2:
+        return None
+
+    centers = np.asarray(centers, dtype=np.float64)
+    centers = remove_large_centerline_jumps(centers)
+    centers = smooth_centerline_points(centers)
+    if len(centers) < 2:
+        return None
+    return np.ascontiguousarray(centers, dtype=np.float32)
+
+
+def remove_large_centerline_jumps(points):
+    points = valid_points(points)
+    if len(points) < 3:
+        return points
+    deltas = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    finite = deltas[np.isfinite(deltas) & (deltas > 1e-9)]
+    if len(finite) == 0:
+        return points
+    median = float(np.median(finite))
+    if median <= 1e-9:
+        return points
+    keep = np.ones(len(points), dtype=bool)
+    # A single bad depth slice should not stretch the whole fixed-length chain.
+    for index, distance in enumerate(deltas):
+        if distance > 6.0 * median and 0 < index + 1 < len(points) - 1:
+            keep[index + 1] = False
+    cleaned = points[keep]
+    return cleaned if len(cleaned) >= 2 else points
+
+
+def smooth_centerline_points(points):
+    points = valid_points(points)
+    if len(points) < 5:
+        return points
+    smoothed = points.copy()
+    smoothed[1:-1] = 0.25 * points[:-2] + 0.50 * points[1:-1] + 0.25 * points[2:]
+    return smoothed
+
+
 def estimate_equal_segment_length(nodes, segment_count):
     lengths = segment_lengths(nodes)
     lengths = lengths[np.isfinite(lengths)]
@@ -486,6 +914,11 @@ def estimate_equal_segment_length(nodes, segment_count):
     total = float(np.sum(lengths))
     if not np.isfinite(total) or total <= 1e-9:
         return 0.05
+    node_points = valid_points(nodes)
+    if len(node_points) >= 2:
+        extent = float(np.linalg.norm(np.max(node_points, axis=0) - np.min(node_points, axis=0)))
+        if np.isfinite(extent) and extent > 1e-6 and total > 3.0 * extent:
+            total = 3.0 * extent
     return total / max(1, int(segment_count))
 
 
@@ -519,7 +952,15 @@ def build_chains(starts, directions, segment_length_m):
     return np.ascontiguousarray(output, dtype=np.float64)
 
 
-def sample_noisy_chains_around_nodes(nodes, count, segment_length_m, rng, node_std_m=0.020, direction_std=0.080):
+def sample_noisy_chains_around_nodes(
+    nodes,
+    count,
+    segment_length_m,
+    rng,
+    node_std_m=0.020,
+    direction_std=0.080,
+    direction_smooth_passes=1,
+):
     nodes = valid_points(nodes)
     count = max(0, int(count))
     if count == 0 or len(nodes) < 2:
@@ -532,7 +973,10 @@ def sample_noisy_chains_around_nodes(nodes, count, segment_length_m, rng, node_s
         max(0.0, float(direction_std)),
         (count, len(directions), 3),
     )
-    noisy_directions = normalize_vectors(noisy_directions)
+    noisy_directions = smooth_particle_directions(
+        normalize_vectors(noisy_directions),
+        passes=int(direction_smooth_passes),
+    )
     return build_chains(starts, noisy_directions, float(segment_length_m))
 
 
@@ -557,6 +1001,19 @@ def normalize_vectors(vectors):
     if np.any(~valid):
         output[~valid] = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     return output
+
+
+def smooth_particle_directions(directions, passes=1):
+    directions = normalize_vectors(directions)
+    passes = max(0, int(passes))
+    if directions.ndim != 3 or directions.shape[1] < 3 or passes == 0:
+        return directions
+    smoothed = directions.copy()
+    for _ in range(passes):
+        updated = smoothed.copy()
+        updated[:, 1:-1, :] = 0.25 * smoothed[:, :-2, :] + 0.50 * smoothed[:, 1:-1, :] + 0.25 * smoothed[:, 2:, :]
+        smoothed = normalize_vectors(updated)
+    return smoothed
 
 
 def valid_points(points):
@@ -585,34 +1042,83 @@ def assign_points_to_nearest_segments(points, nodes):
     return segment_indices, best_distances
 
 
+def assign_points_to_reference_arclength(points, nodes):
+    points = valid_points(points)
+    nodes = valid_points(nodes)
+    if len(points) == 0 or len(nodes) < 2:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.float64),
+        )
+
+    segment_vectors = nodes[1:] - nodes[:-1]
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    best_squared = np.full(len(points), np.inf, dtype=np.float64)
+    best_segments = np.zeros(len(points), dtype=np.int64)
+    best_arclength = np.zeros(len(points), dtype=np.float64)
+
+    for index, (start, vector, length, length_start) in enumerate(
+        zip(nodes[:-1], segment_vectors, segment_lengths, cumulative[:-1])
+    ):
+        length_sq = float(np.dot(vector, vector))
+        if length_sq <= 1e-12:
+            projection_fraction = np.zeros(len(points), dtype=np.float64)
+            projected = start[None, :]
+        else:
+            projection_fraction = np.clip(((points - start[None, :]) @ vector) / length_sq, 0.0, 1.0)
+            projected = start[None, :] + projection_fraction[:, None] * vector[None, :]
+        squared = np.sum((points - projected) ** 2, axis=1)
+        update = squared < best_squared
+        if np.any(update):
+            best_squared[update] = squared[update]
+            best_segments[update] = int(index)
+            best_arclength[update] = float(length_start) + projection_fraction[update] * float(length)
+
+    return best_segments, np.sqrt(best_squared), best_arclength
+
+
 def particle_distance_scores(
     points,
     particles,
-    segment_indices=None,
     outlier_distance=np.inf,
     score_keep_fraction=1.0,
     coverage_penalty_m=0.0,
     coverage_min_fraction=0.05,
+    bend_penalty_m=0.0,
+    expected_segments=None,
+    backend="auto",
+    chunk_points=512,
 ):
     points = valid_points(points)
     particles = valid_particles(particles)
     if len(points) == 0 or len(particles) == 0 or particles.shape[1] < 2:
         return np.full(len(particles), np.inf, dtype=np.float64)
 
-    all_squared_distances = None
-    nearest_segments = None
-    if segment_indices is None:
-        all_squared_distances = point_to_particle_segment_squared_distances(points, particles[:, :-1, :3], particles[:, 1:, :3])
-        if all_squared_distances.size:
-            squared_distances = np.min(all_squared_distances, axis=1)
-            nearest_segments = np.argmin(all_squared_distances, axis=1)
-        else:
-            squared_distances = np.empty((len(particles), 0), dtype=np.float64)
-        expected_segments = np.arange(particles.shape[1] - 1, dtype=np.int64)
+    torch_scores = particle_distance_scores_torch(
+        points,
+        particles,
+        outlier_distance=outlier_distance,
+        score_keep_fraction=score_keep_fraction,
+        coverage_penalty_m=coverage_penalty_m,
+        coverage_min_fraction=coverage_min_fraction,
+        bend_penalty_m=bend_penalty_m,
+        expected_segments=expected_segments,
+        backend=backend,
+        chunk_points=chunk_points,
+    )
+    if torch_scores is not None:
+        return torch_scores
+
+    all_squared_distances = point_to_particle_segment_squared_distances(points, particles[:, :-1, :3], particles[:, 1:, :3])
+    if all_squared_distances.size:
+        squared_distances = np.min(all_squared_distances, axis=1)
+        nearest_segments = np.argmin(all_squared_distances, axis=1)
     else:
-        segment_indices = np.clip(np.asarray(segment_indices, dtype=np.int64).reshape(-1), 0, particles.shape[1] - 2)
-        squared_distances = point_to_particle_assigned_segment_squared_distances(points, particles, segment_indices)
-        expected_segments = np.unique(np.clip(np.asarray(segment_indices, dtype=np.int64), 0, particles.shape[1] - 2))
+        squared_distances = np.empty((len(particles), 0), dtype=np.float64)
+        nearest_segments = np.empty((len(particles), 0), dtype=np.int64)
+    expected_segments = expected_segment_indices(expected_segments, particles.shape[1] - 1)
     if squared_distances.size == 0:
         return np.full(len(particles), np.inf, dtype=np.float64)
 
@@ -622,30 +1128,116 @@ def particle_distance_scores(
         keep_fraction=float(score_keep_fraction),
     )
     if coverage_penalty_m > 0.0 and len(expected_segments):
-        if nearest_segments is not None:
-            scores = scores + segment_coverage_penalty(
-                nearest_segments,
-                expected_segments=expected_segments,
-                penalty_m=float(coverage_penalty_m),
-                min_fraction=float(coverage_min_fraction),
-            )
-        else:
-            scores = scores + assigned_segment_coverage_penalty(
-                squared_distances,
-                segment_indices,
-                expected_segments=expected_segments,
-                outlier_distance=float(outlier_distance),
-                penalty_m=float(coverage_penalty_m),
-                min_fraction=float(coverage_min_fraction),
-            )
+        scores = scores + segment_coverage_penalty(
+            nearest_segments,
+            expected_segments=expected_segments,
+            penalty_m=float(coverage_penalty_m),
+            min_fraction=float(coverage_min_fraction),
+        )
+    if float(bend_penalty_m) > 0.0:
+        scores = scores + particle_bend_penalty(particles, penalty_m=float(bend_penalty_m))
     return scores
 
 
-def trimmed_mean_squared_distances(distances, outlier_distance=np.inf, keep_fraction=1.0):
-    distances = np.asarray(distances, dtype=np.float64)
-    if distances.ndim != 2 or distances.shape[1] == 0:
-        return np.full(distances.shape[0] if distances.ndim == 2 else 0, np.inf, dtype=np.float64)
-    return trimmed_mean_squared_values(distances * distances, outlier_distance=outlier_distance, keep_fraction=keep_fraction)
+def particle_distance_scores_torch(
+    points,
+    particles,
+    outlier_distance=np.inf,
+    score_keep_fraction=1.0,
+    coverage_penalty_m=0.0,
+    coverage_min_fraction=0.05,
+    bend_penalty_m=0.0,
+    expected_segments=None,
+    backend="auto",
+    chunk_points=512,
+):
+    device = torch_scoring_device(backend)
+    if device is None:
+        return None
+
+    try:
+        with torch.inference_mode():
+            points_t = torch.as_tensor(points[:, :3], dtype=torch.float32, device=device)
+            particles_t = torch.as_tensor(particles[:, :, :3], dtype=torch.float32, device=device)
+            starts = particles_t[:, :-1, :]
+            ends = particles_t[:, 1:, :]
+            segment = ends - starts
+            length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
+
+            best_chunks = []
+            nearest_chunks = []
+            chunk_points = max(1, int(chunk_points))
+            for start_index in range(0, points_t.shape[0], chunk_points):
+                chunk = points_t[start_index : start_index + chunk_points]
+                point_delta = chunk[None, None, :, :] - starts[:, :, None, :]
+                t = torch.sum(point_delta * segment[:, :, None, :], dim=3) / length_sq[:, :, None]
+                t = torch.clamp(t, 0.0, 1.0)
+                projection = starts[:, :, None, :] + t[:, :, :, None] * segment[:, :, None, :]
+                delta = chunk[None, None, :, :] - projection
+                squared = torch.sum(delta * delta, dim=3)
+                best, nearest = torch.min(squared, dim=1)
+                best_chunks.append(best)
+                nearest_chunks.append(nearest)
+
+            if not best_chunks:
+                return np.full(len(particles), np.inf, dtype=np.float64)
+            squared_distances = torch.cat(best_chunks, dim=1)
+            nearest_segments = torch.cat(nearest_chunks, dim=1)
+
+            outlier_distance = float(outlier_distance)
+            if np.isfinite(outlier_distance):
+                squared_distances = torch.clamp(squared_distances, max=outlier_distance * outlier_distance)
+            keep_fraction = float(np.clip(score_keep_fraction, 1e-6, 1.0))
+            keep_count = max(1, int(np.ceil(squared_distances.shape[1] * keep_fraction)))
+            if keep_count >= squared_distances.shape[1]:
+                scores = torch.mean(squared_distances, dim=1)
+            else:
+                selected, _indices = torch.topk(squared_distances, keep_count, dim=1, largest=False)
+                scores = torch.mean(selected, dim=1)
+
+            expected = expected_segment_indices(expected_segments, particles.shape[1] - 1)
+            if float(coverage_penalty_m) > 0.0 and len(expected):
+                required = max(1, int(np.ceil(nearest_segments.shape[1] * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
+                missing = torch.zeros(nearest_segments.shape[0], dtype=torch.float32, device=device)
+                for segment_index in expected:
+                    counts = torch.count_nonzero(nearest_segments == int(segment_index), dim=1)
+                    missing = missing + (counts < required).to(torch.float32)
+                scores = scores + missing * float(coverage_penalty_m) * float(coverage_penalty_m)
+
+            if float(bend_penalty_m) > 0.0 and particles_t.shape[1] > 2:
+                directions = segment / torch.sqrt(length_sq[:, :, None])
+                dots = torch.sum(directions[:, :-1, :] * directions[:, 1:, :], dim=2).clamp(-1.0, 1.0)
+                bend = torch.mean(torch.clamp(1.0 - dots, min=0.0), dim=1)
+                scores = scores + bend * float(bend_penalty_m) * float(bend_penalty_m)
+
+            return scores.detach().cpu().numpy().astype(np.float64, copy=False)
+    except RuntimeError:
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        return None
+
+
+def torch_scoring_device(backend):
+    backend = str(backend or "auto").lower()
+    if backend == "cpu":
+        return None
+    if torch is None:
+        return None
+    if backend in {"auto", "cuda"} and torch.cuda.is_available():
+        return torch.device("cuda")
+    return None
+
+
+def expected_segment_indices(expected_segments, segment_count):
+    if expected_segments is None:
+        return np.arange(int(segment_count), dtype=np.int64)
+    expected = np.asarray(expected_segments, dtype=np.int64).reshape(-1)
+    if len(expected) == 0:
+        return expected
+    return np.unique(np.clip(expected, 0, int(segment_count) - 1))
 
 
 def trimmed_mean_squared_values(squared_distances, outlier_distance=np.inf, keep_fraction=1.0):
@@ -682,74 +1274,26 @@ def segment_coverage_penalty(nearest_segments, expected_segments, penalty_m=0.02
     return missing_counts * float(penalty_m) * float(penalty_m)
 
 
-def assigned_segment_coverage_penalty(
-    squared_distances,
-    segment_indices,
-    expected_segments,
-    outlier_distance=np.inf,
-    penalty_m=0.025,
-    min_fraction=0.05,
-):
-    squared_distances = np.asarray(squared_distances, dtype=np.float64)
-    segment_indices = np.asarray(segment_indices, dtype=np.int64).reshape(-1)
-    if squared_distances.ndim != 2 or squared_distances.shape[1] == 0 or len(segment_indices) != squared_distances.shape[1]:
-        return np.zeros(squared_distances.shape[0] if squared_distances.ndim == 2 else 0, dtype=np.float64)
-
-    expected_segments = np.asarray(expected_segments, dtype=np.int64).reshape(-1)
-    if len(expected_segments) == 0:
-        return np.zeros(squared_distances.shape[0], dtype=np.float64)
-
-    outlier_distance = float(outlier_distance)
-    max_distance_sq = outlier_distance * outlier_distance if np.isfinite(outlier_distance) else np.inf
-    close = squared_distances <= max_distance_sq
-    required = max(1, int(np.ceil(squared_distances.shape[1] * float(np.clip(min_fraction, 0.0, 1.0)))))
-    missing_counts = np.zeros(squared_distances.shape[0], dtype=np.float64)
-    for segment_index in expected_segments:
-        selected = segment_indices == int(segment_index)
-        if not np.any(selected):
-            missing_counts += 1.0
-            continue
-        counts = np.count_nonzero(close[:, selected], axis=1)
-        missing_counts += counts < required
-    return missing_counts * float(penalty_m) * float(penalty_m)
-
-
-def point_to_particle_polyline_distances(points, particles):
-    points = valid_points(points)
+def particle_bend_penalty(particles, penalty_m=0.030):
     particles = valid_particles(particles)
-    if len(points) == 0 or len(particles) == 0 or particles.shape[1] < 2:
-        return np.empty((len(particles), 0), dtype=np.float64)
-
-    starts = particles[:, :-1, :3]
-    ends = particles[:, 1:, :3]
-    distances = point_to_particle_segment_distances(points, starts, ends)
-    if distances.size == 0:
-        return np.empty((len(particles), 0), dtype=np.float64)
-    return np.min(distances, axis=1)
+    if len(particles) == 0 or particles.shape[1] < 3:
+        return np.zeros(len(particles), dtype=np.float64)
+    directions = particle_directions(particles)
+    dots = np.sum(directions[:, :-1, :] * directions[:, 1:, :], axis=2)
+    bend = np.mean(np.maximum(0.0, 1.0 - np.clip(dots, -1.0, 1.0)), axis=1)
+    return bend * float(penalty_m) * float(penalty_m)
 
 
-def point_to_particle_assigned_segment_distances(points, particles, segment_indices):
-    squared = point_to_particle_assigned_segment_squared_distances(points, particles, segment_indices)
-    return np.sqrt(squared, out=squared)
-
-
-def point_to_particle_assigned_segment_squared_distances(points, particles, segment_indices):
-    points = valid_points(points)
+def endpoint_order_penalty(particles, measurement_nodes, weight=1.0):
     particles = valid_particles(particles)
-    segment_indices = np.asarray(segment_indices, dtype=np.int64).reshape(-1)
-    if len(points) == 0 or len(particles) == 0 or particles.shape[1] < 2 or len(segment_indices) != len(points):
-        return np.empty((len(particles), 0), dtype=np.float64)
-
-    max_segment = particles.shape[1] - 2
-    segment_indices = np.clip(segment_indices, 0, max_segment)
-    starts = particles[:, segment_indices, :3]
-    ends = particles[:, segment_indices + 1, :3]
-    return point_to_particle_assigned_segments_squared(points, starts, ends)
-
-
-def point_to_particle_segment_distances(points, starts, ends):
-    squared = point_to_particle_segment_squared_distances(points, starts, ends)
-    return np.sqrt(squared, out=squared)
+    nodes = valid_points(measurement_nodes)
+    if len(particles) == 0 or len(nodes) < 2:
+        return np.zeros(len(particles), dtype=np.float64)
+    start = nodes[0]
+    end = nodes[-1]
+    start_error = np.sum((particles[:, 0, :3] - start[None, :]) ** 2, axis=1)
+    end_error = np.sum((particles[:, -1, :3] - end[None, :]) ** 2, axis=1)
+    return 0.5 * float(weight) * (start_error + end_error)
 
 
 def point_to_particle_segment_squared_distances(points, starts, ends):
@@ -769,28 +1313,6 @@ def point_to_particle_segment_squared_distances(points, starts, ends):
     return np.sum(delta * delta, axis=3)
 
 
-def point_to_particle_assigned_segments(points, starts, ends):
-    squared = point_to_particle_assigned_segments_squared(points, starts, ends)
-    return np.sqrt(squared, out=squared)
-
-
-def point_to_particle_assigned_segments_squared(points, starts, ends):
-    points = np.asarray(points, dtype=np.float64)[:, :3]
-    starts = np.asarray(starts, dtype=np.float64)
-    ends = np.asarray(ends, dtype=np.float64)
-    if starts.ndim != 3 or ends.shape != starts.shape or starts.shape[2] < 3:
-        return np.empty((0, 0), dtype=np.float64)
-
-    segment = ends[:, :, :3] - starts[:, :, :3]
-    length_sq = np.sum(segment * segment, axis=2)
-    point_delta = points[None, :, :] - starts[:, :, :3]
-    denom = np.maximum(length_sq, 1e-12)
-    t = np.clip(np.sum(point_delta * segment, axis=2) / denom, 0.0, 1.0)
-    projection = starts[:, :, :3] + t[:, :, None] * segment
-    delta = points[None, :, :] - projection
-    return np.sum(delta * delta, axis=2)
-
-
 def point_to_all_segment_distances(points, nodes):
     points = valid_points(points)
     nodes = valid_points(nodes)
@@ -808,22 +1330,6 @@ def valid_particles(particles):
     if particles.ndim != 3 or particles.shape[1] < 2 or particles.shape[2] < 3:
         return np.empty((0, 0, 3), dtype=np.float64)
     return np.ascontiguousarray(particles[:, :, :3], dtype=np.float64)
-
-
-def point_to_assigned_segment_distances(points, nodes, segment_indices):
-    points = valid_points(points)
-    nodes = valid_points(nodes)
-    segment_indices = np.asarray(segment_indices, dtype=np.int64).reshape(-1)
-    if len(points) == 0 or len(nodes) < 2 or len(segment_indices) != len(points):
-        return np.empty(0, dtype=np.float64)
-
-    distances = np.empty(len(points), dtype=np.float64)
-    segment_indices = np.clip(segment_indices, 0, len(nodes) - 2)
-    for segment_index in range(len(nodes) - 1):
-        selected = segment_indices == segment_index
-        if np.any(selected):
-            distances[selected] = point_to_segment_distances(points[selected], nodes[segment_index], nodes[segment_index + 1])
-    return distances
 
 
 def point_to_segment_distances(points, start, end):

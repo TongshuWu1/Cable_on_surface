@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 import queue
 import re
@@ -7,7 +8,8 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+import tomllib
 
 import cv2
 import numpy as np
@@ -21,21 +23,37 @@ except Exception:
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
+from cable_detection import remove_small_components
+
 DEFAULT_DATASET_DIR = PROJECT_DIR / "datasets/cable_pidnet"
 DEFAULT_MODEL_PATH = PROJECT_DIR / "models/pidnet_cable_best.pt"
+DEFAULT_IMAGE_SIZE = "1280x720"
+DEFAULT_PARAMS_PATH = PROJECT_DIR / "pidnet_training_params.json"
+DEFAULT_CONFIG_PATH = PROJECT_DIR / "config.toml"
 CAPTURE_DIR = DEFAULT_DATASET_DIR / "captures"
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Label cable masks and train the PIDNet-S cable segmenter.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Live tracker config.toml to tune PIDNet cleanup values.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--image", action="append", default=[], help="Image path to label. Can be repeated.")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--imgsz", type=int, default=512)
+    parser.add_argument(
+        "--imgsz",
+        default=DEFAULT_IMAGE_SIZE,
+        help="Training image size. Use 1280x720 for full ZED HD720, or a single value like 512 for square training.",
+    )
     parser.add_argument("--base-channels", type=int, default=24)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--boundary-weight", type=float, default=0.20)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resolution", choices=resolution_names(), default="HD720")
     parser.add_argument("--fps", type=int, default=60)
@@ -163,12 +181,118 @@ def binary_mask_metrics(predicted_mask, target_mask):
     }
 
 
+def safe_int(var, default, min_value=None, max_value=None):
+    try:
+        value = int(float(var.get()))
+    except Exception:
+        value = int(default)
+    if min_value is not None:
+        value = max(int(min_value), value)
+    if max_value is not None:
+        value = min(int(max_value), value)
+    return value
+
+
+def safe_float(var, default, min_value=None, max_value=None):
+    try:
+        value = float(var.get())
+    except Exception:
+        value = float(default)
+    if min_value is not None:
+        value = max(float(min_value), value)
+    if max_value is not None:
+        value = min(float(max_value), value)
+    return value
+
+
+def load_toml_config(path):
+    path = Path(path)
+    if not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def odd_kernel_value(var, default):
+    value = safe_int(var, default, min_value=1, max_value=99)
+    if value % 2 == 0:
+        value += 1
+    return value
+
+
+def replace_toml_values(path, updates):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file does not exist: {path}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    section = None
+    seen = set()
+    output = []
+
+    def append_missing_for_section(section_name):
+        if section_name is None:
+            return
+        for update_key, value in updates.items():
+            update_section, key = update_key
+            if update_section == section_name and update_key not in seen:
+                output.append(f"{key} = {toml_scalar(value)}")
+                seen.add(update_key)
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            append_missing_for_section(section)
+            section = stripped.strip("[]").strip()
+            output.append(line)
+            continue
+        key = None
+        if section and "=" in line and not stripped.startswith("#"):
+            key = line.split("=", 1)[0].strip()
+        update_key = (section, key)
+        if key is not None and update_key in updates:
+            output.append(f"{key} = {toml_scalar(updates[update_key])}")
+            seen.add(update_key)
+        else:
+            output.append(line)
+
+    append_missing_for_section(section)
+    missing = [key for key in updates if key not in seen]
+    if missing:
+        output.append("")
+    missing_sections = []
+    for section_name, _key in missing:
+        if section_name not in missing_sections:
+            missing_sections.append(section_name)
+    for section_name in missing_sections:
+        output.append(f"[{section_name}]")
+        for update_key, value in updates.items():
+            update_section, key = update_key
+            if update_section == section_name and update_key not in seen:
+                output.append(f"{key} = {toml_scalar(value)}")
+                seen.add(update_key)
+
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+def toml_scalar(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(int(value))
+    if isinstance(value, float):
+        return f"{float(value):.8g}"
+    return json.dumps(str(value))
+
+
 class PidNetTrainingApp:
     def __init__(self, root, args):
         self.root = root
         self.args = args
         self.root.title("PIDNet-S Cable Segmenter Training")
         self.root.geometry("1720x980")
+        self.live_config = load_toml_config(args.config)
+        pidnet_config = self.live_config.get("pidnet", {})
+        detector_config = self.live_config.get("detector", {})
 
         self.frames = []
         self.selected_frame_idx = -1
@@ -179,14 +303,29 @@ class PidNetTrainingApp:
         self.draw_when_zoomed_var = tk.BooleanVar(value=False)
         self.epochs_var = tk.IntVar(value=int(args.epochs))
         self.batch_var = tk.IntVar(value=int(args.batch_size))
-        self.imgsz_var = tk.IntVar(value=int(args.imgsz))
+        self.imgsz_var = tk.StringVar(value=str(args.imgsz))
         self.base_channels_var = tk.IntVar(value=int(args.base_channels))
+        self.lr_var = tk.DoubleVar(value=float(args.lr))
+        self.weight_decay_var = tk.DoubleVar(value=float(args.weight_decay))
+        self.val_split_var = tk.DoubleVar(value=float(args.val_split))
+        self.num_workers_var = tk.IntVar(value=int(args.num_workers))
+        self.boundary_weight_var = tk.DoubleVar(value=float(args.boundary_weight))
+        self.amp_var = tk.BooleanVar(value=bool(args.amp))
         self.device_var = tk.StringVar(value=str(args.device or "cuda"))
-        self.test_threshold_var = tk.DoubleVar(value=0.50)
+        self.test_threshold_var = tk.DoubleVar(value=float(pidnet_config.get("threshold", 0.50)))
+        self.threshold_text_var = tk.StringVar(value=f"{float(pidnet_config.get('threshold', 0.50)):.2f}")
         self.live_test_var = tk.BooleanVar(value=False)
+        self.morph_kernel_var = tk.IntVar(value=5)
+        self.morph_iterations_var = tk.IntVar(value=1)
+        self.config_var = tk.StringVar(value=str(Path(args.config)))
+        self.detector_min_area_var = tk.IntVar(value=int(detector_config.get("min_area_px", 80)))
+        self.detector_open_kernel_var = tk.IntVar(value=int(detector_config.get("open_kernel", 3)))
+        self.detector_close_kernel_var = tk.IntVar(value=int(detector_config.get("close_kernel", 5)))
         self.dataset_var = tk.StringVar(value=str(Path(args.dataset)))
         self.output_var = tk.StringVar(value=str(Path(args.output)))
-        self.status_var = tk.StringVar(value="Step 1: open images or capture from ZED, then paint only the cable. Unpainted pixels are background.")
+        self.status_var = tk.StringVar(value="Open or capture frames, paint cable masks, save labels, then train and test PIDNet.")
+        self.train_progress_var = tk.DoubleVar(value=0.0)
+        self.train_summary_var = tk.StringVar(value="No training run active.")
 
         self.view_zoom = 1.0
         self.view_center_xy = None
@@ -227,18 +366,14 @@ class PidNetTrainingApp:
         instructions.pack(side=tk.TOP, fill=tk.X)
         tk.Label(
             instructions,
-            text="PIDNet-S cable training workflow",
+            text="PIDNet-S cable mask training",
             font=("TkDefaultFont", 13, "bold"),
             bg="#f4f4f4",
             anchor="w",
         ).pack(side=tk.TOP, fill=tk.X)
         tk.Label(
             instructions,
-            text=(
-                "1. Open/capture RGB frames.  2. Paint only the cable pixels; every unpainted pixel is background.  "
-                "3. Save labels to dataset/images and dataset/masks.  "
-                "4. Train PIDNet-S on CUDA.  5. Run main.py with the saved checkpoint."
-            ),
+            text="Paint white cable masks, clean them if needed, train at 1280x720, then test the checkpoint before using it live.",
             bg="#f4f4f4",
             anchor="w",
             justify=tk.LEFT,
@@ -265,6 +400,12 @@ class PidNetTrainingApp:
         tk.Button(toolbar, text="Save Current Mask", command=self.save_current_label).pack(side=tk.LEFT, padx=3)
         tk.Button(toolbar, text="Save All Painted Masks", command=self.save_all_labels).pack(side=tk.LEFT, padx=3)
         tk.Button(toolbar, text="Clear Mask", command=self.clear_current_mask).pack(side=tk.LEFT, padx=3)
+        tk.Label(toolbar, text="  Label cleanup").pack(side=tk.LEFT)
+        tk.Spinbox(toolbar, from_=1, to=41, increment=2, width=4, textvariable=self.morph_kernel_var).pack(side=tk.LEFT, padx=3)
+        tk.Label(toolbar, text="Iter").pack(side=tk.LEFT)
+        tk.Spinbox(toolbar, from_=1, to=8, width=3, textvariable=self.morph_iterations_var).pack(side=tk.LEFT, padx=3)
+        tk.Button(toolbar, text="Label Open", command=lambda: self.apply_mask_morph("open")).pack(side=tk.LEFT, padx=3)
+        tk.Button(toolbar, text="Label Close", command=lambda: self.apply_mask_morph("close")).pack(side=tk.LEFT, padx=3)
         tk.Button(toolbar, text="Reset View", command=self.reset_view).pack(side=tk.LEFT, padx=3)
 
         paths = tk.Frame(self.root, padx=8, pady=4)
@@ -283,15 +424,43 @@ class PidNetTrainingApp:
         for label, var, width in (
             ("Epochs", self.epochs_var, 6),
             ("Batch", self.batch_var, 5),
-            ("Image", self.imgsz_var, 6),
             ("Channels", self.base_channels_var, 5),
         ):
             tk.Label(train_bar, text=label).pack(side=tk.LEFT)
             tk.Spinbox(train_bar, from_=1, to=4096, width=width, textvariable=var, command=self.refresh_command_text).pack(side=tk.LEFT, padx=3)
+        tk.Label(train_bar, text="Image WxH").pack(side=tk.LEFT)
+        image_entry = tk.Entry(train_bar, textvariable=self.imgsz_var, width=10)
+        image_entry.pack(side=tk.LEFT, padx=3)
+        image_entry.bind("<KeyRelease>", lambda _event: self.refresh_command_text())
         tk.Label(train_bar, text="Device").pack(side=tk.LEFT)
         tk.Entry(train_bar, textvariable=self.device_var, width=8).pack(side=tk.LEFT, padx=3)
         tk.Button(train_bar, text="Train PIDNet-S on CUDA", command=self.start_training).pack(side=tk.LEFT, padx=8)
         tk.Button(train_bar, text="Stop Training", command=self.stop_training).pack(side=tk.LEFT, padx=3)
+        tk.Button(train_bar, text="Check Dataset", command=self.check_dataset_health).pack(side=tk.LEFT, padx=8)
+
+        tune_bar = tk.Frame(self.root, padx=8, pady=4)
+        tune_bar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(tune_bar, text="Tune").pack(side=tk.LEFT)
+        for label, var, width in (
+            ("LR", self.lr_var, 9),
+            ("Weight Decay", self.weight_decay_var, 9),
+            ("Val Split", self.val_split_var, 6),
+            ("Boundary", self.boundary_weight_var, 6),
+        ):
+            tk.Label(tune_bar, text=label).pack(side=tk.LEFT, padx=(10, 0))
+            entry = tk.Entry(tune_bar, textvariable=var, width=width)
+            entry.pack(side=tk.LEFT, padx=3)
+            entry.bind("<KeyRelease>", lambda _event: self.refresh_command_text())
+        tk.Label(tune_bar, text="Workers").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Spinbox(tune_bar, from_=0, to=32, width=4, textvariable=self.num_workers_var, command=self.refresh_command_text).pack(side=tk.LEFT, padx=3)
+        tk.Checkbutton(tune_bar, text="AMP", variable=self.amp_var, command=self.refresh_command_text).pack(side=tk.LEFT, padx=8)
+        tk.Button(tune_bar, text="Save Params", command=self.save_pidnet_params).pack(side=tk.LEFT, padx=3)
+        tk.Button(tune_bar, text="Load Params", command=self.load_pidnet_params).pack(side=tk.LEFT, padx=3)
+
+        progress_bar = tk.Frame(self.root, padx=8, pady=2)
+        progress_bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Progressbar(progress_bar, variable=self.train_progress_var, maximum=100.0, length=260).pack(side=tk.LEFT, padx=3)
+        tk.Label(progress_bar, textvariable=self.train_summary_var, anchor="w").pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
 
         test_bar = tk.Frame(self.root, padx=8, pady=4)
         test_bar.pack(side=tk.TOP, fill=tk.X)
@@ -304,8 +473,9 @@ class PidNetTrainingApp:
             orient=tk.HORIZONTAL,
             variable=self.test_threshold_var,
             length=150,
-            command=lambda _value: self.refresh(),
+            command=self.on_threshold_change,
         ).pack(side=tk.LEFT, padx=3)
+        tk.Label(test_bar, textvariable=self.threshold_text_var, width=5).pack(side=tk.LEFT)
         tk.Button(test_bar, text="Test Current / Start Live", command=self.test_current_frame).pack(side=tk.LEFT, padx=8)
         tk.Checkbutton(
             test_bar,
@@ -317,10 +487,48 @@ class PidNetTrainingApp:
         tk.Button(test_bar, text="Test Train Set", command=lambda: self.test_dataset_split("train")).pack(side=tk.LEFT, padx=3)
         tk.Button(test_bar, text="Clear Test View", command=self.clear_prediction).pack(side=tk.LEFT, padx=3)
 
+        cleanup_bar = tk.Frame(self.root, padx=8, pady=4)
+        cleanup_bar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(cleanup_bar, text="Live PIDNet cleanup").pack(side=tk.LEFT)
+        tk.Label(cleanup_bar, text="Min area").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Spinbox(
+            cleanup_bar,
+            from_=0,
+            to=100000,
+            width=7,
+            textvariable=self.detector_min_area_var,
+            command=self.refresh,
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Label(cleanup_bar, text="Open").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Spinbox(
+            cleanup_bar,
+            from_=1,
+            to=99,
+            increment=2,
+            width=4,
+            textvariable=self.detector_open_kernel_var,
+            command=self.on_live_cleanup_change,
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Label(cleanup_bar, text="Close").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Spinbox(
+            cleanup_bar,
+            from_=1,
+            to=99,
+            increment=2,
+            width=4,
+            textvariable=self.detector_close_kernel_var,
+            command=self.on_live_cleanup_change,
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Button(cleanup_bar, text="Preview Cleanup", command=self.refresh).pack(side=tk.LEFT, padx=8)
+        tk.Button(cleanup_bar, text="Save to config.toml", command=self.save_live_cleanup_to_config).pack(side=tk.LEFT, padx=3)
+        tk.Label(cleanup_bar, text="Config").pack(side=tk.LEFT, padx=(12, 0))
+        tk.Entry(cleanup_bar, textvariable=self.config_var, width=44).pack(side=tk.LEFT, padx=3)
+        tk.Button(cleanup_bar, text="Browse", command=self.choose_config_path).pack(side=tk.LEFT, padx=3)
+
         body = tk.Frame(self.root)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=1)
+        body.columnconfigure(0, weight=2)
+        body.columnconfigure(1, weight=2)
         body.columnconfigure(2, weight=1)
         body.rowconfigure(1, weight=1)
         titles = ["RGB + cable foreground", "Model test / training mask"]
@@ -413,8 +621,30 @@ class PidNetTrainingApp:
             item["split"] = self.split_var.get()
         self.refresh()
 
+    def on_threshold_change(self, _value=None):
+        self.threshold_text_var.set(f"{safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95):.2f}")
+        self.refresh()
+
+    def on_live_cleanup_change(self):
+        self.detector_open_kernel_var.set(odd_kernel_value(self.detector_open_kernel_var, 3))
+        self.detector_close_kernel_var.set(odd_kernel_value(self.detector_close_kernel_var, 5))
+        self.refresh()
+
     def adjust_brush(self, delta):
         self.brush_radius_var.set(int(np.clip(self.brush_radius_var.get() + delta, 1, 40)))
+        self.refresh()
+
+    def choose_config_path(self):
+        path = filedialog.askopenfilename(
+            title="Choose live tracker config.toml",
+            initialdir=str(Path(self.config_var.get()).parent),
+            filetypes=[("TOML config", "*.toml"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.config_var.set(path)
+        self.load_live_cleanup_from_config(path)
+        self.status_var.set(f"Loaded live cleanup values from {Path(path).name}")
         self.refresh()
 
     def choose_dataset_dir(self):
@@ -435,6 +665,55 @@ class PidNetTrainingApp:
             self.unload_segmenter()
             self.update_model_status()
             self.refresh_command_text()
+
+    def load_live_cleanup_from_config(self, path):
+        config = load_toml_config(path)
+        pidnet_config = config.get("pidnet", {})
+        detector_config = config.get("detector", {})
+        if "threshold" in pidnet_config:
+            self.test_threshold_var.set(float(pidnet_config["threshold"]))
+            self.threshold_text_var.set(f"{float(pidnet_config['threshold']):.2f}")
+        if "min_area_px" in detector_config:
+            self.detector_min_area_var.set(int(detector_config["min_area_px"]))
+        if "open_kernel" in detector_config:
+            self.detector_open_kernel_var.set(int(detector_config["open_kernel"]))
+        if "close_kernel" in detector_config:
+            self.detector_close_kernel_var.set(int(detector_config["close_kernel"]))
+
+    def live_cleanup_params(self):
+        open_kernel = odd_kernel_value(self.detector_open_kernel_var, 3)
+        close_kernel = odd_kernel_value(self.detector_close_kernel_var, 5)
+        self.detector_open_kernel_var.set(open_kernel)
+        self.detector_close_kernel_var.set(close_kernel)
+        return {
+            "threshold": safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
+            "min_area_px": safe_int(self.detector_min_area_var, 80, min_value=0, max_value=1000000),
+            "open_kernel": open_kernel,
+            "close_kernel": close_kernel,
+        }
+
+    def save_live_cleanup_to_config(self):
+        params = self.live_cleanup_params()
+        config_path = Path(self.config_var.get() or DEFAULT_CONFIG_PATH)
+        try:
+            replace_toml_values(
+                config_path,
+                {
+                    ("pidnet", "threshold"): params["threshold"],
+                    ("detector", "min_area_px"): params["min_area_px"],
+                    ("detector", "open_kernel"): params["open_kernel"],
+                    ("detector", "close_kernel"): params["close_kernel"],
+                },
+            )
+        except Exception as exc:
+            self.status_var.set(f"Could not save live cleanup config: {exc}")
+            return
+        self.status_var.set(
+            f"Saved live PIDNet cleanup to {config_path.name}: "
+            f"threshold={params['threshold']:.2f}, min_area={params['min_area_px']}, "
+            f"open={params['open_kernel']}, close={params['close_kernel']}."
+        )
+        self.refresh_command_text()
 
     def unload_segmenter(self):
         self.segmenter = None
@@ -567,6 +846,30 @@ class PidNetTrainingApp:
         self.status_var.set("Cleared current mask.")
         self.refresh()
 
+    def apply_mask_morph(self, operation):
+        item = self.active_item()
+        if item is None:
+            self.status_var.set("No saved frame is selected for mask cleanup.")
+            return
+        kernel_size = safe_int(self.morph_kernel_var, 5, min_value=1, max_value=99)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+            self.morph_kernel_var.set(kernel_size)
+        iterations = safe_int(self.morph_iterations_var, 1, min_value=1, max_value=16)
+        op_map = {
+            "open": cv2.MORPH_OPEN,
+            "close": cv2.MORPH_CLOSE,
+        }
+        if operation not in op_map:
+            return
+        before = int(np.count_nonzero(item["mask"]))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        item["mask"] = cv2.morphologyEx(item["mask"], op_map[operation], kernel, iterations=iterations)
+        item["mask"] = (item["mask"] > 127).astype(np.uint8) * 255
+        after = int(np.count_nonzero(item["mask"]))
+        self.status_var.set(f"Applied mask {operation}: cable px {before} -> {after}.")
+        self.refresh()
+
     def save_current_label(self):
         item = self.active_item()
         if item is None:
@@ -603,39 +906,224 @@ class PidNetTrainingApp:
         self.refresh_command_text()
         return saved > 0
 
+    def current_pidnet_params(self):
+        return {
+            "version": 1,
+            "dataset": str(Path(self.dataset_var.get())),
+            "output": str(Path(self.output_var.get())),
+            "epochs": safe_int(self.epochs_var, 80, min_value=1),
+            "batch_size": safe_int(self.batch_var, 8, min_value=1),
+            "imgsz": str(self.imgsz_var.get()).strip() or DEFAULT_IMAGE_SIZE,
+            "base_channels": safe_int(self.base_channels_var, 24, min_value=1),
+            "device": str(self.device_var.get() or "cuda"),
+            "lr": safe_float(self.lr_var, 1e-3, min_value=1e-8),
+            "weight_decay": safe_float(self.weight_decay_var, 1e-4, min_value=0.0),
+            "val_split": safe_float(self.val_split_var, 0.15, min_value=0.0, max_value=0.8),
+            "num_workers": safe_int(self.num_workers_var, 4, min_value=0),
+            "boundary_weight": safe_float(self.boundary_weight_var, 0.20, min_value=0.0),
+            "amp": bool(self.amp_var.get()),
+            "test_threshold": safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
+            "config": str(Path(self.config_var.get() or DEFAULT_CONFIG_PATH)),
+            "live_mask_cleanup": self.live_cleanup_params(),
+            "label_mask_cleanup": {
+                "kernel": safe_int(self.morph_kernel_var, 5, min_value=1, max_value=99),
+                "iterations": safe_int(self.morph_iterations_var, 1, min_value=1, max_value=16),
+            },
+        }
+
+    def apply_pidnet_params(self, params):
+        if not isinstance(params, dict):
+            raise ValueError("PIDNet parameter file must contain a JSON object.")
+        if "dataset" in params:
+            self.dataset_var.set(str(params["dataset"]))
+        if "output" in params:
+            self.output_var.set(str(params["output"]))
+            self.unload_segmenter()
+            self.update_model_status()
+        for key, var in (
+            ("epochs", self.epochs_var),
+            ("batch_size", self.batch_var),
+            ("base_channels", self.base_channels_var),
+            ("num_workers", self.num_workers_var),
+        ):
+            if key in params:
+                var.set(int(params[key]))
+        for key, var in (
+            ("lr", self.lr_var),
+            ("weight_decay", self.weight_decay_var),
+            ("val_split", self.val_split_var),
+            ("boundary_weight", self.boundary_weight_var),
+            ("test_threshold", self.test_threshold_var),
+        ):
+            if key in params:
+                var.set(float(params[key]))
+        if "imgsz" in params:
+            self.imgsz_var.set(str(params["imgsz"]))
+        if "device" in params:
+            self.device_var.set(str(params["device"]))
+        if "amp" in params:
+            self.amp_var.set(bool(params["amp"]))
+        if "config" in params:
+            self.config_var.set(str(params["config"]))
+        cleanup_params = params.get("live_mask_cleanup", {})
+        if isinstance(cleanup_params, dict):
+            if "threshold" in cleanup_params:
+                self.test_threshold_var.set(float(cleanup_params["threshold"]))
+            if "min_area_px" in cleanup_params:
+                self.detector_min_area_var.set(int(cleanup_params["min_area_px"]))
+            if "open_kernel" in cleanup_params:
+                self.detector_open_kernel_var.set(int(cleanup_params["open_kernel"]))
+            if "close_kernel" in cleanup_params:
+                self.detector_close_kernel_var.set(int(cleanup_params["close_kernel"]))
+        mask_params = params.get("label_mask_cleanup", params.get("mask_open_close", {}))
+        if isinstance(mask_params, dict):
+            if "kernel" in mask_params:
+                self.morph_kernel_var.set(int(mask_params["kernel"]))
+            if "iterations" in mask_params:
+                self.morph_iterations_var.set(int(mask_params["iterations"]))
+        self.on_threshold_change()
+        self.refresh_command_text()
+
+    def save_pidnet_params(self):
+        path = filedialog.asksaveasfilename(
+            title="Save PIDNet training parameters",
+            initialfile=DEFAULT_PARAMS_PATH.name,
+            initialdir=str(PROJECT_DIR),
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(self.current_pidnet_params(), indent=2) + "\n", encoding="utf-8")
+        self.status_var.set(f"Saved PIDNet parameters: {output_path.name}")
+
+    def load_pidnet_params(self):
+        path = filedialog.askopenfilename(
+            title="Load PIDNet training parameters",
+            initialdir=str(PROJECT_DIR),
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            params = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.apply_pidnet_params(params)
+        except Exception as exc:
+            self.status_var.set(f"Could not load PIDNet parameters: {exc}")
+            return
+        self.status_var.set(f"Loaded PIDNet parameters: {Path(path).name}")
+        self.refresh()
+
+    def check_dataset_health(self):
+        dataset_dir = Path(self.dataset_var.get())
+        lines = [f"Dataset check: {dataset_dir}"]
+        total_pairs = 0
+        total_empty = 0
+        total_heavy = 0
+        total_shape_mismatch = 0
+        for split in ("train", "val"):
+            image_dir = dataset_dir / "images" / split
+            mask_dir = dataset_dir / "masks" / split
+            pairs = dataset_image_mask_pairs(dataset_dir, split)
+            total_pairs += len(pairs)
+            image_stems = set()
+            mask_stems = set()
+            if image_dir.exists():
+                image_stems = {path.stem for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
+            if mask_dir.exists():
+                mask_stems = {path.stem for path in mask_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
+            missing_masks = len(image_stems - mask_stems)
+            missing_images = len(mask_stems - image_stems)
+            empty = 0
+            heavy = 0
+            shape_mismatch = 0
+            for image_path, mask_path in pairs:
+                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                if image is None or mask is None:
+                    continue
+                if image.shape[:2] != mask.shape[:2]:
+                    shape_mismatch += 1
+                foreground_fraction = float(np.count_nonzero(mask > 127)) / max(mask.size, 1)
+                if foreground_fraction <= 0.0:
+                    empty += 1
+                if foreground_fraction > 0.25:
+                    heavy += 1
+            total_empty += empty
+            total_heavy += heavy
+            total_shape_mismatch += shape_mismatch
+            lines.append(
+                f"{split}: pairs={len(pairs)} missing_masks={missing_masks} missing_images={missing_images} "
+                f"empty={empty} very_large_masks={heavy} shape_mismatch={shape_mismatch}"
+            )
+        if total_pairs == 0:
+            lines.append("Need saved image/mask pairs before training.")
+        if total_pairs > 0 and count_labeled_pairs(dataset_dir)["val"] == 0:
+            lines.append("No saved val split found; trainer will split train pairs automatically.")
+        report = "\n".join(lines) + "\n"
+        self.output_text.insert(tk.END, report)
+        self.output_text.see(tk.END)
+        self.status_var.set(
+            f"Dataset check complete: pairs={total_pairs}, empty={total_empty}, "
+            f"large={total_heavy}, shape_mismatch={total_shape_mismatch}."
+        )
+
     def training_command(self):
-        return [
+        command = [
             sys.executable,
+            "-u",
             str(PROJECT_DIR / "tools" / "train_pidnet_cable.py"),
             "--dataset",
             str(Path(self.dataset_var.get())),
             "--output",
             str(Path(self.output_var.get())),
             "--epochs",
-            str(int(self.epochs_var.get())),
+            str(safe_int(self.epochs_var, 80, min_value=1)),
             "--batch-size",
-            str(int(self.batch_var.get())),
+            str(safe_int(self.batch_var, 8, min_value=1)),
             "--imgsz",
-            str(int(self.imgsz_var.get())),
+            str(self.imgsz_var.get()).strip() or DEFAULT_IMAGE_SIZE,
             "--base-channels",
-            str(int(self.base_channels_var.get())),
+            str(safe_int(self.base_channels_var, 24, min_value=1)),
             "--device",
             str(self.device_var.get() or "cuda"),
+            "--lr",
+            f"{safe_float(self.lr_var, 1e-3, min_value=1e-8):.8g}",
+            "--weight-decay",
+            f"{safe_float(self.weight_decay_var, 1e-4, min_value=0.0):.8g}",
+            "--val-split",
+            f"{safe_float(self.val_split_var, 0.15, min_value=0.0, max_value=0.8):.8g}",
+            "--num-workers",
+            str(safe_int(self.num_workers_var, 4, min_value=0)),
+            "--boundary-weight",
+            f"{safe_float(self.boundary_weight_var, 0.20, min_value=0.0):.8g}",
         ]
+        command.append("--amp" if bool(self.amp_var.get()) else "--no-amp")
+        return command
 
     def refresh_command_text(self):
         if not hasattr(self, "command_text"):
             return
         command = " ".join(shell_quote(part) for part in self.training_command())
+        cleanup_params = self.live_cleanup_params()
         live = (
             f"{shell_quote(sys.executable)} {shell_quote(str(PROJECT_DIR / 'main.py'))} "
+            f"--config {shell_quote(str(Path(self.config_var.get() or DEFAULT_CONFIG_PATH)))} "
             f"--neural-detector-checkpoint {shell_quote(str(Path(self.output_var.get())))} "
-            f"--neural-detector-device {shell_quote(str(self.device_var.get() or 'cuda'))}"
+            f"--neural-detector-device {shell_quote(str(self.device_var.get() or 'cuda'))} "
+            f"--neural-detector-threshold {cleanup_params['threshold']:.4g} "
+            f"--detector-min-area {cleanup_params['min_area_px']} "
+            f"--detector-open-kernel {cleanup_params['open_kernel']} "
+            f"--detector-close-kernel {cleanup_params['close_kernel']}"
         )
         counts = count_labeled_pairs(Path(self.dataset_var.get()))
         text = (
             f"Dataset: train={counts['train']} val={counts['val']}\n"
             "Mask convention: white pixels are cable; all black/unpainted pixels are background.\n"
+            f"Live cleanup preview: threshold={cleanup_params['threshold']:.2f}, min_area={cleanup_params['min_area_px']}, "
+            f"open={cleanup_params['open_kernel']}, close={cleanup_params['close_kernel']}\n"
             f"Train:\n{command}\n\n"
             f"Run live after training:\n{live}\n"
         )
@@ -652,6 +1140,8 @@ class PidNetTrainingApp:
             self.status_var.set("Need at least one saved training mask before training.")
             return
         command = self.training_command()
+        self.train_progress_var.set(0.0)
+        self.train_summary_var.set("Training starting.")
         self.output_text.delete("1.0", tk.END)
         self.output_text.insert(tk.END, "Starting PIDNet-S training on CUDA...\n")
         self.output_text.insert(tk.END, " ".join(shell_quote(part) for part in command) + "\n\n")
@@ -679,6 +1169,36 @@ class PidNetTrainingApp:
         code = process.wait()
         self.output_queue.put(f"\nTraining finished with exit code {code}.\n")
 
+    def update_training_progress_from_line(self, line):
+        epoch_match = re.search(
+            r"epoch\s+(\d+)/(\d+)\s+loss\s+([0-9.eE+-]+)\s+val_iou\s+([0-9.eE+-]+)\s+val_dice\s+([0-9.eE+-]+)",
+            line,
+        )
+        if epoch_match:
+            epoch = int(epoch_match.group(1))
+            total = max(1, int(epoch_match.group(2)))
+            loss = float(epoch_match.group(3))
+            iou = float(epoch_match.group(4))
+            dice = float(epoch_match.group(5))
+            self.train_progress_var.set(100.0 * epoch / total)
+            self.train_summary_var.set(f"Epoch {epoch}/{total} | loss {loss:.4f} | val IoU {iou:.4f} | Dice {dice:.4f}")
+            return
+        saved_match = re.search(r"saved\s+(.+?)\s+val_iou=([0-9.eE+-]+)", line)
+        if saved_match:
+            self.train_summary_var.set(f"Saved best checkpoint | val IoU {float(saved_match.group(2)):.4f}")
+            return
+        if line.startswith("Training on "):
+            self.train_summary_var.set(line.strip())
+            return
+        if line.startswith("Training finished"):
+            code_match = re.search(r"exit code\s+(-?\d+)", line)
+            code = int(code_match.group(1)) if code_match else 0
+            if code == 0:
+                self.train_progress_var.set(100.0)
+                self.train_summary_var.set("Training finished.")
+            else:
+                self.train_summary_var.set(f"Training stopped with exit code {code}.")
+
     def poll_training_output(self):
         while True:
             try:
@@ -687,6 +1207,7 @@ class PidNetTrainingApp:
                 break
             self.output_text.insert(tk.END, line)
             self.output_text.see(tk.END)
+            self.update_training_progress_from_line(line)
             if line.startswith("Training finished"):
                 self.unload_segmenter()
                 self.update_model_status()
@@ -698,6 +1219,7 @@ class PidNetTrainingApp:
             self.status_var.set("No training process is running.")
             return
         self.train_process.terminate()
+        self.train_summary_var.set("Training stop requested.")
         self.status_var.set("Requested training stop.")
 
     def active_frame_key(self):
@@ -709,6 +1231,19 @@ class PidNetTrainingApp:
             return ("blank",)
         return ("live", id(bgr), tuple(bgr.shape))
 
+    def cleaned_prediction_mask(self, probability):
+        params = self.live_cleanup_params()
+        raw = (np.asarray(probability) >= params["threshold"]).astype(np.uint8) * 255
+        mask = raw
+        if params["open_kernel"] > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params["open_kernel"], params["open_kernel"]))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        if params["close_kernel"] > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params["close_kernel"], params["close_kernel"]))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        mask, component_count = remove_small_components(mask, min_area=params["min_area_px"])
+        return mask > 0, raw > 0, component_count
+
     def load_segmenter(self, force_reload=False):
         checkpoint_path = Path(self.output_var.get())
         if not checkpoint_path.exists():
@@ -716,7 +1251,7 @@ class PidNetTrainingApp:
         key = (
             self.checkpoint_signature(checkpoint_path),
             str(self.device_var.get() or "cuda"),
-            int(self.base_channels_var.get()),
+            safe_int(self.base_channels_var, 24, min_value=1),
         )
         if force_reload or self.segmenter is None or self.segmenter_key != key:
             from cable_pidnet import PidNetSegmenter
@@ -724,7 +1259,7 @@ class PidNetTrainingApp:
             self.segmenter = PidNetSegmenter(
                 checkpoint_path,
                 device=str(self.device_var.get() or "cuda"),
-                base_channels=int(self.base_channels_var.get()),
+                base_channels=safe_int(self.base_channels_var, 24, min_value=1),
             )
             self.segmenter_key = key
             self.prediction_probability = None
@@ -752,17 +1287,16 @@ class PidNetTrainingApp:
 
         self.prediction_probability = probability
         self.prediction_frame_key = self.active_frame_key()
-        threshold = float(self.test_threshold_var.get())
-        predicted = probability >= threshold
+        predicted, _raw_predicted, component_count = self.cleaned_prediction_mask(probability)
         item = self.active_item()
         if item is not None and np.any(item["mask"]):
             metrics = binary_mask_metrics(predicted, item["mask"] > 0)
             self.prediction_summary = (
                 f"IoU {metrics['iou']:.3f} Dice {metrics['dice']:.3f} | "
-                f"pred {metrics['predicted']} label {metrics['target']}"
+                f"pred {metrics['predicted']} label {metrics['target']} comp {component_count}"
             )
         else:
-            self.prediction_summary = f"predicted cable pixels {int(np.count_nonzero(predicted))}"
+            self.prediction_summary = f"cleaned cable pixels {int(np.count_nonzero(predicted))} comp {component_count}"
         self.status_var.set(f"Tested PIDNet checkpoint on current frame: {self.prediction_summary}")
         self.refresh()
 
@@ -805,9 +1339,8 @@ class PidNetTrainingApp:
 
         self.prediction_probability = probability
         self.prediction_frame_key = ("live", tuple(bgr.shape[:2]))
-        threshold = float(self.test_threshold_var.get())
-        predicted = probability >= threshold
-        self.prediction_summary = f"live predicted cable pixels {int(np.count_nonzero(predicted))}"
+        predicted, _raw_predicted, component_count = self.cleaned_prediction_mask(probability)
+        self.prediction_summary = f"live cleaned cable pixels {int(np.count_nonzero(predicted))} comp {component_count}"
         self.live_test_last_time = now
         return True
 
@@ -822,7 +1355,7 @@ class PidNetTrainingApp:
             self.status_var.set(f"No saved {split} image/mask pairs to test.")
             return
 
-        threshold = float(self.test_threshold_var.get())
+        params = self.live_cleanup_params()
         intersection = 0
         union = 0
         dice_num = 0
@@ -834,7 +1367,7 @@ class PidNetTrainingApp:
             if bgr is None or mask is None:
                 continue
             probability = segmenter.probability_map(bgr)
-            predicted = probability >= threshold
+            predicted, _raw_predicted, _component_count = self.cleaned_prediction_mask(probability)
             target = mask > 127
             if predicted.shape != target.shape:
                 target = cv2.resize(target.astype(np.uint8), (predicted.shape[1], predicted.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
@@ -852,7 +1385,11 @@ class PidNetTrainingApp:
             return
         iou = intersection / max(union, 1)
         dice = dice_num / max(dice_den, 1)
-        line = f"{split} test: {tested} images | threshold {threshold:.2f} | IoU {iou:.4f} | Dice {dice:.4f}\n"
+        line = (
+            f"{split} test: {tested} images | threshold {params['threshold']:.2f} "
+            f"open {params['open_kernel']} close {params['close_kernel']} min_area {params['min_area_px']} "
+            f"| IoU {iou:.4f} | Dice {dice:.4f}\n"
+        )
         self.output_text.insert(tk.END, line)
         self.output_text.see(tk.END)
         self.status_var.set(line.strip())
@@ -915,8 +1452,9 @@ class PidNetTrainingApp:
         if probability is None:
             return self.make_mask_panel(bgr, mask)
 
-        threshold = float(self.test_threshold_var.get())
-        predicted = probability >= threshold
+        params = self.live_cleanup_params()
+        threshold = params["threshold"]
+        predicted, raw_predicted, component_count = self.cleaned_prediction_mask(probability)
         label = np.asarray(mask, dtype=np.uint8) > 0
         if label.shape != predicted.shape:
             label = cv2.resize(label.astype(np.uint8), (predicted.shape[1], predicted.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
@@ -932,12 +1470,23 @@ class PidNetTrainingApp:
             draw_stroke_mask(panel, false_negative.astype(np.uint8) * 255, (255, 80, 40), alpha=0.70)
             legend = "green ok | red extra | blue missed"
         else:
+            removed = raw_predicted & ~predicted
+            draw_stroke_mask(panel, removed.astype(np.uint8) * 255, (64, 64, 180), alpha=0.42)
             draw_stroke_mask(panel, predicted.astype(np.uint8) * 255, (0, 255, 255), alpha=0.48)
-            legend = "yellow predicted cable"
-        cv2.putText(panel, f"threshold {threshold:.2f}", (24, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+            legend = "yellow cleaned cable | dim red removed"
+        cv2.putText(
+            panel,
+            f"thr {threshold:.2f} open {params['open_kernel']} close {params['close_kernel']} min {params['min_area_px']}",
+            (24, 42),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
         cv2.putText(panel, legend, (24, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-        if self.prediction_summary:
-            cv2.putText(panel, self.prediction_summary[:80], (24, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+        summary = self.prediction_summary or f"components {component_count} | cleaned px {int(np.count_nonzero(predicted))}"
+        cv2.putText(panel, summary[:80], (24, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
         return panel
 
     def update_status_counts(self):
