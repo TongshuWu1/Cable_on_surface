@@ -17,6 +17,8 @@ from cable_detection import (
 from cable_particle_filter import (
     CableParticleFilter,
     CableParticleFilterConfig,
+    fit_reference_ordered_point_cloud_chain,
+    fit_unordered_point_cloud_chain,
     filtered_cable_estimate,
 )
 from zed_spatial import (
@@ -146,6 +148,24 @@ def parse_args():
     parser.add_argument("--measurement-smoothing", action=argparse.BooleanOptionalAction, default=config_value(config, "measurement", "smoothing", True), help="Smooth fitted 3D measurement nodes before particle-filter proposal injection.")
     parser.add_argument("--measurement-smoothing-alpha", type=float, default=config_value(config, "measurement", "smoothing_alpha", 0.30), help="Current-frame weight for measurement node smoothing.")
     parser.add_argument("--measurement-smoothing-gate", type=float, default=config_value(config, "measurement", "smoothing_gate_m", 0.040), help="Do not smooth when raw measurement jumps farther than this mean node distance. Use 0 to always smooth.")
+    parser.add_argument(
+        "--measurement-mask-centerline",
+        action=argparse.BooleanOptionalAction,
+        default=config_value(config, "measurement", "mask_centerline", True),
+        help="For PIDNet masks, build an ordered 3D centerline from masked ZED points before the particle filter update.",
+    )
+    parser.add_argument(
+        "--measurement-mask-centerline-gate",
+        type=float,
+        default=config_value(config, "measurement", "mask_centerline_reference_gate_m", 0.15),
+        help="Reference-projection gate in meters when ordering PIDNet mask points by the previous filtered cable. Use 0 for ungated projection.",
+    )
+    parser.add_argument(
+        "--measurement-mask-centerline-max-residual",
+        type=float,
+        default=config_value(config, "measurement", "mask_centerline_max_residual_m", 0.08),
+        help="Reject an ordered mask-cloud centerline when its median support residual is above this many meters. Use 0 to disable.",
+    )
     parser.add_argument(
         "--measurement-prediction-gate",
         type=float,
@@ -316,6 +336,8 @@ def parse_args():
     args.measurement_centerline_points = max(2, int(args.measurement_centerline_points))
     args.measurement_smoothing_alpha = float(np.clip(args.measurement_smoothing_alpha, 0.0, 1.0))
     args.measurement_smoothing_gate = max(0.0, float(args.measurement_smoothing_gate))
+    args.measurement_mask_centerline_gate = max(0.0, float(args.measurement_mask_centerline_gate))
+    args.measurement_mask_centerline_max_residual = max(0.0, float(args.measurement_mask_centerline_max_residual))
     args.measurement_gate_reacquire_after = max(0, int(args.measurement_gate_reacquire_after))
     args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
     args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
@@ -608,7 +630,15 @@ def run_live(args):
                         args.measurement_prediction_gate,
                         last_filter_lost_frames,
                     )
-                    if mask_only_detection or pidnet_mask_point_measurement:
+                    if pidnet_mask_point_measurement and bool(args.measurement_mask_centerline):
+                        measurement = mask_cloud_centerline_measurement(
+                            point_cloud,
+                            detection,
+                            args,
+                            reference_nodes=reference_nodes,
+                            confidence_measure=confidence_measure,
+                        )
+                    elif mask_only_detection or pidnet_mask_point_measurement:
                         support_reference_nodes = None if pidnet_mask_point_measurement else reference_nodes
                         support_reference_gate = 0.0 if pidnet_mask_point_measurement else reference_gate
                         measurement = cable_measurement_from_mask_points(
@@ -788,6 +818,88 @@ def retrieve_confidence_measure(zed, confidence_map):
     except Exception:
         return None
     return None
+
+
+def mask_cloud_centerline_measurement(point_cloud, detection, args, reference_nodes=None, confidence_measure=None):
+    measurement = cable_measurement_from_mask_points(
+        point_cloud,
+        detection,
+        segment_count=args.cable_segments,
+        depth_min=args.depth_min,
+        depth_max=args.depth_max,
+        confidence_map=confidence_measure,
+        max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+        max_points=args.pf_measurement_points,
+        reference_nodes=None,
+        reference_gate_m=0.0,
+        reference_min_points=args.pf_min_measurement_points,
+    )
+    if measurement is None:
+        return None
+
+    source_points = np.asarray(getattr(measurement, "source_points", np.empty((0, 3))), dtype=np.float32)
+    nodes, method = ordered_centerline_from_mask_cloud(
+        source_points,
+        args,
+        reference_nodes=reference_nodes,
+    )
+    if nodes is None:
+        return measurement
+
+    nodes = np.ascontiguousarray(nodes, dtype=np.float32)
+    residual = polyline_residual(source_points, nodes)
+    return replace(
+        measurement,
+        points_xyz=nodes,
+        residual_m=float(residual),
+        method=f"ordered mask-cloud 3D centerline ({method}) | {measurement.method}",
+    )
+
+
+def ordered_centerline_from_mask_cloud(source_points, args, reference_nodes=None):
+    points = np.asarray(source_points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 3:
+        return None, "none"
+    points = points[np.all(np.isfinite(points[:, :3]), axis=1), :3]
+    if len(points) < int(args.pf_min_measurement_points):
+        return None, "too few support points"
+
+    if bool(args.pf_reference_ordering) and reference_nodes is not None:
+        nodes = fit_reference_ordered_point_cloud_chain(
+            points,
+            reference_nodes=reference_nodes,
+            segment_count=args.cable_segments,
+            gate_m=float(args.measurement_mask_centerline_gate),
+            min_points=int(args.pf_min_measurement_points),
+        )
+        if mask_cloud_centerline_is_supported(points, nodes, args):
+            return nodes, "reference projection"
+
+    nodes = fit_unordered_point_cloud_chain(
+        points,
+        segment_count=args.cable_segments,
+        endpoint_ordering=bool(args.pf_endpoint_ordering),
+        max_points=int(args.pf_ordering_max_points),
+        knn=int(args.pf_ordering_knn),
+    )
+    if mask_cloud_centerline_is_supported(points, nodes, args):
+        return nodes, "endpoint graph"
+    return None, "unsupported"
+
+
+def mask_cloud_centerline_is_supported(source_points, nodes, args):
+    if nodes is None:
+        return False
+    nodes = np.asarray(nodes, dtype=np.float32)
+    if nodes.ndim != 2 or nodes.shape[1] < 3 or len(nodes) < 2:
+        return False
+    if not np.all(np.isfinite(nodes[:, :3])):
+        return False
+    max_residual = float(args.measurement_mask_centerline_max_residual)
+    if max_residual <= 0.0:
+        return True
+    residual = polyline_residual(source_points, nodes)
+    return bool(np.isfinite(residual) and residual <= max_residual)
 
 
 def measurement_reference_nodes(last_filter_nodes, lost_frames, reacquire_after=4):
