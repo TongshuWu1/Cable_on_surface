@@ -44,7 +44,7 @@ hold_frames = 8
 # Relative paths are resolved from this config file.
 checkpoint = "models/pidnet_cable_best.pt"
 device = "cuda"
-threshold = 0.4
+threshold = 0.75
 base_channels = 24
 
 [detector]
@@ -52,9 +52,9 @@ base_channels = 24
 # Gaussian color segmentation. Switch this to compare detector speed and quality.
 backend = "pidnet"
 
-# PIDNet runs on a resized image for speed, then outputs are mapped back to the
-# full ZED RGB resolution. 0.5 is usually a good speed/accuracy tradeoff.
-scale = 0.50
+# The current checkpoint was trained at full ZED HD720. Full-scale inference
+# keeps the live mask close to the labeled data; reduce this only for speed.
+scale = 1.0
 
 # Use the previous 2D cable path to crop the next detector pass. A full-frame
 # pass runs every full_frame_every frames so the cable can be reacquired.
@@ -147,8 +147,9 @@ smoothing = true
 smoothing_alpha = 0.30
 smoothing_gate_m = 0.040
 
-# Before fitting, keep lifted 3D points near the previous filtered cable. Raise
-# this if fast motion is rejected; use 0 to disable prediction gating.
+# Before fitting, keep lifted 3D points near the previous filtered cable on the
+# HSV/centerline paths. The PIDNet mask-point path bypasses this gate so a bad
+# particle-filter estimate cannot suppress a good neural mask cloud.
 prediction_gate_m = 0.12
 
 # After this many prediction-only frames, prediction gating is disabled so the
@@ -177,7 +178,7 @@ direction_smooth_passes = 1
 
 # Measurement likelihood width, in meters. Smaller values trust ZED points more;
 # larger values make the filter smoother but slower to react.
-measurement_node_std_m = 0.030
+measurement_node_std_m = 0.020
 
 # Maximum masked ZED cable points used to score particles by point-to-segment
 # distance. This is the main particle-score cost knob.
@@ -216,8 +217,8 @@ measurement_reset_error_m = 0.25
 # is already close to the filtered estimate, only stable_ratio particles are
 # regenerated. Because the PIDNet mask cloud is the trusted measurement, the
 # maximum ratio is intentionally high enough to recover from bad particles.
-measurement_proposal_ratio = 0.30
-measurement_proposal_stable_ratio = 0.04
+measurement_proposal_ratio = 0.40
+measurement_proposal_stable_ratio = 0.012
 measurement_proposal_start_error_m = 0.015
 measurement_proposal_full_error_m = 0.060
 measurement_proposal_node_std_m = 0.012
@@ -234,7 +235,7 @@ coverage_min_fraction = 0.05
 
 # Penalize sharp adjacent-segment bends during scoring. This keeps the PF from
 # explaining good cable points with a chain that folds through the cloud.
-bend_penalty_m = 0.030
+bend_penalty_m = 0.00
 
 # When particle weights collapse, display the best actual particle instead of a
 # direction average that may not correspond to any valid chain hypothesis.

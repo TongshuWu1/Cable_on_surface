@@ -609,6 +609,8 @@ def run_live(args):
                         last_filter_lost_frames,
                     )
                     if mask_only_detection or pidnet_mask_point_measurement:
+                        support_reference_nodes = None if pidnet_mask_point_measurement else reference_nodes
+                        support_reference_gate = 0.0 if pidnet_mask_point_measurement else reference_gate
                         measurement = cable_measurement_from_mask_points(
                             point_cloud,
                             detection,
@@ -618,8 +620,8 @@ def run_live(args):
                             confidence_map=confidence_measure,
                             max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
                             max_points=args.hsv_mask_points if mask_only_detection else args.pf_measurement_points,
-                            reference_nodes=reference_nodes,
-                            reference_gate_m=reference_gate,
+                            reference_nodes=support_reference_nodes,
+                            reference_gate_m=support_reference_gate,
                             reference_min_points=args.pf_min_measurement_points,
                         )
                     else:
