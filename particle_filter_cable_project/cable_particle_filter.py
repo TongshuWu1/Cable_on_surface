@@ -937,8 +937,8 @@ def build_chain(start, directions, segment_length_m):
     directions = normalize_vectors(directions)
     nodes = np.empty((len(directions) + 1, 3), dtype=np.float64)
     nodes[0] = start
-    for index, direction in enumerate(directions):
-        nodes[index + 1] = nodes[index] + float(segment_length_m) * direction
+    if len(directions):
+        nodes[1:] = start[None, :] + np.cumsum(float(segment_length_m) * directions, axis=0)
     return nodes.astype(np.float32)
 
 
@@ -947,8 +947,8 @@ def build_chains(starts, directions, segment_length_m):
     directions = normalize_vectors(directions)
     output = np.empty((len(starts), directions.shape[1] + 1, 3), dtype=np.float64)
     output[:, 0, :] = starts
-    for index in range(directions.shape[1]):
-        output[:, index + 1, :] = output[:, index, :] + float(segment_length_m) * directions[:, index, :]
+    if directions.shape[1]:
+        output[:, 1:, :] = starts[:, None, :] + np.cumsum(float(segment_length_m) * directions, axis=1)
     return np.ascontiguousarray(output, dtype=np.float64)
 
 
@@ -1016,21 +1016,22 @@ def smooth_particle_directions(directions, passes=1):
     return smoothed
 
 
-def valid_points(points):
-    points = np.asarray(points, dtype=np.float64)
+def valid_points(points, dtype=np.float64):
+    dtype = np.dtype(dtype)
+    points = np.asarray(points, dtype=dtype)
     if points.ndim != 2 or points.shape[1] < 3:
-        return np.empty((0, 3), dtype=np.float64)
+        return np.empty((0, 3), dtype=dtype)
     points = points[:, :3]
-    return np.ascontiguousarray(points[np.all(np.isfinite(points), axis=1)], dtype=np.float64)
+    return np.ascontiguousarray(points[np.all(np.isfinite(points), axis=1)], dtype=dtype)
 
 
-def sample_points(points, max_points):
-    points = valid_points(points)
+def sample_points(points, max_points, dtype=np.float64):
+    points = valid_points(points, dtype=dtype)
     max_points = max(0, int(max_points))
     if max_points > 0 and len(points) > max_points:
         indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
         points = points[indices]
-    return np.ascontiguousarray(points, dtype=np.float64)
+    return np.ascontiguousarray(points, dtype=np.dtype(dtype))
 
 
 def assign_points_to_nearest_segments(points, nodes):
@@ -1055,27 +1056,19 @@ def assign_points_to_reference_arclength(points, nodes):
     segment_vectors = nodes[1:] - nodes[:-1]
     segment_lengths = np.linalg.norm(segment_vectors, axis=1)
     cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
-    best_squared = np.full(len(points), np.inf, dtype=np.float64)
-    best_segments = np.zeros(len(points), dtype=np.int64)
-    best_arclength = np.zeros(len(points), dtype=np.float64)
+    length_sq = np.sum(segment_vectors * segment_vectors, axis=1)
+    safe_length_sq = np.maximum(length_sq, 1e-12)
+    point_delta = points[:, None, :] - nodes[:-1][None, :, :]
+    projection_fraction = np.sum(point_delta * segment_vectors[None, :, :], axis=2) / safe_length_sq[None, :]
+    projection_fraction = np.clip(projection_fraction, 0.0, 1.0)
+    projection_fraction[:, length_sq <= 1e-12] = 0.0
+    projected = nodes[:-1][None, :, :] + projection_fraction[:, :, None] * segment_vectors[None, :, :]
+    squared = np.sum((points[:, None, :] - projected) ** 2, axis=2)
 
-    for index, (start, vector, length, length_start) in enumerate(
-        zip(nodes[:-1], segment_vectors, segment_lengths, cumulative[:-1])
-    ):
-        length_sq = float(np.dot(vector, vector))
-        if length_sq <= 1e-12:
-            projection_fraction = np.zeros(len(points), dtype=np.float64)
-            projected = start[None, :]
-        else:
-            projection_fraction = np.clip(((points - start[None, :]) @ vector) / length_sq, 0.0, 1.0)
-            projected = start[None, :] + projection_fraction[:, None] * vector[None, :]
-        squared = np.sum((points - projected) ** 2, axis=1)
-        update = squared < best_squared
-        if np.any(update):
-            best_squared[update] = squared[update]
-            best_segments[update] = int(index)
-            best_arclength[update] = float(length_start) + projection_fraction[update] * float(length)
-
+    best_segments = np.argmin(squared, axis=1).astype(np.int64)
+    rows = np.arange(len(points))
+    best_squared = squared[rows, best_segments]
+    best_arclength = cumulative[best_segments] + projection_fraction[rows, best_segments] * segment_lengths[best_segments]
     return best_segments, np.sqrt(best_squared), best_arclength
 
 
@@ -1091,25 +1084,29 @@ def particle_distance_scores(
     backend="auto",
     chunk_points=512,
 ):
-    points = valid_points(points)
-    particles = valid_particles(particles)
+    device = torch_scoring_device(backend)
+    scoring_dtype = np.float32 if device is not None else np.float64
+    points = valid_points(points, dtype=scoring_dtype)
+    particles = valid_particles(particles, dtype=scoring_dtype)
     if len(points) == 0 or len(particles) == 0 or particles.shape[1] < 2:
         return np.full(len(particles), np.inf, dtype=np.float64)
 
-    torch_scores = particle_distance_scores_torch(
-        points,
-        particles,
-        outlier_distance=outlier_distance,
-        score_keep_fraction=score_keep_fraction,
-        coverage_penalty_m=coverage_penalty_m,
-        coverage_min_fraction=coverage_min_fraction,
-        bend_penalty_m=bend_penalty_m,
-        expected_segments=expected_segments,
-        backend=backend,
-        chunk_points=chunk_points,
-    )
-    if torch_scores is not None:
-        return torch_scores
+    if device is not None:
+        torch_scores = particle_distance_scores_torch(
+            points,
+            particles,
+            outlier_distance=outlier_distance,
+            score_keep_fraction=score_keep_fraction,
+            coverage_penalty_m=coverage_penalty_m,
+            coverage_min_fraction=coverage_min_fraction,
+            bend_penalty_m=bend_penalty_m,
+            expected_segments=expected_segments,
+            backend=backend,
+            chunk_points=chunk_points,
+            device=device,
+        )
+        if torch_scores is not None:
+            return torch_scores
 
     all_squared_distances = point_to_particle_segment_squared_distances(points, particles[:, :-1, :3], particles[:, 1:, :3])
     if all_squared_distances.size:
@@ -1150,8 +1147,9 @@ def particle_distance_scores_torch(
     expected_segments=None,
     backend="auto",
     chunk_points=512,
+    device=None,
 ):
-    device = torch_scoring_device(backend)
+    device = torch_scoring_device(backend) if device is None else device
     if device is None:
         return None
 
@@ -1191,6 +1189,14 @@ def particle_distance_scores_torch(
             keep_count = max(1, int(np.ceil(squared_distances.shape[1] * keep_fraction)))
             if keep_count >= squared_distances.shape[1]:
                 scores = torch.mean(squared_distances, dim=1)
+            elif squared_distances.shape[1] - keep_count < keep_count:
+                rejected, _indices = torch.topk(
+                    squared_distances,
+                    squared_distances.shape[1] - keep_count,
+                    dim=1,
+                    largest=True,
+                )
+                scores = (torch.sum(squared_distances, dim=1) - torch.sum(rejected, dim=1)) / float(keep_count)
             else:
                 selected, _indices = torch.topk(squared_distances, keep_count, dim=1, largest=False)
                 scores = torch.mean(selected, dim=1)
@@ -1198,10 +1204,9 @@ def particle_distance_scores_torch(
             expected = expected_segment_indices(expected_segments, particles.shape[1] - 1)
             if float(coverage_penalty_m) > 0.0 and len(expected):
                 required = max(1, int(np.ceil(nearest_segments.shape[1] * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
-                missing = torch.zeros(nearest_segments.shape[0], dtype=torch.float32, device=device)
-                for segment_index in expected:
-                    counts = torch.count_nonzero(nearest_segments == int(segment_index), dim=1)
-                    missing = missing + (counts < required).to(torch.float32)
+                expected_t = torch.as_tensor(expected, dtype=nearest_segments.dtype, device=device)
+                counts = torch.count_nonzero(nearest_segments[:, None, :] == expected_t[None, :, None], dim=2)
+                missing = torch.count_nonzero(counts < required, dim=1).to(torch.float32)
                 scores = scores + missing * float(coverage_penalty_m) * float(coverage_penalty_m)
 
             if float(bend_penalty_m) > 0.0 and particles_t.shape[1] > 2:
@@ -1252,6 +1257,11 @@ def trimmed_mean_squared_values(squared_distances, outlier_distance=np.inf, keep
     keep_count = max(1, int(np.ceil(squared.shape[1] * keep_fraction)))
     if keep_count >= squared.shape[1]:
         return np.mean(squared, axis=1)
+
+    drop_count = squared.shape[1] - keep_count
+    if 0 < drop_count < keep_count:
+        rejected = np.partition(squared, squared.shape[1] - drop_count, axis=1)[:, -drop_count:]
+        return (np.sum(squared, axis=1) - np.sum(rejected, axis=1)) / float(keep_count)
 
     selected = np.partition(squared, keep_count - 1, axis=1)[:, :keep_count]
     return np.mean(selected, axis=1)
@@ -1319,17 +1329,24 @@ def point_to_all_segment_distances(points, nodes):
     if len(points) == 0 or len(nodes) < 2:
         return np.empty((0, 0), dtype=np.float64)
 
-    output = np.empty((len(points), len(nodes) - 1), dtype=np.float64)
-    for index, (start, end) in enumerate(zip(nodes[:-1], nodes[1:])):
-        output[:, index] = point_to_segment_distances(points, start, end)
-    return output
+    starts = nodes[:-1]
+    segment = nodes[1:] - starts
+    length_sq = np.sum(segment * segment, axis=1)
+    safe_length_sq = np.maximum(length_sq, 1e-12)
+    point_delta = points[:, None, :] - starts[None, :, :]
+    t = np.sum(point_delta * segment[None, :, :], axis=2) / safe_length_sq[None, :]
+    t = np.clip(t, 0.0, 1.0)
+    t[:, length_sq <= 1e-12] = 0.0
+    projection = starts[None, :, :] + t[:, :, None] * segment[None, :, :]
+    return np.linalg.norm(points[:, None, :] - projection, axis=2)
 
 
-def valid_particles(particles):
-    particles = np.asarray(particles, dtype=np.float64)
+def valid_particles(particles, dtype=np.float64):
+    dtype = np.dtype(dtype)
+    particles = np.asarray(particles, dtype=dtype)
     if particles.ndim != 3 or particles.shape[1] < 2 or particles.shape[2] < 3:
-        return np.empty((0, 0, 3), dtype=np.float64)
-    return np.ascontiguousarray(particles[:, :, :3], dtype=np.float64)
+        return np.empty((0, 0, 3), dtype=dtype)
+    return np.ascontiguousarray(particles[:, :, :3], dtype=dtype)
 
 
 def point_to_segment_distances(points, start, end):

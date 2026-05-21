@@ -44,8 +44,11 @@ hold_frames = 8
 # Relative paths are resolved from this config file.
 checkpoint = "models/pidnet_cable_best.pt"
 device = "cuda"
-threshold = 0.75
+threshold = 0.22
 base_channels = 24
+
+# CUDA autocast + channels-last inference for faster PIDNet masks.
+amp = true
 
 [detector]
 # Options: "pidnet" for trained neural segmentation, "hsv" for HSV range or
@@ -117,6 +120,12 @@ cloud_update_every = 2
 # filtering, or increase to 2-3 if confidence retrieval becomes expensive.
 confidence_update_every = 2
 
+[processing]
+# Overlap RGB detection, 3D measurement fitting, and particle-filter scoring
+# with the camera/UI loop. If the worker falls behind, the newest display frame
+# is kept and that measurement request is skipped instead of blocking render.
+async_measurement = true
+
 [cable]
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
 segments = 12
@@ -169,7 +178,7 @@ confidence_max = 85.0
 
 [particle_filter]
 enabled = true
-particles = 500
+particles = 1000
 
 # Initial spread when the first valid cable measurement initializes particles.
 initial_node_std_m = 0.025

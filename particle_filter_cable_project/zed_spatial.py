@@ -136,7 +136,7 @@ def live_point_cloud_to_vertices(
     stats["shape"] = tuple(int(v) for v in point_data.shape)
 
     sampled = point_data[::stride, ::stride]
-    xyz = sampled[:, :, :3].reshape(-1, 3).astype(np.float32)
+    xyz = sampled[:, :, :3].reshape(-1, 3).astype(np.float32, copy=False)
     rgba = sampled[:, :, 3].reshape(-1)
     stats["sampled"] = int(len(xyz))
 

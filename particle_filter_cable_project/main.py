@@ -1,6 +1,8 @@
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+import queue
+import threading
 import time
 import tomllib
 
@@ -88,6 +90,7 @@ def parse_args():
     parser.add_argument("--live-max-points", type=int, default=config_value(config, "point_cloud", "max_points", 100000), help="0 keeps every sampled point.")
     parser.add_argument("--cloud-update-every", type=int, default=config_value(config, "point_cloud", "cloud_update_every", 1), help="Update the visual point cloud every N frames; tracking still runs every frame.")
     parser.add_argument("--confidence-update-every", type=int, default=config_value(config, "point_cloud", "confidence_update_every", 1), help="Retrieve ZED confidence every N frames; 0 disables confidence filtering.")
+    parser.add_argument("--async-measurement", action=argparse.BooleanOptionalAction, default=config_value(config, "processing", "async_measurement", True), help="Run RGB detection, 3D fitting, and particle-filter update in a worker thread.")
     parser.add_argument("--detector-backend", choices=("pidnet", "hsv"), default=config_value(config, "detector", "backend", "pidnet"), help="RGB segmentation backend for cable mask comparison.")
     parser.add_argument("--detector-scale", type=float, default=config_value(config, "detector", "scale", 0.50), help="Run RGB cable detection at this image scale, then lift coordinates back to full resolution.")
     parser.add_argument("--detector-roi", action=argparse.BooleanOptionalAction, default=config_value(config, "detector", "roi", True), help="Use the previous 2D cable path as a gated detector search region.")
@@ -109,6 +112,7 @@ def parse_args():
     parser.add_argument("--neural-detector-device", default=config_value(config, "pidnet", "device", "cuda"), help="PyTorch device for PIDNet detector. Default: cuda.")
     parser.add_argument("--neural-detector-threshold", type=float, default=config_value(config, "pidnet", "threshold", 0.50), help="PIDNet probability threshold for the binary cable mask.")
     parser.add_argument("--neural-detector-base-channels", type=int, default=config_value(config, "pidnet", "base_channels", 24))
+    parser.add_argument("--neural-detector-amp", action=argparse.BooleanOptionalAction, default=config_value(config, "pidnet", "amp", True), help="Use CUDA autocast for PIDNet inference.")
     parser.add_argument("--detector-min-area", type=int, default=config_value(config, "detector", "min_area_px", 80))
     parser.add_argument("--detector-open-kernel", type=int, default=config_value(config, "detector", "open_kernel", 3))
     parser.add_argument("--detector-close-kernel", type=int, default=config_value(config, "detector", "close_kernel", 5))
@@ -414,6 +418,7 @@ def load_cable_detector(args):
             device=args.neural_detector_device,
             threshold=float(args.neural_detector_threshold),
             base_channels=int(args.neural_detector_base_channels),
+            amp=bool(args.neural_detector_amp),
             min_area=int(args.detector_min_area),
             open_kernel=int(args.detector_open_kernel),
             close_kernel=int(args.detector_close_kernel),
@@ -482,6 +487,278 @@ def make_particle_filter_config(args):
     )
 
 
+@dataclass
+class MeasurementProcessingState:
+    last_filter_time: float | None = None
+    last_smoothed_measurement_nodes: np.ndarray | None = None
+    last_detection_hint_xy: np.ndarray | None = None
+    last_filter_nodes: np.ndarray | None = None
+    last_filter_estimate: object | None = None
+    last_filter_result: object | None = None
+    last_filter_lost_frames: int = 0
+
+
+@dataclass
+class MeasurementTask:
+    frame_count: int
+    bgr: np.ndarray
+    point_cloud: np.ndarray
+    confidence_measure: np.ndarray | None
+
+
+@dataclass
+class MeasurementProcessingResult:
+    frame_count: int
+    detection: object | None
+    measurement: object | None
+    raw_measurement: object | None
+    estimate: object | None
+    filter_result: object | None
+    tracking_diagnostics: dict
+    stage_seconds: dict
+    state: MeasurementProcessingState
+
+
+class AsyncMeasurementWorker:
+    def __init__(self, args, cable_detector, particle_filter):
+        self.args = args
+        self.cable_detector = cable_detector
+        self.particle_filter = particle_filter
+        self.state = MeasurementProcessingState()
+        self.tasks = queue.Queue(maxsize=1)
+        self.lock = threading.Lock()
+        self.latest_result = None
+        self.in_flight = False
+        self.submitted = 0
+        self.completed = 0
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._run, name="cable-measurement-worker", daemon=True)
+        self.thread.start()
+
+    def busy(self):
+        with self.lock:
+            return self.in_flight or not self.tasks.empty()
+
+    def submit(self, task):
+        with self.lock:
+            if self.in_flight or not self.tasks.empty():
+                self.dropped += 1
+                return False
+            self.in_flight = True
+            self.submitted += 1
+        try:
+            self.tasks.put_nowait(task)
+            return True
+        except queue.Full:
+            with self.lock:
+                self.in_flight = False
+                self.dropped += 1
+            return False
+
+    def drain_latest(self):
+        with self.lock:
+            result = self.latest_result
+            self.latest_result = None
+            return result
+
+    def counters(self):
+        with self.lock:
+            return {
+                "submitted": int(self.submitted),
+                "completed": int(self.completed),
+                "dropped": int(self.dropped),
+                "busy": bool(self.in_flight or not self.tasks.empty()),
+            }
+
+    def stop(self):
+        try:
+            self.tasks.put(None, timeout=2.0)
+        except queue.Full:
+            return
+        self.thread.join(timeout=2.0)
+
+    def _run(self):
+        while True:
+            task = self.tasks.get()
+            if task is None:
+                return
+            try:
+                result = process_measurement_frame(
+                    self.args,
+                    self.cable_detector,
+                    self.particle_filter,
+                    self.state,
+                    task.frame_count,
+                    task.bgr,
+                    task.point_cloud,
+                    task.confidence_measure,
+                )
+                with self.lock:
+                    self.latest_result = result
+                    self.completed += 1
+            except Exception as exc:
+                print(f"Async measurement worker error: {exc}")
+            finally:
+                with self.lock:
+                    self.in_flight = False
+
+
+def process_measurement_frame(args, cable_detector, particle_filter, state, frame_count, bgr, point_cloud, confidence_measure):
+    stage_seconds = {"detect": 0.0, "fit": 0.0, "filter": 0.0}
+    detection = None
+    measurement = None
+    raw_measurement = None
+    estimate = None
+    filter_result = None
+    tracking_diagnostics = {}
+    smoothing_diagnostics = {}
+
+    stage_start = time.monotonic()
+    roi_bbox = None
+    use_roi = (
+        bool(args.detector_roi)
+        and state.last_detection_hint_xy is not None
+        and (args.detector_full_every == 0 or int(frame_count) % int(args.detector_full_every) != 0)
+    )
+    if use_roi:
+        roi_bbox = centerline_roi_bbox(state.last_detection_hint_xy, bgr.shape[:2], args.detector_roi_padding)
+    mask_only_detection = should_use_hsv_mask_only(
+        args,
+        frame_count,
+        state.last_filter_nodes,
+        state.last_filter_lost_frames,
+    )
+    pidnet_mask_point_measurement = args.detector_backend == "pidnet"
+    extract_geometry = not (mask_only_detection or pidnet_mask_point_measurement)
+    detection = cable_detector.detect(
+        bgr,
+        roi_bbox=roi_bbox,
+        scale=args.detector_scale,
+        extract_geometry=extract_geometry,
+    )
+    if roi_bbox is not None and extract_geometry and len(detection.centerline_xy) < 2:
+        detection = cable_detector.detect(bgr, scale=args.detector_scale)
+    if detection is not None and (pidnet_mask_point_measurement or len(detection.centerline_xy) >= 2):
+        if len(detection.centerline_xy) >= 2:
+            state.last_detection_hint_xy = detection.centerline_xy
+    stage_seconds["detect"] += time.monotonic() - stage_start
+
+    stage_start = time.monotonic()
+    reference_nodes = measurement_reference_nodes(
+        state.last_filter_nodes,
+        state.last_filter_lost_frames,
+        reacquire_after=args.measurement_gate_reacquire_after,
+    )
+    reference_gate = measurement_reference_gate(
+        args.measurement_prediction_gate,
+        state.last_filter_lost_frames,
+    )
+    if pidnet_mask_point_measurement and bool(args.measurement_mask_centerline):
+        measurement = mask_cloud_centerline_measurement(
+            point_cloud,
+            detection,
+            args,
+            reference_nodes=reference_nodes,
+            confidence_measure=confidence_measure,
+        )
+    elif mask_only_detection or pidnet_mask_point_measurement:
+        support_reference_nodes = None if pidnet_mask_point_measurement else reference_nodes
+        support_reference_gate = 0.0 if pidnet_mask_point_measurement else reference_gate
+        measurement = cable_measurement_from_mask_points(
+            point_cloud,
+            detection,
+            segment_count=args.cable_segments,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            confidence_map=confidence_measure,
+            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+            max_points=args.hsv_mask_points if mask_only_detection else args.pf_measurement_points,
+            reference_nodes=support_reference_nodes,
+            reference_gate_m=support_reference_gate,
+            reference_min_points=args.pf_min_measurement_points,
+        )
+    else:
+        measurement = fit_cable_segments_from_zed_point_cloud(
+            point_cloud,
+            detection,
+            segment_count=args.cable_segments,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            confidence_map=confidence_measure,
+            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+            node_search_px=args.node_search_px,
+            source_point_mode="centerline",
+            max_centerline_points=args.measurement_centerline_points,
+            max_local_depth_std_m=args.measurement_local_depth_spread,
+            reference_nodes=reference_nodes,
+            reference_gate_m=reference_gate,
+            reference_min_points=args.pf_min_measurement_points,
+        )
+    raw_measurement = measurement
+    measurement, state.last_smoothed_measurement_nodes, smoothing_diagnostics = smooth_measurement_nodes(
+        measurement,
+        state.last_smoothed_measurement_nodes,
+        args,
+        state.last_filter_lost_frames,
+    )
+    stage_seconds["fit"] += time.monotonic() - stage_start
+
+    now = time.monotonic()
+    filter_dt = 1.0 / max(float(args.fps), 1.0) if state.last_filter_time is None else now - state.last_filter_time
+    state.last_filter_time = now
+    if particle_filter is not None:
+        stage_start = time.monotonic()
+        filter_result = particle_filter.step(measurement, filter_dt)
+        estimate = filtered_cable_estimate(measurement, filter_result)
+        stage_seconds["filter"] += time.monotonic() - stage_start
+    else:
+        estimate = measurement
+    tracking_diagnostics = cable_tracking_diagnostics(
+        state.last_filter_nodes,
+        raw_measurement,
+        measurement,
+        estimate,
+        filter_result,
+        smoothing_diagnostics,
+    )
+    if estimate is not None:
+        state.last_filter_nodes = np.asarray(estimate.points_xyz, dtype=np.float32)
+        state.last_filter_estimate = estimate
+        state.last_filter_result = filter_result
+    elif particle_filter is None:
+        state.last_filter_nodes = None
+        state.last_filter_estimate = None
+        state.last_filter_result = None
+    if filter_result is not None:
+        state.last_filter_lost_frames = int(filter_result.lost_frames)
+    elif estimate is not None:
+        state.last_filter_lost_frames = 0
+
+    return MeasurementProcessingResult(
+        frame_count=int(frame_count),
+        detection=detection,
+        measurement=measurement,
+        raw_measurement=raw_measurement,
+        estimate=estimate,
+        filter_result=filter_result,
+        tracking_diagnostics=tracking_diagnostics,
+        stage_seconds=stage_seconds,
+        state=replace(state),
+    )
+
+
+def snapshot_mat_data(mat):
+    if mat is None:
+        return None
+    try:
+        data = np.asarray(mat.get_data())
+    except Exception:
+        data = np.asarray(mat)
+    if data.size == 0:
+        return None
+    return np.ascontiguousarray(data).copy()
+
+
 def main():
     args = parse_args()
     run_live(args)
@@ -524,17 +801,20 @@ def run_live(args):
     last_stats_frame_count = 0
     stats_compute_seconds = 0.0
     stats_compute_frames = 0
-    last_filter_time = None
     latest_stats = empty_point_cloud_stats()
     latest_vertices = np.empty((0, 6), dtype=np.float32)
-    latest_confidence_measure = None
+    latest_confidence_data = None
     latest_detection = None
-    last_smoothed_measurement_nodes = None
-    last_detection_hint_xy = None
     last_filter_nodes = None
     last_filter_estimate = None
     last_filter_result = None
     last_filter_lost_frames = 0
+    processing_state = MeasurementProcessingState()
+    async_worker = (
+        AsyncMeasurementWorker(args, cable_detector, particle_filter)
+        if bool(args.async_measurement)
+        else None
+    )
     last_visual_measurement = None
     last_visual_estimate = None
     last_visual_filter_result = None
@@ -543,17 +823,35 @@ def run_live(args):
     stage_seconds = {
         "capture": 0.0,
         "cloud": 0.0,
+        "copy": 0.0,
         "detect": 0.0,
         "fit": 0.0,
         "filter": 0.0,
         "ui": 0.0,
     }
+    async_busy_frames = 0
 
     try:
         while viewer.is_available():
             if zed.grab(runtime) <= sl.ERROR_CODE.SUCCESS:
                 frame_start_time = time.monotonic()
-                update_measurement = should_update_measurement(args, frame_count, last_filter_nodes, last_filter_lost_frames)
+                completed_result = async_worker.drain_latest() if async_worker is not None else None
+                if completed_result is not None:
+                    latest_detection = completed_result.detection or latest_detection
+                    last_filter_nodes = completed_result.state.last_filter_nodes
+                    last_filter_estimate = completed_result.state.last_filter_estimate
+                    last_filter_result = completed_result.state.last_filter_result
+                    last_filter_lost_frames = int(completed_result.state.last_filter_lost_frames)
+                    processing_state = completed_result.state
+                    for key, value in completed_result.stage_seconds.items():
+                        if key in stage_seconds:
+                            stage_seconds[key] += float(value)
+
+                requested_measurement = should_update_measurement(args, frame_count, last_filter_nodes, last_filter_lost_frames)
+                worker_busy = async_worker.busy() if async_worker is not None else False
+                update_measurement = requested_measurement and not worker_busy
+                if requested_measurement and worker_busy:
+                    async_busy_frames += 1
                 stage_start = frame_start_time
                 zed.retrieve_image(image, sl.VIEW.LEFT)
                 update_cloud_view = frame_count % args.cloud_update_every == 0
@@ -563,11 +861,13 @@ def run_live(args):
                     zed.retrieve_measure(point_cloud, point_measure)
                 if args.confidence_update_every == 0:
                     confidence_measure = None
+                    latest_confidence_data = None
                 elif update_measurement and frame_count % args.confidence_update_every == 0:
-                    latest_confidence_measure = retrieve_confidence_measure(zed, confidence_map)
-                    confidence_measure = latest_confidence_measure
+                    confidence_mat = retrieve_confidence_measure(zed, confidence_map)
+                    latest_confidence_data = snapshot_mat_data(confidence_mat)
+                    confidence_measure = latest_confidence_data
                 else:
-                    confidence_measure = latest_confidence_measure
+                    confidence_measure = latest_confidence_data
                 stage_seconds["capture"] += time.monotonic() - stage_start
 
                 stage_start = time.monotonic()
@@ -583,136 +883,61 @@ def run_live(args):
                     )
                 stage_seconds["cloud"] += time.monotonic() - stage_start
 
-                detection = None
+                detection = latest_detection
                 measurement = None
                 raw_measurement = None
                 tracking_diagnostics = {}
-                estimate = None
-                filter_result = None
+                estimate = last_filter_estimate
+                filter_result = last_filter_result
+                if completed_result is not None:
+                    detection = completed_result.detection or latest_detection
+                    measurement = completed_result.measurement
+                    raw_measurement = completed_result.raw_measurement
+                    estimate = completed_result.estimate
+                    filter_result = completed_result.filter_result
+                    tracking_diagnostics = completed_result.tracking_diagnostics
+
                 if cable_detector is not None and update_measurement:
-                    stage_start = time.monotonic()
-                    roi_bbox = None
-                    use_roi = (
-                        bool(args.detector_roi)
-                        and last_detection_hint_xy is not None
-                        and (args.detector_full_every == 0 or frame_count % args.detector_full_every != 0)
-                    )
-                    if use_roi:
-                        roi_bbox = centerline_roi_bbox(last_detection_hint_xy, bgr.shape[:2], args.detector_roi_padding)
-                    mask_only_detection = should_use_hsv_mask_only(
-                        args,
-                        frame_count,
-                        last_filter_nodes,
-                        last_filter_lost_frames,
-                    )
-                    pidnet_mask_point_measurement = args.detector_backend == "pidnet"
-                    extract_geometry = not (mask_only_detection or pidnet_mask_point_measurement)
-                    detection = cable_detector.detect(
-                        bgr,
-                        roi_bbox=roi_bbox,
-                        scale=args.detector_scale,
-                        extract_geometry=extract_geometry,
-                    )
-                    if roi_bbox is not None and extract_geometry and len(detection.centerline_xy) < 2:
-                        detection = cable_detector.detect(bgr, scale=args.detector_scale)
-                    if detection is not None and (pidnet_mask_point_measurement or len(detection.centerline_xy) >= 2):
-                        latest_detection = detection
-                        if len(detection.centerline_xy) >= 2:
-                            last_detection_hint_xy = detection.centerline_xy
-                    stage_seconds["detect"] += time.monotonic() - stage_start
-                    stage_start = time.monotonic()
-                    reference_nodes = measurement_reference_nodes(
-                        last_filter_nodes,
-                        last_filter_lost_frames,
-                        reacquire_after=args.measurement_gate_reacquire_after,
-                    )
-                    reference_gate = measurement_reference_gate(
-                        args.measurement_prediction_gate,
-                        last_filter_lost_frames,
-                    )
-                    if pidnet_mask_point_measurement and bool(args.measurement_mask_centerline):
-                        measurement = mask_cloud_centerline_measurement(
-                            point_cloud,
-                            detection,
-                            args,
-                            reference_nodes=reference_nodes,
-                            confidence_measure=confidence_measure,
-                        )
-                    elif mask_only_detection or pidnet_mask_point_measurement:
-                        support_reference_nodes = None if pidnet_mask_point_measurement else reference_nodes
-                        support_reference_gate = 0.0 if pidnet_mask_point_measurement else reference_gate
-                        measurement = cable_measurement_from_mask_points(
-                            point_cloud,
-                            detection,
-                            segment_count=args.cable_segments,
-                            depth_min=args.depth_min,
-                            depth_max=args.depth_max,
-                            confidence_map=confidence_measure,
-                            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
-                            max_points=args.hsv_mask_points if mask_only_detection else args.pf_measurement_points,
-                            reference_nodes=support_reference_nodes,
-                            reference_gate_m=support_reference_gate,
-                            reference_min_points=args.pf_min_measurement_points,
-                        )
-                    else:
-                        measurement = fit_cable_segments_from_zed_point_cloud(
-                            point_cloud,
-                            detection,
-                            segment_count=args.cable_segments,
-                            depth_min=args.depth_min,
-                            depth_max=args.depth_max,
-                            confidence_map=confidence_measure,
-                            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
-                            node_search_px=args.node_search_px,
-                            source_point_mode="centerline",
-                            max_centerline_points=args.measurement_centerline_points,
-                            max_local_depth_std_m=args.measurement_local_depth_spread,
-                            reference_nodes=reference_nodes,
-                            reference_gate_m=reference_gate,
-                            reference_min_points=args.pf_min_measurement_points,
-                        )
-                    raw_measurement = measurement
-                    measurement, last_smoothed_measurement_nodes, smoothing_diagnostics = smooth_measurement_nodes(
-                        measurement,
-                        last_smoothed_measurement_nodes,
-                        args,
-                        last_filter_lost_frames,
-                    )
-                    stage_seconds["fit"] += time.monotonic() - stage_start
-                    now = time.monotonic()
-                    filter_dt = 1.0 / max(float(args.fps), 1.0) if last_filter_time is None else now - last_filter_time
-                    last_filter_time = now
-                    if particle_filter is not None:
+                    if async_worker is not None:
                         stage_start = time.monotonic()
-                        filter_result = particle_filter.step(measurement, filter_dt)
-                        estimate = filtered_cable_estimate(measurement, filter_result)
-                        stage_seconds["filter"] += time.monotonic() - stage_start
+                        point_cloud_data = snapshot_mat_data(point_cloud)
+                        confidence_data = None if confidence_measure is None else np.ascontiguousarray(confidence_measure).copy()
+                        if point_cloud_data is not None:
+                            async_worker.submit(
+                                MeasurementTask(
+                                    frame_count=int(frame_count),
+                                    bgr=np.ascontiguousarray(bgr).copy(),
+                                    point_cloud=point_cloud_data,
+                                    confidence_measure=confidence_data,
+                                )
+                            )
+                        stage_seconds["copy"] += time.monotonic() - stage_start
                     else:
-                        estimate = measurement
-                    tracking_diagnostics = cable_tracking_diagnostics(
-                        last_filter_nodes,
-                        raw_measurement,
-                        measurement,
-                        estimate,
-                        filter_result,
-                        smoothing_diagnostics,
-                    )
-                    if estimate is not None:
-                        last_filter_nodes = np.asarray(estimate.points_xyz, dtype=np.float32)
-                        last_filter_estimate = estimate
-                        last_filter_result = filter_result
-                    elif particle_filter is None:
-                        last_filter_nodes = None
-                        last_filter_estimate = None
-                        last_filter_result = None
-                    if filter_result is not None:
-                        last_filter_lost_frames = int(filter_result.lost_frames)
-                    elif estimate is not None:
-                        last_filter_lost_frames = 0
-                elif cable_detector is not None:
-                    detection = latest_detection
-                    estimate = last_filter_estimate
-                    filter_result = last_filter_result
+                        result = process_measurement_frame(
+                            args,
+                            cable_detector,
+                            particle_filter,
+                            processing_state,
+                            frame_count,
+                            bgr,
+                            point_cloud,
+                            confidence_measure,
+                        )
+                        latest_detection = result.detection or latest_detection
+                        last_filter_nodes = result.state.last_filter_nodes
+                        last_filter_estimate = result.state.last_filter_estimate
+                        last_filter_result = result.state.last_filter_result
+                        last_filter_lost_frames = int(result.state.last_filter_lost_frames)
+                        processing_state = result.state
+                        detection = result.detection or latest_detection
+                        measurement = result.measurement
+                        raw_measurement = result.raw_measurement
+                        estimate = result.estimate
+                        filter_result = result.filter_result
+                        tracking_diagnostics = result.tracking_diagnostics
+                        for key, value in result.stage_seconds.items():
+                            if key in stage_seconds:
+                                stage_seconds[key] += float(value)
 
                 stage_start = time.monotonic()
                 if measurement is not None:
@@ -783,16 +1008,23 @@ def run_live(args):
                         name: 1000.0 * value / max(stats_compute_frames, 1)
                         for name, value in stage_seconds.items()
                     }
+                    async_text = ""
+                    if async_worker is not None:
+                        counters = async_worker.counters()
+                        async_text = (
+                            f" | async submitted {counters['submitted']} completed {counters['completed']} "
+                            f"dropped {counters['dropped']} busy_frames {async_busy_frames} busy {int(counters['busy'])}"
+                        )
                     print(
                         f"Frame {frame_count}: point cloud shape {latest_stats['shape']} | "
                         f"render {render_fps:.1f} fps compute {compute_ms:.1f} ms | "
                         f"sampled {latest_stats['sampled']} finite {latest_stats['finite']} "
                         f"in range {latest_stats['in_range']} returned {latest_stats['returned']} "
                         f"capped {latest_stats['capped']} | "
-                        f"ms capture {stage_ms['capture']:.1f} cloud {stage_ms['cloud']:.1f} "
+                        f"ms capture {stage_ms['capture']:.1f} cloud {stage_ms['cloud']:.1f} copy {stage_ms['copy']:.1f} "
                         f"detect {stage_ms['detect']:.1f} fit {stage_ms['fit']:.1f} "
                         f"filter {stage_ms['filter']:.1f} ui {stage_ms['ui']:.1f} | "
-                        f"{latest_cable_status}"
+                        f"{latest_cable_status}{async_text}"
                     )
                     last_stats_time = now
                     last_stats_frame_count = frame_count
@@ -800,10 +1032,13 @@ def run_live(args):
                     stats_compute_frames = 0
                     for key in stage_seconds:
                         stage_seconds[key] = 0.0
+                    async_busy_frames = 0
 
             viewer.poll()
 
     finally:
+        if async_worker is not None:
+            async_worker.stop()
         viewer.close()
         image.free()
         point_cloud.free()

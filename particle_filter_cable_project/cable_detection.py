@@ -621,7 +621,7 @@ def point_samples_near_pixel(
     if x1 <= x0 or y1 <= y0:
         return np.empty((0, 3), dtype=np.float32)
 
-    xyz = point_data[y0:y1, x0:x1, :3].reshape(-1, 3).astype(np.float32)
+    xyz = point_data[y0:y1, x0:x1, :3].reshape(-1, 3).astype(np.float32, copy=False)
     finite = np.all(np.isfinite(xyz), axis=1)
     keep = finite.copy()
     distances = np.linalg.norm(xyz, axis=1)
@@ -658,7 +658,7 @@ def masked_point_cloud_points(
         mask = cv2.resize(mask, (point_data.shape[1], point_data.shape[0]), interpolation=cv2.INTER_NEAREST)
 
     selected = mask > 0
-    xyz = point_data[:, :, :3].astype(np.float32)
+    xyz = point_data[:, :, :3].astype(np.float32, copy=False)
     finite = np.all(np.isfinite(xyz), axis=2)
     selected &= finite
     distances = np.linalg.norm(xyz, axis=2)
@@ -900,17 +900,16 @@ def point_to_polyline_distances(points, nodes):
     if len(points) == 0 or len(nodes) < 2:
         return np.empty((0,), dtype=np.float64)
 
-    best = np.full(len(points), np.inf, dtype=np.float64)
-    for start, end in zip(nodes[:-1], nodes[1:]):
-        segment = end - start
-        length_sq = float(np.dot(segment, segment))
-        if length_sq <= 1e-12:
-            candidate = np.linalg.norm(points - start[None, :], axis=1)
-        else:
-            t = np.clip(((points - start[None, :]) @ segment) / length_sq, 0.0, 1.0)
-            projection = start[None, :] + t[:, None] * segment[None, :]
-            candidate = np.linalg.norm(points - projection, axis=1)
-        best = np.minimum(best, candidate)
+    starts = nodes[:-1]
+    segment = nodes[1:] - starts
+    length_sq = np.sum(segment * segment, axis=1)
+    safe_length_sq = np.maximum(length_sq, 1e-12)
+    point_delta = points[:, None, :] - starts[None, :, :]
+    t = np.sum(point_delta * segment[None, :, :], axis=2) / safe_length_sq[None, :]
+    t = np.clip(t, 0.0, 1.0)
+    t[:, length_sq <= 1e-12] = 0.0
+    projection = starts[None, :, :] + t[:, :, None] * segment[None, :, :]
+    best = np.sqrt(np.min(np.sum((points[:, None, :] - projection) ** 2, axis=2), axis=1))
     return best[np.isfinite(best)]
 
 
