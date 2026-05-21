@@ -44,7 +44,7 @@ hold_frames = 8
 # Relative paths are resolved from this config file.
 checkpoint = "models/pidnet_cable_best.pt"
 device = "cuda"
-threshold = 0.22
+threshold = 0.25
 base_channels = 24
 
 # CUDA autocast + channels-last inference for faster PIDNet masks.
@@ -72,9 +72,9 @@ update_every = 2
 
 # Binary mask cleanup after the selected detector. Increase min_area_px to ignore
 # small noise; increase close_kernel to bridge tiny mask gaps.
-min_area_px = 80
-open_kernel = 7
-close_kernel = 1
+min_area_px = 50
+open_kernel = 1
+close_kernel = 5
 
 # Used by HSV/legacy centerline geometry frames. The default PIDNet path scores
 # masked ZED cable points directly and does not require skeleton extraction.
