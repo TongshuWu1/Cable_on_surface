@@ -192,6 +192,15 @@ process_direction_std = 0.020
 # the main shape measurement. Re-enable only if the green chain becomes noisy.
 direction_smooth_passes = 0
 
+# TrackDLO-style temporal prediction. The filter learns a per-node velocity from
+# recent filtered estimates, shifts particles coherently by that velocity, then
+# adds normal PF process noise.
+temporal_prediction = false
+prediction_gain = 0.75
+prediction_velocity_alpha = 0.50
+prediction_velocity_decay = 0.85
+max_prediction_step_m = 0.035
+
 # Measurement likelihood width, in meters. The ordered measured centerline lets
 # the PF trust current cable geometry more directly.
 measurement_node_std_m = 0.020

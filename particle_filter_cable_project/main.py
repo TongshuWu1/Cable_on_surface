@@ -191,6 +191,11 @@ def parse_args():
     parser.add_argument("--pf-process-std", type=float, default=config_value(config, "particle_filter", "process_node_std_m", pf_defaults.process_node_std_m))
     parser.add_argument("--pf-process-direction-std", type=float, default=config_value(config, "particle_filter", "process_direction_std", pf_defaults.process_direction_std))
     parser.add_argument("--pf-direction-smooth-passes", type=int, default=config_value(config, "particle_filter", "direction_smooth_passes", pf_defaults.direction_smooth_passes))
+    parser.add_argument("--pf-temporal-prediction", action=argparse.BooleanOptionalAction, default=config_value(config, "particle_filter", "temporal_prediction", pf_defaults.temporal_prediction), help="Use TrackDLO-style per-node velocity when predicting particles.")
+    parser.add_argument("--pf-prediction-gain", type=float, default=config_value(config, "particle_filter", "prediction_gain", pf_defaults.prediction_gain), help="Scale applied to learned per-node velocity before prediction.")
+    parser.add_argument("--pf-prediction-velocity-alpha", type=float, default=config_value(config, "particle_filter", "prediction_velocity_alpha", pf_defaults.prediction_velocity_alpha), help="EMA update weight for measured per-node velocity.")
+    parser.add_argument("--pf-prediction-velocity-decay", type=float, default=config_value(config, "particle_filter", "prediction_velocity_decay", pf_defaults.prediction_velocity_decay), help="Velocity decay applied during prediction-only frames.")
+    parser.add_argument("--pf-max-prediction-step", type=float, default=config_value(config, "particle_filter", "max_prediction_step_m", pf_defaults.max_prediction_step_m), help="Maximum temporal-prediction displacement per node per update, in meters.")
     parser.add_argument("--pf-measurement-std", type=float, default=config_value(config, "particle_filter", "measurement_node_std_m", pf_defaults.measurement_node_std_m))
     parser.add_argument(
         "--pf-measurement-points",
@@ -346,6 +351,10 @@ def parse_args():
     args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
     args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
     args.pf_reference_ordering_gate = max(0.0, float(args.pf_reference_ordering_gate))
+    args.pf_prediction_gain = max(0.0, float(args.pf_prediction_gain))
+    args.pf_prediction_velocity_alpha = float(np.clip(args.pf_prediction_velocity_alpha, 0.0, 1.0))
+    args.pf_prediction_velocity_decay = float(np.clip(args.pf_prediction_velocity_decay, 0.0, 1.0))
+    args.pf_max_prediction_step = max(0.0, float(args.pf_max_prediction_step))
     return args
 
 
@@ -454,6 +463,11 @@ def make_particle_filter_config(args):
         process_node_std_m=float(args.pf_process_std),
         process_direction_std=float(args.pf_process_direction_std),
         direction_smooth_passes=int(args.pf_direction_smooth_passes),
+        temporal_prediction=bool(args.pf_temporal_prediction),
+        prediction_gain=float(args.pf_prediction_gain),
+        prediction_velocity_alpha=float(args.pf_prediction_velocity_alpha),
+        prediction_velocity_decay=float(args.pf_prediction_velocity_decay),
+        max_prediction_step_m=float(args.pf_max_prediction_step),
         measurement_node_std_m=float(args.pf_measurement_std),
         measurement_max_points=int(args.pf_measurement_points),
         scoring_backend=str(args.pf_scoring_backend),
@@ -1358,6 +1372,9 @@ def cable_status(detection, measurement, estimate, filter_result, segment_count,
             segment_length = float(getattr(filter_result, "segment_length_m", np.nan))
             if np.isfinite(segment_length):
                 mode += f" seglen={format_mm(segment_length)}"
+            prediction_step = float(getattr(filter_result, "prediction_step_m", 0.0))
+            if np.isfinite(prediction_step) and prediction_step > 0.0:
+                mode += f" pred={format_mm(prediction_step)}"
         diag_text = format_tracking_diagnostics(diagnostics)
         return (
             f"{prefix} | {segment_count} segments | {mode} | residual {residual:.4f}m | "

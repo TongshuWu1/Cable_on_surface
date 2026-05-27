@@ -24,6 +24,11 @@ class CableParticleFilterConfig:
     process_node_std_m: float = 0.006
     process_direction_std: float = 0.020
     direction_smooth_passes: int = 1
+    temporal_prediction: bool = False
+    prediction_gain: float = 0.75
+    prediction_velocity_alpha: float = 0.50
+    prediction_velocity_decay: float = 0.85
+    max_prediction_step_m: float = 0.035
     measurement_node_std_m: float = 0.030
     measurement_max_points: int = 1024
     scoring_backend: str = "auto"
@@ -65,6 +70,7 @@ class CableParticleFilterResult:
     lost_frames: int
     motion_noise_scale: float
     segment_length_m: float
+    prediction_step_m: float = 0.0
     measurement_point_count: int = 0
     visible_segments: np.ndarray | None = None
     visible_nodes: np.ndarray | None = None
@@ -96,6 +102,9 @@ class CableParticleFilter:
         self.last_measurement_proposal_ratio = 0.0
         self.last_ordered_measurement_nodes = None
         self.measurement_update_count = 0
+        self.previous_estimate_nodes = None
+        self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
+        self.last_prediction_step_m = 0.0
 
     def step(self, measurement, dt=1.0 / 30.0, count_lost=True):
         dt = float(np.clip(dt, 1e-3, 0.20))
@@ -115,7 +124,8 @@ class CableParticleFilter:
                     self.initialized = False
                     self._initialize(measurement, measurement_points)
                     self.lost_frames = 0
-                    return self._estimate(measurement_used=True, prediction_only=False)
+                    result = self._estimate(measurement_used=True, prediction_only=False)
+                    return self._finalize_result(result, dt)
                 self._inject_measurement_proposals(measurement_nodes)
                 measurement_points, _segment_indices, visible_segments = self._associate_visible_points(
                     measurement_points,
@@ -123,7 +133,8 @@ class CableParticleFilter:
                 )
                 if measurement_points is None:
                     self.last_measurement_point_count = 0
-                    return self._prediction_only_after_update_drop()
+                    result = self._prediction_only_after_update_drop()
+                    return self._finalize_result(result, dt)
                 self.last_measurement_point_count = int(len(measurement_points))
                 self._weight(
                     measurement_points,
@@ -134,10 +145,11 @@ class CableParticleFilter:
                 result = self._estimate(measurement_used=True, prediction_only=False)
                 self._maybe_resample(noise_scale=self.last_motion_noise_scale)
                 self.lost_frames = 0
-                return result
+                return self._finalize_result(result, dt)
 
             self.lost_frames = 0
-            return self._estimate(measurement_used=True, prediction_only=False)
+            result = self._estimate(measurement_used=True, prediction_only=False)
+            return self._finalize_result(result, dt)
 
         if not self.initialized:
             return None
@@ -147,6 +159,7 @@ class CableParticleFilter:
             self.lost_frames += 1
         if self.lost_frames > int(self.config.max_prediction_frames):
             self.initialized = False
+            self._reset_motion_state()
             return None
 
         self.last_motion_noise_scale = min(
@@ -158,7 +171,7 @@ class CableParticleFilter:
             self._set_visibility(np.zeros(self.segment_count, dtype=bool))
         result = self._estimate(measurement_used=False, prediction_only=True)
         self._maybe_resample(force=self.lost_frames > 1, noise_scale=self.last_motion_noise_scale)
-        return result
+        return self._finalize_result(result, dt)
 
     def _initialize(self, measurement, measurement_points):
         nodes = self._initial_nodes(measurement, measurement_points)
@@ -196,18 +209,24 @@ class CableParticleFilter:
         self.measurement_update_count = 1
         _points, _indices, visible_segments = self._associate_visible_points(measurement_points)
         self._set_visibility(visible_segments)
+        self._reset_motion_state(nodes)
 
     def _predict(self, dt, noise_scale=1.0):
         if self.particles is None or self.segment_length_m is None:
             return
         noise_scale = float(np.clip(noise_scale, 0.25, self.config.max_motion_noise_scale))
         self.last_motion_noise_scale = noise_scale
-        starts = self.particles[:, 0, :] + self.rng.normal(
+        predicted_particles = self.particles
+        prediction_delta = self._prediction_delta(dt)
+        if prediction_delta is not None:
+            predicted_particles = self.particles + prediction_delta[None, :, :]
+
+        starts = predicted_particles[:, 0, :] + self.rng.normal(
             0.0,
             float(self.config.process_node_std_m) * noise_scale,
             (len(self.particles), 3),
         )
-        directions = particle_directions(self.particles)
+        directions = particle_directions(predicted_particles)
         directions = normalize_vectors(
             directions
             + self.rng.normal(
@@ -221,6 +240,33 @@ class CableParticleFilter:
             passes=int(getattr(self.config, "direction_smooth_passes", 1)),
         )
         self.particles = build_chains(starts, directions, self.segment_length_m)
+
+    def _prediction_delta(self, dt):
+        self.last_prediction_step_m = 0.0
+        if not bool(getattr(self.config, "temporal_prediction", True)):
+            return None
+        if self.node_velocity_mps is None:
+            return None
+
+        velocity = np.asarray(self.node_velocity_mps, dtype=np.float64)
+        if velocity.shape != (self.node_count, 3) or not np.all(np.isfinite(velocity)):
+            self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
+            return None
+
+        gain = max(0.0, float(getattr(self.config, "prediction_gain", 0.0)))
+        if gain <= 0.0:
+            return None
+
+        delta = gain * velocity * float(np.clip(dt, 1e-3, 0.20))
+        delta = clamp_node_displacements(
+            delta,
+            max_step_m=float(getattr(self.config, "max_prediction_step_m", 0.035)),
+        )
+        step_m = max_node_step(delta)
+        self.last_prediction_step_m = float(step_m)
+        if step_m <= 1e-9:
+            return None
+        return np.ascontiguousarray(delta, dtype=np.float64)
 
     def _weight(self, measurement_points, visible_segments=None, measurement_nodes=None):
         sigma = max(float(self.config.measurement_node_std_m), 1e-5)
@@ -259,6 +305,62 @@ class CableParticleFilter:
             self.weights.fill(1.0 / len(self.weights))
             return
         self.weights = weighted / total
+
+    def _finalize_result(self, result, dt):
+        if result is None:
+            return None
+        self._update_motion_state(
+            result.points_xyz,
+            dt=dt,
+            measurement_used=bool(result.measurement_used),
+            prediction_only=bool(result.prediction_only),
+        )
+        return result
+
+    def _reset_motion_state(self, nodes=None):
+        self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
+        self.last_prediction_step_m = 0.0
+        node_array = finite_node_chain(nodes, self.node_count)
+        self.previous_estimate_nodes = None if node_array is None else node_array.copy()
+
+    def _update_motion_state(self, nodes, dt, measurement_used, prediction_only):
+        node_array = finite_node_chain(nodes, self.node_count)
+        if node_array is None:
+            return
+
+        if self.previous_estimate_nodes is None:
+            self.previous_estimate_nodes = node_array.copy()
+            self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
+            return
+
+        if prediction_only or not measurement_used:
+            self._decay_node_velocity()
+            self.previous_estimate_nodes = node_array.copy()
+            return
+
+        previous = finite_node_chain(self.previous_estimate_nodes, self.node_count)
+        if previous is None:
+            self.previous_estimate_nodes = node_array.copy()
+            self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
+            return
+
+        max_step = max(1e-6, 2.0 * float(getattr(self.config, "max_prediction_step_m", 0.035)))
+        displacement = clamp_node_displacements(node_array - previous, max_step_m=max_step)
+        measured_velocity = displacement / max(float(dt), 1e-3)
+
+        current_velocity = np.asarray(self.node_velocity_mps, dtype=np.float64)
+        if current_velocity.shape != measured_velocity.shape or not np.all(np.isfinite(current_velocity)):
+            current_velocity = np.zeros_like(measured_velocity, dtype=np.float64)
+
+        alpha = float(np.clip(getattr(self.config, "prediction_velocity_alpha", 0.50), 0.0, 1.0))
+        self.node_velocity_mps = (1.0 - alpha) * current_velocity + alpha * measured_velocity
+        self.previous_estimate_nodes = node_array.copy()
+
+    def _decay_node_velocity(self):
+        if self.node_velocity_mps is None:
+            return
+        decay = float(np.clip(getattr(self.config, "prediction_velocity_decay", 0.85), 0.0, 1.0))
+        self.node_velocity_mps = np.asarray(self.node_velocity_mps, dtype=np.float64) * decay
 
     def _maybe_resample(self, force=False, noise_scale=1.0):
         if self.weights is None or self.particles is None:
@@ -307,6 +409,7 @@ class CableParticleFilter:
             lost_frames=int(self.lost_frames),
             motion_noise_scale=float(self.last_motion_noise_scale),
             segment_length_m=float(self.segment_length_m),
+            prediction_step_m=float(self.last_prediction_step_m),
             measurement_point_count=int(self.last_measurement_point_count),
             visible_segments=self.last_visible_segments.copy(),
             visible_nodes=self.last_visible_nodes.copy(),
@@ -1407,6 +1510,50 @@ def mean_node_distance(reference_nodes, candidate_nodes):
     if len(distances) == 0:
         return np.inf
     return float(np.mean(distances))
+
+
+def finite_node_chain(nodes, node_count):
+    if nodes is None:
+        return None
+    nodes = np.asarray(nodes, dtype=np.float64)
+    expected_shape = (int(node_count), 3)
+    if nodes.shape != expected_shape:
+        return None
+    if not np.all(np.isfinite(nodes)):
+        return None
+    return np.ascontiguousarray(nodes, dtype=np.float64)
+
+
+def max_node_step(displacements):
+    displacements = np.asarray(displacements, dtype=np.float64)
+    if displacements.ndim != 2 or displacements.shape[1] < 3 or len(displacements) == 0:
+        return 0.0
+    finite = np.all(np.isfinite(displacements[:, :3]), axis=1)
+    if not np.any(finite):
+        return 0.0
+    return float(np.max(np.linalg.norm(displacements[finite, :3], axis=1)))
+
+
+def clamp_node_displacements(displacements, max_step_m):
+    displacements = np.asarray(displacements, dtype=np.float64).copy()
+    if displacements.ndim != 2 or displacements.shape[1] < 3:
+        return displacements
+
+    max_step_m = max(0.0, float(max_step_m))
+    if max_step_m <= 0.0:
+        return np.zeros_like(displacements, dtype=np.float64)
+
+    finite = np.all(np.isfinite(displacements[:, :3]), axis=1)
+    if not np.any(finite):
+        return np.zeros_like(displacements, dtype=np.float64)
+
+    norms = np.linalg.norm(displacements[:, :3], axis=1)
+    scale = np.ones(len(displacements), dtype=np.float64)
+    too_large = finite & (norms > max_step_m)
+    scale[too_large] = max_step_m / np.maximum(norms[too_large], 1e-12)
+    displacements[:, :3] *= scale[:, None]
+    displacements[~finite, :3] = 0.0
+    return np.ascontiguousarray(displacements[:, :3], dtype=np.float64)
 
 
 def segment_lengths(nodes):
