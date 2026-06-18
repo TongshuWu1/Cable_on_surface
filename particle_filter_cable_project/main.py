@@ -80,9 +80,14 @@ def parse_args():
     parser.add_argument("--ip-address", default=config_value(config, "camera", "ip_address", ""))
     parser.add_argument("--resolution", choices=RESOLUTIONS, default=config_value(config, "camera", "resolution", "HD720"))
     parser.add_argument("--fps", type=int, default=config_value(config, "camera", "fps", 60))
+    parser.add_argument("--sdk-gpu-id", type=int, default=config_value(config, "camera", "sdk_gpu_id", 0), help="ZED SDK CUDA device id. Use -1 for SDK auto selection.")
+    parser.add_argument("--zed-async-image-retrieval", action=argparse.BooleanOptionalAction, default=config_value(config, "camera", "async_image_retrieval", True), help="Allow ZED image retrieval to run asynchronously when supported by the SDK.")
+    parser.add_argument("--zed-async-recovery", action=argparse.BooleanOptionalAction, default=config_value(config, "camera", "async_grab_camera_recovery", True), help="Recover camera communication issues in the background instead of blocking grab().")
     parser.add_argument("--depth-mode", choices=DEPTH_MODES, default=config_value(config, "camera", "depth_mode", "NEURAL_PLUS"))
     parser.add_argument("--depth-min", type=float, default=config_value(config, "depth", "min_m", 0.01))
     parser.add_argument("--depth-max", type=float, default=config_value(config, "depth", "max_m", 1.0))
+    parser.add_argument("--depth-stabilization", type=int, default=config_value(config, "depth", "stabilization", 0), help="ZED depth stabilization strength. 0 disables hidden positional tracking overhead.")
+    parser.add_argument("--image-enhancement", action=argparse.BooleanOptionalAction, default=config_value(config, "camera", "image_enhancement", True), help="Use ZED SDK image enhancement for the left RGB image.")
     parser.add_argument("--confidence", type=int, default=config_value(config, "depth", "confidence", 95))
     parser.add_argument("--texture-confidence", type=int, default=config_value(config, "depth", "texture_confidence", 100))
     parser.add_argument("--depth-fill", action=argparse.BooleanOptionalAction, default=config_value(config, "depth", "fill", True))
@@ -155,8 +160,8 @@ def parse_args():
     parser.add_argument(
         "--measurement-mask-centerline",
         action=argparse.BooleanOptionalAction,
-        default=config_value(config, "measurement", "mask_centerline", True),
-        help="For PIDNet masks, build an ordered 3D centerline from masked ZED points before the particle filter update.",
+        default=config_value(config, "measurement", "mask_centerline", False),
+        help="For PIDNet masks, build an ordered 3D centerline before the particle-filter update. Disable for full-PF raw cloud scoring.",
     )
     parser.add_argument(
         "--measurement-mask-centerline-gate",
@@ -300,6 +305,24 @@ def parse_args():
         help="Direction noise for measurement-proposal particles.",
     )
     parser.add_argument(
+        "--pf-measurement-proposal-wide-fraction",
+        type=float,
+        default=config_value(config, "particle_filter", "measurement_proposal_wide_fraction", pf_defaults.measurement_proposal_wide_fraction),
+        help="Fraction of injected proposals sampled broadly around the temporary measured chain.",
+    )
+    parser.add_argument(
+        "--pf-measurement-proposal-current-fraction",
+        type=float,
+        default=config_value(config, "particle_filter", "measurement_proposal_current_fraction", pf_defaults.measurement_proposal_current_fraction),
+        help="Fraction of injected proposals sampled near the current MAP/filtered chain.",
+    )
+    parser.add_argument(
+        "--pf-measurement-proposal-wide-std-multiplier",
+        type=float,
+        default=config_value(config, "particle_filter", "measurement_proposal_wide_std_multiplier", pf_defaults.measurement_proposal_wide_std_multiplier),
+        help="Noise multiplier for broad measurement proposals.",
+    )
+    parser.add_argument(
         "--pf-score-keep-fraction",
         type=float,
         default=config_value(config, "particle_filter", "score_keep_fraction", pf_defaults.score_keep_fraction),
@@ -317,7 +340,31 @@ def parse_args():
         default=config_value(config, "particle_filter", "coverage_min_fraction", pf_defaults.coverage_min_fraction),
         help="Minimum fraction of support points each expected visible segment should own.",
     )
+    parser.add_argument(
+        "--pf-two-sided-support-weight",
+        type=float,
+        default=config_value(config, "particle_filter", "two_sided_support_weight", pf_defaults.two_sided_support_weight),
+        help="Weight for particle-to-cloud support scoring. 0 disables the reverse likelihood.",
+    )
+    parser.add_argument(
+        "--pf-two-sided-support-samples",
+        type=int,
+        default=config_value(config, "particle_filter", "two_sided_support_samples_per_segment", pf_defaults.two_sided_support_samples_per_segment),
+        help="Number of support samples per visible particle segment for reverse scoring.",
+    )
+    parser.add_argument(
+        "--pf-two-sided-support-distance",
+        type=float,
+        default=config_value(config, "particle_filter", "two_sided_support_distance_m", pf_defaults.two_sided_support_distance_m),
+        help="Clamp distance for particle-to-cloud support scoring, in meters.",
+    )
     parser.add_argument("--pf-bend-penalty", type=float, default=config_value(config, "particle_filter", "bend_penalty_m", pf_defaults.bend_penalty_m))
+    parser.add_argument(
+        "--pf-estimate-mode",
+        choices=("map", "weighted", "auto"),
+        default=config_value(config, "particle_filter", "estimate_mode", pf_defaults.estimate_mode),
+        help="map returns the highest-probability particle; weighted averages particles; auto uses MAP only after weight collapse.",
+    )
     parser.add_argument("--pf-map-estimate-effective-ratio", type=float, default=config_value(config, "particle_filter", "map_estimate_effective_ratio", pf_defaults.map_estimate_effective_ratio))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
     parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
@@ -355,6 +402,12 @@ def parse_args():
     args.pf_prediction_velocity_alpha = float(np.clip(args.pf_prediction_velocity_alpha, 0.0, 1.0))
     args.pf_prediction_velocity_decay = float(np.clip(args.pf_prediction_velocity_decay, 0.0, 1.0))
     args.pf_max_prediction_step = max(0.0, float(args.pf_max_prediction_step))
+    args.pf_measurement_proposal_wide_fraction = float(np.clip(args.pf_measurement_proposal_wide_fraction, 0.0, 0.8))
+    args.pf_measurement_proposal_current_fraction = float(np.clip(args.pf_measurement_proposal_current_fraction, 0.0, 0.8))
+    args.pf_measurement_proposal_wide_std_multiplier = max(1.0, float(args.pf_measurement_proposal_wide_std_multiplier))
+    args.pf_two_sided_support_weight = max(0.0, float(args.pf_two_sided_support_weight))
+    args.pf_two_sided_support_samples = max(1, int(args.pf_two_sided_support_samples))
+    args.pf_two_sided_support_distance = max(0.0, float(args.pf_two_sided_support_distance))
     return args
 
 
@@ -367,6 +420,16 @@ def open_zed(args):
     init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
     init.depth_minimum_distance = args.depth_min
     init.depth_maximum_distance = args.depth_max
+    if hasattr(init, "sdk_gpu_id"):
+        init.sdk_gpu_id = int(args.sdk_gpu_id)
+    if hasattr(init, "async_image_retrieval"):
+        init.async_image_retrieval = bool(args.zed_async_image_retrieval)
+    if hasattr(init, "async_grab_camera_recovery"):
+        init.async_grab_camera_recovery = bool(args.zed_async_recovery)
+    if hasattr(init, "depth_stabilization"):
+        init.depth_stabilization = int(args.depth_stabilization)
+    if hasattr(init, "enable_image_enhancement"):
+        init.enable_image_enhancement = bool(args.image_enhancement)
     configure_input_source(init, args)
 
     zed = sl.Camera()
@@ -486,10 +549,17 @@ def make_particle_filter_config(args):
         measurement_proposal_full_error_m=float(args.pf_measurement_proposal_full_error),
         measurement_proposal_node_std_m=float(args.pf_measurement_proposal_std),
         measurement_proposal_direction_std=float(args.pf_measurement_proposal_direction_std),
+        measurement_proposal_wide_fraction=float(args.pf_measurement_proposal_wide_fraction),
+        measurement_proposal_current_fraction=float(args.pf_measurement_proposal_current_fraction),
+        measurement_proposal_wide_std_multiplier=float(args.pf_measurement_proposal_wide_std_multiplier),
         score_keep_fraction=float(args.pf_score_keep_fraction),
         coverage_penalty_m=float(args.pf_coverage_penalty),
         coverage_min_fraction=float(args.pf_coverage_min_fraction),
+        two_sided_support_weight=float(args.pf_two_sided_support_weight),
+        two_sided_support_samples_per_segment=int(args.pf_two_sided_support_samples),
+        two_sided_support_distance_m=float(args.pf_two_sided_support_distance),
         bend_penalty_m=float(args.pf_bend_penalty),
+        estimate_mode=str(args.pf_estimate_mode),
         map_estimate_effective_ratio=float(args.pf_map_estimate_effective_ratio),
         min_measurement_points=int(args.pf_min_measurement_points),
         min_segment_points=int(args.pf_min_segment_points),

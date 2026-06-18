@@ -13,12 +13,31 @@ input_svo_file = ""
 ip_address = ""
 resolution = "HD720"
 fps = 60
-depth_mode = "NEURAL_PLUS"
+
+# Pin the ZED SDK and PyTorch to the RTX 4080. Use -1 to let the SDK choose.
+sdk_gpu_id = 0
+
+# These keep camera recovery/retrieval from blocking the render loop when the
+# SDK can handle the work asynchronously.
+async_image_retrieval = true
+async_grab_camera_recovery = true
+
+# NEURAL is the live balance point. NEURAL_PLUS is more accurate but heavier and
+# best reserved for offline/low-FPS runs or when depth detail matters more than UI rate.
+depth_mode = "NEURAL"
+
+# SDK color/gamma enhancement helps the RGB segmenter in uneven lighting.
+image_enhancement = true
 
 [depth]
 # Working depth range in meters. Keep this tight around the cable workspace.
 min_m = 0.01
 max_m = 1.0
+
+# 0 disables depth stabilization. The SDK docs note stabilization can enable
+# positional tracking in the background, which costs performance. Raise this if
+# the camera is fixed and depth jitter is worse than frame rate.
+stabilization = 0
 
 # Larger values are stricter for ZED depth confidence. If cable depth disappears,
 # lower confidence first, then texture_confidence.
@@ -156,10 +175,11 @@ smoothing = false
 smoothing_alpha = 0.30
 smoothing_gate_m = 0.040
 
-# For PIDNet masks, first collapse the orange 3D support cloud into an ordered
-# measured centerline. The PF then tracks this measured shape instead of
-# discovering the shape from unordered points alone.
-mask_centerline = true
+# Full-PF mode keeps the PIDNet/ZED measurement as raw unordered support points.
+# The particle filter scores candidate fixed-length segment chains directly
+# against this cloud. The ordered centerline path is still available as a
+# debugging/legacy mode, but should stay off for probability-based fitting.
+mask_centerline = false
 mask_centerline_reference_gate_m = 0.15
 mask_centerline_max_residual_m = 0.08
 
@@ -230,13 +250,14 @@ endpoint_refresh_interval = 0
 reference_ordering = true
 reference_ordering_gate_m = 0.08
 
-# Keep the particle start/end close to the current measured endpoints. This is
-# the main guard against segment-order flips in a good unordered point cloud.
-endpoint_penalty_weight = 1.0
+# Keep the particle start/end close to fitted endpoints. In full-PF mode this
+# stays off so the raw cloud likelihood, not endpoint detection, defines the fit.
+endpoint_penalty_weight = 0.0
 
-# Reset the PF from the current valid masked-cloud fit when the mean node
-# disagreement is this large. Use 0 to disable.
-measurement_reset_error_m = 0.25
+# Resetting from a deterministic fitted centerline would override the PF
+# posterior. Keep this disabled for full-PF fitting; initialization/reacquisition
+# still use a fitted chain only to seed particles.
+measurement_reset_error_m = 0.0
 
 # Adaptive measurement proposals reduce detector jitter: when the measured cable
 # is already close to the filtered estimate, only stable_ratio particles are
@@ -249,21 +270,40 @@ measurement_proposal_full_error_m = 0.060
 measurement_proposal_node_std_m = 0.012
 measurement_proposal_direction_std = 0.025
 
+# Proposal mixture: most injected particles stay near the temporary
+# measurement fit, some are broad measurement proposals for recovery, and some
+# stay near the current MAP chain so one noisy fit does not take over.
+measurement_proposal_wide_fraction = 0.20
+measurement_proposal_current_fraction = 0.20
+measurement_proposal_wide_std_multiplier = 3.0
+
 # Robust scoring keeps this fraction of the lowest point-to-segment distances,
 # so a few bad depth points do not dominate the weight.
 score_keep_fraction = 0.90
 
-# Penalize particles whose visible segments do not own enough support points.
-# Use 0 to disable.
+# Penalize particles whose visible segments do not own enough close support
+# points. Use 0 to disable.
 coverage_penalty_m = 0.025
 coverage_min_fraction = 0.05
 
-# Bend penalty is off so tight measured cable bends can be followed. The measured
-# centerline and raw support cloud now provide the shape constraint.
-bend_penalty_m = 0.0
+# Two-sided scoring adds the reverse likelihood: sampled points along each
+# visible particle segment should also lie near the raw support cloud. This
+# prevents a particle from explaining only one dense fragment of the mask.
+two_sided_support_weight = 0.35
+two_sided_support_samples_per_segment = 2
+two_sided_support_distance_m = 0.08
 
-# When particle weights collapse, display the best actual particle instead of a
-# direction average that may not correspond to any valid chain hypothesis.
+# Modest smoothness prior. Fixed length handles geometry; this just discourages
+# depth-noise zigzags without preventing real cable bends.
+bend_penalty_m = 0.015
+
+# Full-PF output is the maximum-a-posteriori sampled cable configuration: the
+# highest-weight particle after raw point-cloud scoring. Options: "map",
+# "weighted", or "auto".
+estimate_mode = "map"
+
+# In auto mode only, display the best actual particle when weights collapse
+# instead of a direction average that may not correspond to any valid hypothesis.
 map_estimate_effective_ratio = 0.35
 
 # Minimum support required before a measurement update is trusted.

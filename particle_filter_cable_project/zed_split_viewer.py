@@ -1,7 +1,41 @@
 import ctypes
+import sys
+from pathlib import Path
 from threading import Lock
 
 import numpy as np
+
+
+_FREEGLUT_HANDLE = None
+
+
+def _preload_freeglut():
+    if sys.platform != "win32":
+        return
+    candidates = [
+        Path(sys.prefix) / "Lib" / "site-packages" / "OpenGL" / "DLLS" / "freeglut.dll",
+        Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/extras/demo_suite/freeglut.dll"),
+        Path("C:/Program Files (x86)/ZED SDK/dependencies/freeglut_2.8/x64/freeglut.dll"),
+    ]
+    for dll_path in candidates:
+        if not dll_path.exists():
+            continue
+        try:
+            if hasattr(ctypes, "windll"):
+                return ctypes.windll.LoadLibrary(str(dll_path))
+            if hasattr(ctypes, "WinDLL"):
+                return ctypes.WinDLL(str(dll_path))
+            return ctypes.CDLL(str(dll_path))
+        except OSError:
+            continue
+
+
+_FREEGLUT_HANDLE = _preload_freeglut()
+if _FREEGLUT_HANDLE is not None:
+    import OpenGL.platform
+
+    OpenGL.platform.PLATFORM.GLUT = _FREEGLUT_HANDLE
+
 from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *

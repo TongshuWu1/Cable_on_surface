@@ -32,30 +32,32 @@ Current pipeline:
    because there is only one physical cable and gaps usually mean occlusion.
 3. Use the PIDNet mask to select ZED point-cloud samples that belong to the
    cable.
-4. On initialization/reacquisition, estimate cable start/end from the masked 3D
-   cloud with a k-nearest-neighbor graph, then resample the endpoint-to-endpoint
-   path into ordered cable nodes.
-5. On normal tracking frames, order the masked 3D points by projection onto the
-   current filtered chain. This is cheaper than rebuilding the graph every frame
-   and keeps start/end identity stable.
-6. Treat the same masked 3D points as the measurement support set for the particle
+4. Treat the masked 3D points as the measurement support set for the particle
    filter. The support cap is `particle_filter.measurement_points`.
-7. Each particle is one connected fixed-length 3D segment chain.
+5. Each particle is one connected fixed-length 3D segment chain.
+6. On initialization/reacquisition, estimate a temporary cable path from the
+   masked 3D cloud only to seed particles.
+7. On normal tracking frames, optionally build a temporary ordered cloud fit only
+   to propose new particles; the raw cloud likelihood is still authoritative.
 8. Score each particle by the distance from every masked cable point to the
    closest segment in that particle. CUDA tensor scoring is used automatically
    when available.
-9. Add an endpoint penalty so the particle start/end stay close to the measured
-   cable start/end instead of flipping segment order.
+9. Score the reverse direction too: sampled points along each visible particle
+   segment should lie near the raw support cloud.
 10. Keep the best `particle_filter.score_keep_fraction` point distances, so
    sparse bad depth points do not dominate the particle weight.
 11. During occlusion, assign visible points to the closest predicted segment and
    only mark those segments as observed; hidden segments continue by prediction.
 12. Add a coverage penalty when expected visible segments do not own enough
    support points.
-13. Regenerate a fraction of particles around the current ordered masked-cloud
-   fit, then score the mixed particle set with the same point-to-segment
-   distance.
-14. Track the fixed-length connected segment chain with the particle filter.
+13. Use a mixed proposal distribution: normal proposals near the temporary
+   masked-cloud fit, broad proposals for recovery, and conservative proposals
+   near the current MAP chain.
+14. Add a modest bend prior to reduce depth-noise zigzags without preventing
+   real cable bends.
+15. Output the MAP estimate, meaning the highest-weight sampled cable
+   configuration after scoring.
+16. Track the fixed-length connected segment chain with the particle filter.
 
 Label masks and train the PIDNet-S detector on CUDA:
 
@@ -149,7 +151,12 @@ segment scoring.
 
 The live UI shows RGB on the left and the ZED point cloud on the right. The
 cable model is controlled by `cable.segments`; `N` segments means `N + 1`
-connected 3D nodes. Important tuning sections:
+connected 3D nodes. In the default full-PF mode, `measurement.mask_centerline`
+is false and `particle_filter.estimate_mode` is `map`, so the displayed cable
+is the highest-probability particle rather than a deterministic centerline fit.
+The main full-PF scoring knobs are `particle_filter.two_sided_support_weight`,
+`particle_filter.coverage_penalty_m`, and `particle_filter.bend_penalty_m`.
+Important tuning sections:
 
 - `pidnet`: model checkpoint, CUDA device, probability threshold.
 - `detector`: PIDNet/HSV backend, resized inference, ROI reacquisition.
