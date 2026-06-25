@@ -11,7 +11,9 @@ import numpy as np
 import pyzed.sl as sl
 
 from cable_detection import (
+    attach_endpoint_markers_to_measurement,
     cable_measurement_from_mask_points,
+    detect_blue_endpoint_markers,
 )
 from cable_particle_filter import (
     CableParticleFilter,
@@ -116,6 +118,23 @@ def parse_args():
     parser.add_argument("--detector-skeleton-prune-px", type=int, default=config_value(config, "detector", "skeleton_prune_px", 10))
     parser.add_argument("--detector-skeleton-prune-passes", type=int, default=config_value(config, "detector", "skeleton_prune_passes", 2))
     parser.add_argument("--detector-centerline-smooth-window", type=int, default=config_value(config, "detector", "centerline_smooth_window", 9))
+    parser.add_argument(
+        "--endpoint-mode",
+        default=str(config_value(config, "endpoint", "mode", "blue")).lower(),
+        help='Endpoint anchor source: "blue" uses blue tape markers, "normal" uses inferred cable endpoints, "none" disables endpoint anchors.',
+    )
+    parser.add_argument("--endpoint-markers", action=argparse.BooleanOptionalAction, default=config_value(config, "endpoint_markers", "enabled", True), help="Detect blue tape markers and use them as measured cable endpoints.")
+    parser.add_argument("--endpoint-marker-h-min", type=int, default=config_value(config, "endpoint_markers", "h_min", 90))
+    parser.add_argument("--endpoint-marker-h-max", type=int, default=config_value(config, "endpoint_markers", "h_max", 135))
+    parser.add_argument("--endpoint-marker-s-min", type=int, default=config_value(config, "endpoint_markers", "s_min", 70))
+    parser.add_argument("--endpoint-marker-v-min", type=int, default=config_value(config, "endpoint_markers", "v_min", 40))
+    parser.add_argument("--endpoint-marker-min-area", type=int, default=config_value(config, "endpoint_markers", "min_area_px", 50))
+    parser.add_argument("--endpoint-marker-min-points", type=int, default=config_value(config, "endpoint_markers", "min_points", 8))
+    parser.add_argument("--endpoint-marker-open-kernel", type=int, default=config_value(config, "endpoint_markers", "open_kernel", 3))
+    parser.add_argument("--endpoint-marker-close-kernel", type=int, default=config_value(config, "endpoint_markers", "close_kernel", 5))
+    parser.add_argument("--endpoint-marker-points", type=int, default=config_value(config, "endpoint_markers", "max_points_per_marker", 256))
+    parser.add_argument("--endpoint-marker-tape-length", type=float, default=config_value(config, "endpoint_markers", "tape_length_m", 0.035), help="Physical blue tape length at each cable end, in meters.")
+    parser.add_argument("--endpoint-marker-offset-to-tips", action=argparse.BooleanOptionalAction, default=config_value(config, "endpoint_markers", "offset_to_tips", True), help="Offset blue tape centroids outward by half tape length to estimate actual cable tips.")
     parser.add_argument("--cable-segments", type=int, default=config_value(config, "cable", "segments", 2))
     parser.add_argument("--cable-max-points", type=int, default=config_value(config, "cable", "max_visual_points", 1000))
     parser.add_argument("--cable-confidence-max", type=float, default=config_value(config, "measurement", "confidence_max", 85.0), help="Use <0 to disable.")
@@ -125,6 +144,17 @@ def parse_args():
     parser.add_argument("--pf-particles", type=int, default=config_value(config, "particle_filter", "particles", pf_defaults.particle_count))
     parser.add_argument("--pf-initial-node-std", type=float, default=config_value(config, "particle_filter", "initial_node_std_m", pf_defaults.initial_node_std_m))
     parser.add_argument("--pf-initial-direction-std", type=float, default=config_value(config, "particle_filter", "initial_direction_std", pf_defaults.initial_direction_std))
+    parser.add_argument(
+        "--pf-initial-structured-fraction",
+        type=float,
+        default=config_value(
+            config,
+            "particle_filter",
+            "initial_structured_fraction",
+            pf_defaults.initial_structured_fraction,
+        ),
+        help="Fraction of initial particles generated from deterministic cable offset/bend modes before random fill.",
+    )
     parser.add_argument("--pf-process-std", type=float, default=config_value(config, "particle_filter", "process_node_std_m", pf_defaults.process_node_std_m))
     parser.add_argument("--pf-process-direction-std", type=float, default=config_value(config, "particle_filter", "process_direction_std", pf_defaults.process_direction_std))
     parser.add_argument(
@@ -283,6 +313,12 @@ def parse_args():
         default=config_value(config, "particle_filter", "endpoint_anchor_projection_passes", pf_defaults.endpoint_anchor_projection_passes),
         help="Number of soft endpoint projection passes applied before particle scoring.",
     )
+    parser.add_argument(
+        "--pf-endpoint-anchor-requires-marker",
+        action=argparse.BooleanOptionalAction,
+        default=config_value(config, "particle_filter", "endpoint_anchor_requires_marker", pf_defaults.endpoint_anchor_requires_marker),
+        help="When endpoint anchoring is enabled, only use endpoints measured from blue tape markers.",
+    )
     parser.add_argument("--pf-map-estimate-effective-ratio", type=float, default=config_value(config, "particle_filter", "map_estimate_effective_ratio", pf_defaults.map_estimate_effective_ratio))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
     parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
@@ -317,6 +353,19 @@ def parse_args():
     args.detector_skeleton_prune_px = max(0, int(args.detector_skeleton_prune_px))
     args.detector_skeleton_prune_passes = max(0, int(args.detector_skeleton_prune_passes))
     args.detector_centerline_smooth_window = max(1, int(args.detector_centerline_smooth_window))
+    args.endpoint_mode = str(args.endpoint_mode).strip().lower()
+    if args.endpoint_mode not in ("blue", "normal", "none"):
+        raise ValueError('endpoint.mode must be one of "blue", "normal", or "none".')
+    args.endpoint_marker_h_min = int(np.clip(args.endpoint_marker_h_min, 0, 179))
+    args.endpoint_marker_h_max = int(np.clip(args.endpoint_marker_h_max, 0, 179))
+    args.endpoint_marker_s_min = int(np.clip(args.endpoint_marker_s_min, 0, 255))
+    args.endpoint_marker_v_min = int(np.clip(args.endpoint_marker_v_min, 0, 255))
+    args.endpoint_marker_min_area = max(1, int(args.endpoint_marker_min_area))
+    args.endpoint_marker_min_points = max(1, int(args.endpoint_marker_min_points))
+    args.endpoint_marker_open_kernel = max(0, int(args.endpoint_marker_open_kernel))
+    args.endpoint_marker_close_kernel = max(0, int(args.endpoint_marker_close_kernel))
+    args.endpoint_marker_points = max(1, int(args.endpoint_marker_points))
+    args.endpoint_marker_tape_length = max(0.0, float(args.endpoint_marker_tape_length))
     args.viewer_update_every = max(1, int(args.viewer_update_every))
     args.viewer_hold_frames = max(0, int(args.viewer_hold_frames))
     args.pf_velocity_alpha = float(np.clip(args.pf_velocity_alpha, 0.0, 1.0))
@@ -328,11 +377,23 @@ def parse_args():
     args.pf_measurement_proposal_wide_fraction = float(np.clip(args.pf_measurement_proposal_wide_fraction, 0.0, 0.8))
     args.pf_measurement_proposal_current_fraction = float(np.clip(args.pf_measurement_proposal_current_fraction, 0.0, 0.8))
     args.pf_measurement_proposal_wide_std_multiplier = max(1.0, float(args.pf_measurement_proposal_wide_std_multiplier))
+    args.pf_initial_structured_fraction = float(np.clip(args.pf_initial_structured_fraction, 0.0, 0.8))
     args.pf_top_particles = max(0, int(args.pf_top_particles))
     args.pf_top_particle_cluster_gate = max(0.0, float(args.pf_top_particle_cluster_gate))
     args.pf_endpoint_anchor_weight = max(0.0, float(args.pf_endpoint_anchor_weight))
     args.pf_endpoint_anchor_projection_gain = float(np.clip(args.pf_endpoint_anchor_projection_gain, 0.0, 1.0))
     args.pf_endpoint_anchor_projection_passes = max(1, int(args.pf_endpoint_anchor_projection_passes))
+    if args.endpoint_mode == "blue":
+        args.endpoint_markers = True
+        args.pf_endpoint_anchor_requires_marker = True
+    elif args.endpoint_mode == "normal":
+        args.endpoint_markers = False
+        args.pf_endpoint_anchor_requires_marker = False
+    elif args.endpoint_mode == "none":
+        args.endpoint_markers = False
+        args.pf_endpoint_anchor_requires_marker = True
+        args.pf_endpoint_anchor_weight = 0.0
+        args.pf_endpoint_anchor_projection = False
     args.pf_occlusion_segment_window = max(0, int(args.pf_occlusion_segment_window))
     return args
 
@@ -419,6 +480,7 @@ def make_particle_filter_config(args):
         segment_length_m=float(args.cable_segment_length),
         initial_node_std_m=float(args.pf_initial_node_std),
         initial_direction_std=float(args.pf_initial_direction_std),
+        initial_structured_fraction=float(args.pf_initial_structured_fraction),
         process_node_std_m=float(args.pf_process_std),
         process_direction_std=float(args.pf_process_direction_std),
         velocity_prediction=bool(args.pf_velocity_prediction),
@@ -452,6 +514,7 @@ def make_particle_filter_config(args):
         endpoint_anchor_projection=bool(args.pf_endpoint_anchor_projection),
         endpoint_anchor_projection_gain=float(args.pf_endpoint_anchor_projection_gain),
         endpoint_anchor_projection_passes=int(args.pf_endpoint_anchor_projection_passes),
+        endpoint_anchor_requires_marker=bool(args.pf_endpoint_anchor_requires_marker),
         map_estimate_effective_ratio=float(args.pf_map_estimate_effective_ratio),
         min_measurement_points=int(args.pf_min_measurement_points),
         min_segment_points=int(args.pf_min_segment_points),
@@ -593,6 +656,7 @@ def process_measurement_frame(
     detection = None
     measurement = None
     raw_measurement = None
+    endpoint_markers = None
     estimate = None
     filter_result = None
     tracking_diagnostics = {}
@@ -620,6 +684,28 @@ def process_measurement_frame(
         reference_gate_m=0.0,
         reference_min_points=args.pf_min_measurement_points,
     )
+    if bool(args.endpoint_markers):
+        endpoint_markers = detect_blue_endpoint_markers(
+            bgr,
+            point_cloud,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            confidence_map=confidence_measure,
+            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+            reference_nodes=state.last_filter_nodes,
+            hue_min=args.endpoint_marker_h_min,
+            hue_max=args.endpoint_marker_h_max,
+            saturation_min=args.endpoint_marker_s_min,
+            value_min=args.endpoint_marker_v_min,
+            min_area_px=args.endpoint_marker_min_area,
+            min_points_per_marker=args.endpoint_marker_min_points,
+            open_kernel=args.endpoint_marker_open_kernel,
+            close_kernel=args.endpoint_marker_close_kernel,
+            max_points_per_marker=args.endpoint_marker_points,
+            tape_length_m=args.endpoint_marker_tape_length,
+            offset_to_tips=bool(args.endpoint_marker_offset_to_tips),
+        )
+        measurement = attach_endpoint_markers_to_measurement(measurement, endpoint_markers)
     raw_measurement = measurement
     stage_seconds["fit"] += time.monotonic() - stage_start
 
@@ -743,10 +829,14 @@ def run_live(args):
         print(
             "Parallel pipeline enabled: main thread handles ZED grab + OpenGL UI; "
             "measurement worker handles PIDNet + 3D support construction + PF update. "
-            f"detector_every={args.detector_update_every} viewer_every={args.viewer_update_every}"
+            f"detector_every={args.detector_update_every} viewer_every={args.viewer_update_every} "
+            f"endpoint_mode={args.endpoint_mode}"
         )
     else:
-        print("Synchronous pipeline: PIDNet + 3D support construction + PF update run on the UI/camera thread.")
+        print(
+            "Synchronous pipeline: PIDNet + 3D support construction + PF update run on the UI/camera thread. "
+            f"endpoint_mode={args.endpoint_mode}"
+        )
     last_visual_measurement = None
     last_visual_estimate = None
     last_visual_filter_result = None
@@ -1124,10 +1214,12 @@ def cable_status(detection, measurement, estimate, filter_result, segment_count,
             if np.isfinite(prediction_step) and prediction_step > 0.0:
                 mode += f" pred={format_mm(prediction_step)}"
         diag_text = format_tracking_diagnostics(diagnostics)
+        marker_count = int(getattr(measurement, "endpoint_marker_count", 0)) if measurement is not None else 0
+        marker_text = f" blue={marker_count}/2" if marker_count > 0 else ""
         return (
             f"{prefix} | {segment_count} segments | {mode} | residual {residual:.4f}m | "
             f"source={source_count} mask components {detection.component_count} "
-            f"centerline {centerline_count} branches {detection.branch_count}{diag_text}"
+            f"centerline {centerline_count} branches {detection.branch_count}{marker_text}{diag_text}"
         )
     if measurement is None:
         return (
@@ -1246,6 +1338,7 @@ def draw_cable_segmentation_view(
         contours, _hierarchy = cv2.findContours(detection.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(panel, contours, -1, (255, 255, 255), 1, cv2.LINE_AA)
 
+    draw_endpoint_marker_overlay(panel, measurement)
     draw_detection_geometry(panel, detection, segment_count)
     draw_cable_status_text(panel, detection, measurement, estimate, segment_count, mode_text=detector_description)
     return panel
@@ -1266,9 +1359,39 @@ def draw_cable_mask_view(
     if detection is not None and detection.skeleton is not None and np.any(detection.skeleton):
         ys, xs = np.nonzero(detection.skeleton)
         panel[ys, xs] = (0, 180, 255)
+    draw_endpoint_marker_overlay(panel, measurement)
     draw_detection_geometry(panel, detection, segment_count)
     draw_cable_status_text(panel, detection, measurement, estimate, segment_count, mode_text=detector_description)
     return panel
+
+
+def draw_endpoint_marker_overlay(panel, measurement):
+    if measurement is None:
+        return
+    marker_mask = getattr(measurement, "endpoint_marker_mask", None)
+    if marker_mask is not None:
+        marker_mask = np.asarray(marker_mask, dtype=np.uint8)
+        if marker_mask.shape[:2] != panel.shape[:2]:
+            marker_mask = cv2.resize(marker_mask, (panel.shape[1], panel.shape[0]), interpolation=cv2.INTER_NEAREST)
+        marker_pixels = marker_mask > 0
+        if np.any(marker_pixels):
+            tint = np.zeros_like(panel)
+            tint[:, :, 0] = 255
+            tint[:, :, 1] = 110
+            panel[marker_pixels] = cv2.addWeighted(panel[marker_pixels], 0.35, tint[marker_pixels], 0.65, 0.0)
+            contours, _hierarchy = cv2.findContours(marker_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(panel, contours, -1, (255, 210, 80), 2, cv2.LINE_AA)
+
+    centers_xy = getattr(measurement, "endpoint_marker_centers_xy", None)
+    centers_xy = np.asarray(centers_xy, dtype=np.float32)
+    if centers_xy.ndim != 2 or centers_xy.shape[1] < 2:
+        return
+    for point in centers_xy[:, :2]:
+        if not np.all(np.isfinite(point)):
+            continue
+        xy = tuple(np.round(point).astype(np.int32))
+        cv2.circle(panel, xy, 9, (255, 255, 80), 2, cv2.LINE_AA)
+        cv2.circle(panel, xy, 3, (255, 255, 255), -1, cv2.LINE_AA)
 
 
 def draw_detection_geometry(panel, detection, segment_count):

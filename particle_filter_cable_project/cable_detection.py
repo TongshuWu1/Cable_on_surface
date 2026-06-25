@@ -23,6 +23,21 @@ class CableEstimate3D:
     method: str
     centerline_xy: np.ndarray | None = None
     valid_centerline_mask: np.ndarray | None = None
+    endpoint_nodes: np.ndarray | None = None
+    endpoint_marker_centers_xyz: np.ndarray | None = None
+    endpoint_marker_centers_xy: np.ndarray | None = None
+    endpoint_marker_mask: np.ndarray | None = None
+    endpoint_marker_count: int = 0
+
+
+@dataclass
+class EndpointMarker3D:
+    mask: np.ndarray
+    centers_xyz: np.ndarray
+    centers_xy: np.ndarray
+    endpoint_nodes: np.ndarray | None
+    component_count: int
+    points_xyz: np.ndarray
 
 
 class CableMaskDetector:
@@ -207,6 +222,234 @@ def cable_measurement_from_mask_points(
         centerline_xy=np.empty((0, 2), dtype=np.float32),
         valid_centerline_mask=np.zeros(0, dtype=bool),
     )
+
+
+def detect_blue_endpoint_markers(
+    bgr,
+    point_cloud,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    reference_nodes=None,
+    hue_min=90,
+    hue_max=135,
+    saturation_min=70,
+    value_min=40,
+    min_area_px=50,
+    min_points_per_marker=8,
+    open_kernel=3,
+    close_kernel=5,
+    max_points_per_marker=256,
+    tape_length_m=0.035,
+    offset_to_tips=True,
+):
+    bgr = np.asarray(bgr, dtype=np.uint8)
+    if bgr.ndim != 3 or bgr.shape[2] < 3:
+        return None
+
+    mask = blue_hsv_mask(
+        bgr,
+        hue_min=hue_min,
+        hue_max=hue_max,
+        saturation_min=saturation_min,
+        value_min=value_min,
+    )
+    open_kernel = odd_kernel_size(open_kernel)
+    close_kernel = odd_kernel_size(close_kernel)
+    if open_kernel > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel, open_kernel))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    if close_kernel > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return None
+
+    markers = []
+    cleaned = np.zeros_like(mask, dtype=np.uint8)
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < int(min_area_px):
+            continue
+        component_mask = (labels == label).astype(np.uint8) * 255
+        points = sampled_masked_point_cloud_points(
+            point_cloud,
+            component_mask,
+            depth_min=depth_min,
+            depth_max=depth_max,
+            confidence_map=confidence_map,
+            max_confidence=max_confidence,
+            max_points=max_points_per_marker,
+        )
+        if len(points) < int(min_points_per_marker):
+            continue
+        center_xyz = np.nanmedian(points[:, :3], axis=0).astype(np.float32)
+        if not np.all(np.isfinite(center_xyz)):
+            continue
+        center_xy = np.asarray(centroids[label], dtype=np.float32)
+        markers.append(
+            {
+                "area": area,
+                "point_count": int(len(points)),
+                "center_xyz": center_xyz,
+                "center_xy": center_xy,
+                "points": points,
+                "label": label,
+            }
+        )
+
+    if not markers:
+        return None
+
+    markers.sort(key=lambda item: (item["point_count"], item["area"]), reverse=True)
+    markers = markers[:2]
+    markers = order_marker_records(markers, reference_nodes)
+    for marker in markers:
+        cleaned[labels == marker["label"]] = 255
+
+    centers_xyz = np.ascontiguousarray([marker["center_xyz"] for marker in markers], dtype=np.float32)
+    centers_xy = np.ascontiguousarray([marker["center_xy"] for marker in markers], dtype=np.float32)
+    points_xyz = np.concatenate([marker["points"] for marker in markers], axis=0).astype(np.float32, copy=False)
+    endpoint_nodes = endpoint_nodes_from_blue_marker_centers(
+        centers_xyz,
+        reference_nodes=reference_nodes,
+        tape_length_m=tape_length_m,
+        offset_to_tips=offset_to_tips,
+    )
+    return EndpointMarker3D(
+        mask=np.ascontiguousarray(cleaned, dtype=np.uint8),
+        centers_xyz=centers_xyz,
+        centers_xy=centers_xy,
+        endpoint_nodes=endpoint_nodes,
+        component_count=len(markers),
+        points_xyz=np.ascontiguousarray(points_xyz, dtype=np.float32),
+    )
+
+
+def attach_endpoint_markers_to_measurement(measurement, markers):
+    if measurement is None or markers is None:
+        return measurement
+    measurement.endpoint_nodes = markers.endpoint_nodes
+    measurement.endpoint_marker_centers_xyz = markers.centers_xyz
+    measurement.endpoint_marker_centers_xy = markers.centers_xy
+    measurement.endpoint_marker_mask = markers.mask
+    measurement.endpoint_marker_count = int(markers.component_count)
+    return measurement
+
+
+def blue_hsv_mask(bgr, hue_min=90, hue_max=135, saturation_min=70, value_min=40):
+    hsv = cv2.cvtColor(np.asarray(bgr, dtype=np.uint8), cv2.COLOR_BGR2HSV)
+    hue_min = int(np.clip(hue_min, 0, 179))
+    hue_max = int(np.clip(hue_max, 0, 179))
+    saturation_min = int(np.clip(saturation_min, 0, 255))
+    value_min = int(np.clip(value_min, 0, 255))
+    if hue_min <= hue_max:
+        return cv2.inRange(
+            hsv,
+            np.array([hue_min, saturation_min, value_min], dtype=np.uint8),
+            np.array([hue_max, 255, 255], dtype=np.uint8),
+        )
+    low = cv2.inRange(
+        hsv,
+        np.array([0, saturation_min, value_min], dtype=np.uint8),
+        np.array([hue_max, 255, 255], dtype=np.uint8),
+    )
+    high = cv2.inRange(
+        hsv,
+        np.array([hue_min, saturation_min, value_min], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8),
+    )
+    return cv2.bitwise_or(low, high)
+
+
+def order_marker_records(markers, reference_nodes=None):
+    markers = list(markers)
+    if len(markers) != 2:
+        return markers
+    reference = valid_xyz(reference_nodes)
+    if len(reference) < 2:
+        centers = np.asarray([marker["center_xyz"] for marker in markers], dtype=np.float64)
+        order = np.argsort(centers[:, 0])
+        return [markers[int(index)] for index in order]
+
+    start = reference[0]
+    end = reference[-1]
+    centers = np.asarray([marker["center_xyz"] for marker in markers], dtype=np.float64)
+    direct = float(np.linalg.norm(centers[0] - start) + np.linalg.norm(centers[1] - end))
+    reverse = float(np.linalg.norm(centers[1] - start) + np.linalg.norm(centers[0] - end))
+    return markers if direct <= reverse else [markers[1], markers[0]]
+
+
+def endpoint_nodes_from_blue_marker_centers(
+    centers_xyz,
+    reference_nodes=None,
+    tape_length_m=0.035,
+    offset_to_tips=True,
+):
+    centers = valid_xyz(centers_xyz)
+    if len(centers) == 0:
+        return None
+
+    half_tape = 0.5 * max(0.0, float(tape_length_m)) if bool(offset_to_tips) else 0.0
+    if len(centers) >= 2:
+        centers = centers[:2]
+        reference = valid_xyz(reference_nodes)
+        if len(reference) >= 2:
+            centers = order_endpoint_pair_to_reference(centers, reference)
+        direction = centers[-1] - centers[0]
+        norm = float(np.linalg.norm(direction))
+        if norm > 1e-9:
+            direction /= norm
+            endpoints = centers.copy()
+            endpoints[0] -= half_tape * direction
+            endpoints[-1] += half_tape * direction
+        else:
+            endpoints = centers.copy()
+        return np.ascontiguousarray(endpoints, dtype=np.float32)
+
+    reference = valid_xyz(reference_nodes)
+    if len(reference) < 2:
+        return None
+    endpoints = np.full((2, 3), np.nan, dtype=np.float32)
+    center = centers[0]
+    start_distance = float(np.linalg.norm(center - reference[0]))
+    end_distance = float(np.linalg.norm(center - reference[-1]))
+    if start_distance <= end_distance:
+        tangent = unit_vector(reference[1] - reference[0])
+        endpoints[0] = center - half_tape * tangent
+    else:
+        tangent = unit_vector(reference[-1] - reference[-2])
+        endpoints[-1] = center + half_tape * tangent
+    return np.ascontiguousarray(endpoints, dtype=np.float32)
+
+
+def order_endpoint_pair_to_reference(endpoints, reference_nodes):
+    endpoints = valid_xyz(endpoints)
+    reference = valid_xyz(reference_nodes)
+    if len(endpoints) < 2 or len(reference) < 2:
+        return endpoints
+    direct = float(np.linalg.norm(endpoints[0] - reference[0]) + np.linalg.norm(endpoints[-1] - reference[-1]))
+    reverse = float(np.linalg.norm(endpoints[-1] - reference[0]) + np.linalg.norm(endpoints[0] - reference[-1]))
+    return endpoints if direct <= reverse else endpoints[::-1].copy()
+
+
+def valid_xyz(points):
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] < 3:
+        return np.empty((0, 3), dtype=np.float64)
+    points = points[:, :3]
+    return np.ascontiguousarray(points[np.all(np.isfinite(points), axis=1)], dtype=np.float64)
+
+
+def unit_vector(vector):
+    vector = np.asarray(vector, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= 1e-9:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    return vector / norm
 
 
 def sample_centerline_xy(centerline_xy, max_points=0):

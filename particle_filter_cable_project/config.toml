@@ -95,6 +95,30 @@ skeleton_prune_px = 10
 skeleton_prune_passes = 2
 centerline_smooth_window = 9
 
+[endpoint]
+# Endpoint anchor source:
+#   "blue"   -> detect blue tape and use it as the endpoint measurement
+#   "normal" -> disable blue tape and use the inferred cable endpoint prediction
+#   "none"   -> disable endpoint anchors completely
+mode = "blue"
+
+[endpoint_markers]
+# Blue tape markers at the cable ends: 3.5 cm blue, 48 cm orange,
+# 3.5 cm blue. The detected blue centroid is offset outward by half the
+# tape length so the PF anchor is the cable tip, not the tape center.
+enabled = true
+h_min = 90
+h_max = 135
+s_min = 70
+v_min = 40
+min_area_px = 50
+min_points = 8
+open_kernel = 3
+close_kernel = 5
+max_points_per_marker = 256
+tape_length_m = 0.035
+offset_to_tips = true
+
 [point_cloud]
 # Visual point-cloud sampling. Larger stride and lower max_points make the
 # display faster without changing particle-filter scoring.
@@ -116,14 +140,12 @@ async_measurement = true
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
 segments = 12
 
-# Physical cable length in meters. Set this for drone experiments so occluded
-# parts remain constrained by the known cable length. 0 estimates segment length
-# once from the first valid 3D measurement.
-length_m = 0.56
+# Physical cable length in meters: 3.5 cm blue + 48 cm orange + 3.5 cm blue.
+length_m = 0.55
 
-# Use a slightly shorter effective tracking length so noisy endpoints do not
-# force the fixed-length segment chain to spend excess length as zigzag.
-length_scale = 0.96
+# With blue tape endpoints, keep the physical length consistent with the
+# endpoint anchors. Lower this only if live depth noise reintroduces zigzag.
+length_scale = 1.0
 
 # Per-segment length override in meters. Used only when length_m is 0.
 segment_length_m = 0.0
@@ -142,6 +164,7 @@ particles = 800
 # Initial spread when the first valid cable measurement initializes particles.
 initial_node_std_m = 0.025
 initial_direction_std = 0.10
+initial_structured_fraction = 0.25
 
 # Per-frame process noise on cable vertices, in meters.
 process_node_std_m = 0.002
@@ -204,13 +227,13 @@ measurement_proposal_wide_std_multiplier = 3.0
 
 # Main middle-shape scoring objective:
 #   E(x) = mean_j min_i distance(point_j, cable_segment_i(x))^2
-# Endpoint anchors are disabled by default because endpoints inferred only from
-# the masked cable cloud are easy to mis-detect. Re-enable when endpoints come
-# from a reliable source such as drone attachment poses.
-endpoint_anchor_weight = 0.0
-endpoint_anchor_projection = false
-endpoint_anchor_projection_gain = 0.0
+# Endpoint anchors are controlled by [endpoint].mode. In "blue" mode these come
+# only from tape markers; in "normal" mode they come from inferred cable endpoints.
+endpoint_anchor_weight = 2.0
+endpoint_anchor_projection = true
+endpoint_anchor_projection_gain = 0.35
 endpoint_anchor_projection_passes = 1
+endpoint_anchor_requires_marker = true
 
 # Output is a weighted average of top particles near the MAP particle after
 # simple point-to-cable scoring. Options: "top_clustered", "top_weighted",
