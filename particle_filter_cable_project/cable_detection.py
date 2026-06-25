@@ -28,7 +28,7 @@ class CableEstimate3D:
 class CableMaskDetector:
     """Base class for cable mask detectors.
 
-    Subclasses provide ``create_mask``. This class only handles ROI/scale,
+    Subclasses provide ``create_mask``. This class only handles scale,
     cleanup, skeletonization, and ordered centerline extraction.
     """
 
@@ -72,27 +72,18 @@ class CableMaskDetector:
             max_components=0 if self.allow_occluded_fragments else self.max_components,
         )
 
-    def detect(self, bgr, roi_bbox=None, scale=1.0, extract_geometry=True):
+    def detect(self, bgr, scale=1.0, extract_geometry=True):
         bgr = np.asarray(bgr, dtype=np.uint8)
-        if roi_bbox is None and float(scale) >= 0.999:
+        if float(scale) >= 0.999:
             return self._detect_crop(bgr, extract_geometry=extract_geometry)
 
-        crop, bbox = crop_bgr_to_bbox(bgr, roi_bbox)
-        if crop.size == 0:
-            return empty_detection(bgr.shape[:2])
-
-        original_h, original_w = crop.shape[:2]
+        original_h, original_w = bgr.shape[:2]
         scale = float(np.clip(scale, 0.10, 1.0))
-        if scale < 0.999:
-            scaled_w = max(2, int(round(original_w * scale)))
-            scaled_h = max(2, int(round(original_h * scale)))
-            detector_input = cv2.resize(crop, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
-            detection = self._detect_crop(detector_input, extract_geometry=extract_geometry)
-            detection = resize_detection(detection, (original_h, original_w))
-        else:
-            detection = self._detect_crop(crop, extract_geometry=extract_geometry)
-
-        return offset_detection(detection, bgr.shape[:2], bbox)
+        scaled_w = max(2, int(round(original_w * scale)))
+        scaled_h = max(2, int(round(original_h * scale)))
+        detector_input = cv2.resize(bgr, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+        detection = self._detect_crop(detector_input, extract_geometry=extract_geometry)
+        return resize_detection(detection, (original_h, original_w))
 
     def _detect_crop(self, bgr, extract_geometry=True):
         raw_mask = self.create_mask(bgr)
@@ -124,104 +115,6 @@ class CableMaskDetector:
             branch_count=branch_count,
             centerline_paths_xy=tuple(centerline_paths_xy),
         )
-
-
-class HsvCableDetector(CableMaskDetector):
-    """HSV range or Gaussian detector for baseline cable segmentation.
-
-    OpenCV HSV uses H in [0, 179] and S/V in [0, 255]. If h_min > h_max, the
-    hue range wraps around zero, which is useful for red cables.
-    """
-
-    def __init__(
-        self,
-        h_min=50,
-        h_max=80,
-        s_min=80,
-        s_max=255,
-        v_min=80,
-        v_max=255,
-        mode="range",
-        gaussian_threshold=0.0,
-        gaussian_positive_mean=None,
-        gaussian_positive_std=None,
-        gaussian_negative_mean=None,
-        gaussian_negative_std=None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.mode = str(mode).lower()
-        self.h_min = int(np.clip(h_min, 0, 179))
-        self.h_max = int(np.clip(h_max, 0, 179))
-        self.s_min = int(np.clip(s_min, 0, 255))
-        self.s_max = int(np.clip(s_max, 0, 255))
-        self.v_min = int(np.clip(v_min, 0, 255))
-        self.v_max = int(np.clip(v_max, 0, 255))
-        self.gaussian_threshold = float(gaussian_threshold)
-        self.gaussian_positive_mean = vector_or_none(gaussian_positive_mean, 4)
-        self.gaussian_positive_std = vector_or_none(gaussian_positive_std, 4)
-        self.gaussian_negative_mean = vector_or_none(gaussian_negative_mean, 4)
-        self.gaussian_negative_std = vector_or_none(gaussian_negative_std, 4)
-
-    def create_mask(self, bgr):
-        bgr = np.asarray(bgr, dtype=np.uint8)
-        if bgr.ndim != 3 or bgr.shape[2] < 3:
-            return np.zeros(bgr.shape[:2], dtype=np.uint8)
-
-        hsv = cv2.cvtColor(bgr[:, :, :3], cv2.COLOR_BGR2HSV)
-        if self.mode == "gaussian" and self.has_gaussian_model():
-            score = hsv_gaussian_score(
-                hsv,
-                self.gaussian_positive_mean,
-                self.gaussian_positive_std,
-                self.gaussian_negative_mean,
-                self.gaussian_negative_std,
-            )
-            return (score >= self.gaussian_threshold).astype(np.uint8) * 255
-
-        hue = hsv[:, :, 0]
-        saturation = hsv[:, :, 1]
-        value = hsv[:, :, 2]
-
-        if self.h_min <= self.h_max:
-            hue_mask = (hue >= self.h_min) & (hue <= self.h_max)
-        else:
-            hue_mask = (hue >= self.h_min) | (hue <= self.h_max)
-        mask = (
-            hue_mask
-            & (saturation >= self.s_min)
-            & (saturation <= self.s_max)
-            & (value >= self.v_min)
-            & (value <= self.v_max)
-        )
-        return mask.astype(np.uint8) * 255
-
-    def has_gaussian_model(self):
-        return self.gaussian_positive_mean is not None and self.gaussian_positive_std is not None
-
-    def description(self):
-        if self.mode == "gaussian" and self.has_gaussian_model():
-            return f"HSV Gaussian threshold {self.gaussian_threshold:.3f}"
-        return (
-            f"HSV H {self.h_min}-{self.h_max} "
-            f"S {self.s_min}-{self.s_max} V {self.v_min}-{self.v_max}"
-        )
-
-
-def crop_bgr_to_bbox(bgr, roi_bbox=None):
-    bgr = np.asarray(bgr, dtype=np.uint8)
-    height, width = bgr.shape[:2]
-    if roi_bbox is None:
-        return bgr, (0, 0, width, height)
-
-    x0, y0, x1, y1 = [int(round(float(v))) for v in roi_bbox]
-    x0 = int(np.clip(x0, 0, width))
-    x1 = int(np.clip(x1, 0, width))
-    y0 = int(np.clip(y0, 0, height))
-    y1 = int(np.clip(y1, 0, height))
-    if x1 <= x0 or y1 <= y0:
-        return bgr[:0, :0], (0, 0, 0, 0)
-    return bgr[y0:y1, x0:x1], (x0, y0, x1, y1)
 
 
 def empty_detection(image_shape):
@@ -259,38 +152,6 @@ def resize_detection(detection, output_shape):
     )
 
 
-def offset_detection(detection, image_shape, bbox):
-    height, width = [int(v) for v in image_shape[:2]]
-    x0, y0, x1, y1 = [int(v) for v in bbox]
-    if x0 == 0 and y0 == 0 and x1 == width and y1 == height:
-        return detection
-
-    full_mask = np.zeros((height, width), dtype=np.uint8)
-    full_skeleton = np.zeros((height, width), dtype=np.uint8)
-    if x1 > x0 and y1 > y0:
-        crop_h = y1 - y0
-        crop_w = x1 - x0
-        mask = detection.mask
-        skeleton = detection.skeleton
-        if mask.shape[:2] != (crop_h, crop_w):
-            mask = cv2.resize(mask, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
-        if skeleton.shape[:2] != (crop_h, crop_w):
-            skeleton = cv2.resize(skeleton, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
-        full_mask[y0:y1, x0:x1] = mask
-        full_skeleton[y0:y1, x0:x1] = skeleton
-
-    centerline_xy = translate_xy_points(detection.centerline_xy, x0, y0)
-    paths = tuple(translate_xy_points(path, x0, y0) for path in detection.centerline_paths_xy)
-    return CableDetection2D(
-        mask=full_mask,
-        skeleton=full_skeleton,
-        centerline_xy=centerline_xy,
-        component_count=int(detection.component_count),
-        branch_count=int(detection.branch_count),
-        centerline_paths_xy=paths,
-    )
-
-
 def scale_xy_points(points_xy, scale_x, scale_y):
     points = np.asarray(points_xy, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] < 2 or len(points) == 0:
@@ -299,88 +160,6 @@ def scale_xy_points(points_xy, scale_x, scale_y):
     output[:, 0] *= float(scale_x)
     output[:, 1] *= float(scale_y)
     return np.ascontiguousarray(output, dtype=np.float32)
-
-
-def translate_xy_points(points_xy, offset_x, offset_y):
-    points = np.asarray(points_xy, dtype=np.float32)
-    if points.ndim != 2 or points.shape[1] < 2 or len(points) == 0:
-        return np.empty((0, 2), dtype=np.float32)
-    output = points[:, :2].copy()
-    output[:, 0] += float(offset_x)
-    output[:, 1] += float(offset_y)
-    return np.ascontiguousarray(output, dtype=np.float32)
-
-
-def fit_cable_segments_from_zed_point_cloud(
-    point_cloud,
-    detection,
-    segment_count=12,
-    depth_min=0.05,
-    depth_max=None,
-    confidence_map=None,
-    max_confidence=None,
-    node_search_px=4,
-    source_point_mode="centerline",
-    max_centerline_points=0,
-    max_local_depth_std_m=0.0,
-    reference_nodes=None,
-    reference_gate_m=0.0,
-    reference_min_points=0,
-):
-    if detection is None:
-        return None
-
-    centerline_xy = np.asarray(detection.centerline_xy, dtype=np.float32)
-    if centerline_xy.ndim != 2 or centerline_xy.shape[1] < 2 or len(centerline_xy) < 2:
-        return None
-    centerline_xy = sample_centerline_xy(centerline_xy, max_centerline_points)
-
-    centerline_xyz, valid_centerline = centerline_points_to_3d(
-        point_cloud,
-        centerline_xy,
-        depth_min=depth_min,
-        depth_max=depth_max,
-        confidence_map=confidence_map,
-        max_confidence=max_confidence,
-        search_px=node_search_px,
-        max_local_depth_std_m=max_local_depth_std_m,
-    )
-    ordered_points = centerline_xyz[valid_centerline]
-    if len(ordered_points) < 2:
-        return None
-    ordered_points = gate_points_to_reference(
-        ordered_points,
-        reference_nodes,
-        gate_m=reference_gate_m,
-        min_points=reference_min_points,
-    )
-    if len(ordered_points) < 2:
-        return None
-
-    nodes = fit_polyline_segments(ordered_points, segment_count=segment_count)
-    if nodes is None:
-        return None
-
-    if source_point_mode == "mask":
-        source_points = masked_point_cloud_points(
-            point_cloud,
-            detection.mask,
-            depth_min=depth_min,
-            depth_max=depth_max,
-            confidence_map=confidence_map,
-            max_confidence=max_confidence,
-        )
-    else:
-        source_points = ordered_points
-    residual = polyline_residual(source_points if len(source_points) else ordered_points, nodes)
-    return CableEstimate3D(
-        points_xyz=np.ascontiguousarray(nodes, dtype=np.float32),
-        source_points=np.ascontiguousarray(source_points, dtype=np.float32),
-        residual_m=float(residual),
-        method=f"{int(segment_count)}-segment cable skeleton from RGB mask + ZED {source_point_mode} points",
-        centerline_xy=np.ascontiguousarray(centerline_xy, dtype=np.float32),
-        valid_centerline_mask=np.asarray(valid_centerline, dtype=bool),
-    )
 
 
 def cable_measurement_from_mask_points(
@@ -428,40 +207,6 @@ def cable_measurement_from_mask_points(
         centerline_xy=np.empty((0, 2), dtype=np.float32),
         valid_centerline_mask=np.zeros(0, dtype=bool),
     )
-
-
-def centerline_points_to_3d(
-    point_cloud,
-    centerline_xy,
-    depth_min=0.05,
-    depth_max=None,
-    confidence_map=None,
-    max_confidence=None,
-    search_px=4,
-    max_local_depth_std_m=0.0,
-):
-    try:
-        point_data = np.asarray(point_cloud.get_data())
-    except Exception:
-        point_data = np.asarray(point_cloud)
-
-    if point_data.ndim != 3 or point_data.shape[2] < 3:
-        return np.empty((0, 3), dtype=np.float32), np.zeros(0, dtype=bool)
-
-    target_shape = point_data.shape[:2]
-    confidence = confidence_array(confidence_map, target_shape)
-    points, valid = median_points_near_pixels(
-        point_data,
-        centerline_xy,
-        depth_min=depth_min,
-        depth_max=depth_max,
-        confidence=confidence,
-        max_confidence=max_confidence,
-        search_px=search_px,
-        max_local_depth_std_m=max_local_depth_std_m,
-    )
-
-    return points, valid
 
 
 def sample_centerline_xy(centerline_xy, max_points=0):
@@ -653,9 +398,7 @@ def masked_point_cloud_points(
     if point_data.ndim != 3 or point_data.shape[2] < 3:
         return np.empty((0, 3), dtype=np.float32)
 
-    mask = np.asarray(mask, dtype=np.uint8)
-    if mask.shape[:2] != point_data.shape[:2]:
-        mask = cv2.resize(mask, (point_data.shape[1], point_data.shape[0]), interpolation=cv2.INTER_NEAREST)
+    mask = mask_for_point_data(mask, point_data.shape[:2])
 
     selected = mask > 0
     xyz = point_data[:, :, :3].astype(np.float32, copy=False)
@@ -708,9 +451,7 @@ def sampled_masked_point_cloud_points(
             max_points=0,
         )
 
-    mask = np.asarray(mask, dtype=np.uint8)
-    if mask.shape[:2] != point_data.shape[:2]:
-        mask = cv2.resize(mask, (point_data.shape[1], point_data.shape[0]), interpolation=cv2.INTER_NEAREST)
+    mask = mask_for_point_data(mask, point_data.shape[:2])
 
     height, width = point_data.shape[:2]
     flat_indices = np.flatnonzero(mask.reshape(-1) > 0)
@@ -747,6 +488,14 @@ def sampled_masked_point_cloud_points(
         indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
         points = points[indices]
     return np.ascontiguousarray(points, dtype=np.float32)
+
+
+def mask_for_point_data(mask, point_shape):
+    mask = np.asarray(mask, dtype=np.uint8)
+    target_h, target_w = [int(v) for v in point_shape[:2]]
+    if mask.shape[:2] != (target_h, target_w):
+        mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    return np.ascontiguousarray(mask, dtype=np.uint8)
 
 
 def evenly_sample_indices(indices, count):
@@ -805,51 +554,6 @@ def confidence_values_at_pixels(confidence_map, target_shape, ys, xs):
             interpolation=cv2.INTER_NEAREST,
         )
     return np.asarray(data[ys, xs], dtype=np.float32)
-
-
-def vector_or_none(value, expected_count):
-    if value is None:
-        return None
-    vector = np.asarray(value, dtype=np.float32).reshape(-1)
-    if len(vector) != int(expected_count) or not np.all(np.isfinite(vector)):
-        return None
-    return np.ascontiguousarray(vector, dtype=np.float32)
-
-
-def hsv_gaussian_features(hsv):
-    hsv = np.asarray(hsv, dtype=np.float32)
-    if hsv.ndim < 2 or hsv.shape[-1] < 3:
-        return np.empty((*hsv.shape[:-1], 4), dtype=np.float32)
-    radians = hsv[..., 0] * (2.0 * np.pi / 180.0)
-    saturation = hsv[..., 1] / 255.0
-    value = hsv[..., 2] / 255.0
-    features = np.stack(
-        [
-            np.sin(radians),
-            np.cos(radians),
-            saturation,
-            value,
-        ],
-        axis=-1,
-    )
-    return np.ascontiguousarray(features, dtype=np.float32)
-
-
-def diagonal_gaussian_logpdf(features, mean, std):
-    features = np.asarray(features, dtype=np.float32)
-    mean = np.asarray(mean, dtype=np.float32).reshape(4)
-    std = np.maximum(np.asarray(std, dtype=np.float32).reshape(4), 1e-4)
-    normalized = (features - mean) / std
-    return -0.5 * np.sum(normalized * normalized + np.log(2.0 * np.pi * std * std), axis=-1)
-
-
-def hsv_gaussian_score(hsv, positive_mean, positive_std, negative_mean=None, negative_std=None):
-    features = hsv_gaussian_features(hsv)
-    positive = diagonal_gaussian_logpdf(features, positive_mean, positive_std)
-    if negative_mean is None or negative_std is None:
-        return positive
-    negative = diagonal_gaussian_logpdf(features, negative_mean, negative_std)
-    return positive - negative
 
 
 def fit_polyline_segments(points_xyz, segment_count=12):

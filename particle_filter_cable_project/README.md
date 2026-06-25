@@ -21,11 +21,13 @@ P0 -- P1 -- P2 -- ... -- PN
 ```
 
 `cable.segments = N` means the estimate has `N + 1` connected control points.
-All segments share one fixed length. Use `cable.segment_length_m = 0` to
-estimate that length once from the first measurement, or set a positive value in
-meters.
+All segments share one fixed length. Set `cable.length_m` to the measured
+physical cable length; the filter uses `length_m * length_scale / segments` as
+the fixed segment length. Keep `length_scale` slightly below `1.0` when noisy
+endpoints make the chain spend excess length as zigzag. Leave `length_m = 0` to
+estimate the segment length once from the first measurement.
 
-Current pipeline:
+Current research pipeline:
 
 1. Segment the cable in RGB using the PIDNet-S binary cable segmenter.
 2. Clean the mask while preserving multiple visible fragments by default,
@@ -37,27 +39,35 @@ Current pipeline:
 5. Each particle is one connected fixed-length 3D segment chain.
 6. On initialization/reacquisition, estimate a temporary cable path from the
    masked 3D cloud only to seed particles.
-7. On normal tracking frames, optionally build a temporary ordered cloud fit only
-   to propose new particles; the raw cloud likelihood is still authoritative.
-8. Score each particle by the distance from every masked cable point to the
-   closest segment in that particle. CUDA tensor scoring is used automatically
-   when available.
-9. Score the reverse direction too: sampled points along each visible particle
-   segment should lie near the raw support cloud.
-10. Keep the best `particle_filter.score_keep_fraction` point distances, so
-   sparse bad depth points do not dominate the particle weight.
-11. During occlusion, assign visible points to the closest predicted segment and
-   only mark those segments as observed; hidden segments continue by prediction.
-12. Add a coverage penalty when expected visible segments do not own enough
-   support points.
-13. Use a mixed proposal distribution: normal proposals near the temporary
-   masked-cloud fit, broad proposals for recovery, and conservative proposals
-   near the current MAP chain.
-14. Add a modest bend prior to reduce depth-noise zigzags without preventing
-   real cable bends.
-15. Output the MAP estimate, meaning the highest-weight sampled cable
-   configuration after scoring.
-16. Track the fixed-length connected segment chain with the particle filter.
+7. On normal tracking frames, build temporary ordered cloud fits only to propose
+   particles and detect the two cable endpoints; the final estimate still comes
+   from the particle filter.
+8. Use the detected endpoint pair as a soft anchor. Particles are nudged partway
+   toward those endpoints before scoring, and endpoint error is added to the
+   likelihood. This helps when the middle is partially occluded, but it is not a
+   hard kinematic constraint.
+9. Assign visible support points to the closest segment of the current/reference
+   cable. When the mask is partially occluded, hidden segments receive no
+   negative point-cloud evidence.
+10. Score visible support points against only their assigned segment neighborhood
+   in each particle:
+
+   ```text
+   E(x) = mean_j min_{i in assigned_window(j)} distance(point_j, segment_i(x))^2
+   ```
+
+   CUDA tensor scoring is used automatically when available.
+11. Use conservative per-node velocity prediction to carry hidden cable portions
+    through short occlusions. Velocities are updated from visible nodes, ignored
+    below a deadband, and decay while hidden.
+12. Use a mixed proposal distribution: normal proposals near the temporary
+    masked-cloud fit, broad proposals for recovery, and conservative proposals
+    near the current displayed chain.
+13. Output the weighted average of top particles near the MAP particle after
+     simple point-to-cable scoring. This avoids averaging separate shape modes
+     and reduces frame-to-frame jitter from switching MAP particles.
+14. Draw the displayed chain plus the top weighted particles in the 3D viewer.
+15. Track the fixed-length connected segment chain with the particle filter.
 
 Label masks and train the PIDNet-S detector on CUDA:
 
@@ -96,36 +106,6 @@ By default, live mode reads `config.toml` and expects
 ../.venv/bin/python main.py --config /path/to/config.toml
 ```
 
-To compare HSV segmentation against PIDNet, set `detector.backend = "hsv"` in
-`config.toml`. HSV supports a simple range threshold and a Gaussian color model
-learned from labeled masks. You can also switch for one run:
-
-```bash
-../.venv/bin/python main.py --detector-backend hsv
-```
-
-In HSV mode, `hsv.fast_mask_only = true` skips skeleton/centerline extraction on
-normal tracking frames. It samples mask pixels, lifts them to 3D, and scores the
-particle filter directly by point-to-segment distance. Skeleton geometry is
-still refreshed for initialization and reacquisition.
-
-To tune HSV interactively against your existing labeled training masks:
-
-```bash
-../.venv/bin/python tools/hsv_tuning_gui.py
-```
-
-To fit and save HSV settings from labels without the GUI:
-
-```bash
-../.venv/bin/python tools/tune_hsv_from_masks.py --method gaussian --write-config
-```
-
-That scans `datasets/cable_pidnet/images/...` and `masks/...`, estimates a
-robust HSV profile from pixels labeled as cable plus background negatives,
-prints IoU/Dice on the labeled set, and updates only the `[hsv]` values in
-`config.toml`.
-
 Headless PIDNet-S training:
 
 ```bash
@@ -151,16 +131,14 @@ segment scoring.
 
 The live UI shows RGB on the left and the ZED point cloud on the right. The
 cable model is controlled by `cable.segments`; `N` segments means `N + 1`
-connected 3D nodes. In the default full-PF mode, `measurement.mask_centerline`
-is false and `particle_filter.estimate_mode` is `map`, so the displayed cable
-is the highest-probability particle rather than a deterministic centerline fit.
-The main full-PF scoring knobs are `particle_filter.two_sided_support_weight`,
-`particle_filter.coverage_penalty_m`, and `particle_filter.bend_penalty_m`.
+connected 3D nodes. The displayed cable is a clustered weighted average of the
+top particles after simple point-to-cable scoring, not a pre-fitted measurement
+curve.
 Important tuning sections:
 
 - `pidnet`: model checkpoint, CUDA device, probability threshold.
-- `detector`: PIDNet/HSV backend, resized inference, ROI reacquisition.
-- `hsv`: range/Gaussian HSV baseline and fast mask-only tracking path.
+- `detector`: resized PIDNet inference, ROI reacquisition, mask cleanup.
 - `measurement`: masked ZED point selection, depth rejection, prediction gating.
-- `particle_filter`: particle count, process noise, scoring, occlusion.
+- `cable`: number of segments and physical cable length.
+- `particle_filter`: particle count, process noise, proposal injection, scoring.
 - `point_cloud`: viewer point-cloud sampling and confidence-map cadence.

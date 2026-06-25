@@ -56,6 +56,7 @@ VISIBLE_COLOR = (0.25, 1.00, 0.48)
 EXTENDED_COLOR = (1.00, 0.82, 0.16)
 OCCLUDED_COLOR = (1.00, 0.18, 0.20)
 CABLE_SAMPLE_COLOR = (1.00, 0.58, 0.08)
+PARTICLE_CHAIN_COLOR = (0.18, 0.70, 1.00)
 START_NODE_COLOR = (0.00, 0.78, 1.00)
 END_NODE_COLOR = (1.00, 0.25, 0.92)
 
@@ -116,6 +117,7 @@ class ZedDepthGLViewer:
         self.pending_cable_valid = None
         self.pending_cable_visible = None
         self.pending_cable_extended_visible = None
+        self.pending_particle_nodes = None
         self.pending_coordinate_frame = None
         self.rgb_image = None
         self.vertices = np.empty((0, 6), dtype=np.float32)
@@ -125,6 +127,7 @@ class ZedDepthGLViewer:
         self.cable_valid = np.empty(0, dtype=bool)
         self.cable_visible = np.empty(0, dtype=bool)
         self.cable_extended_visible = np.empty(0, dtype=bool)
+        self.particle_nodes = np.empty((0, 0, 3), dtype=np.float32)
         self.coordinate_frame = "camera"
         self.status = "waiting for frames"
 
@@ -292,6 +295,7 @@ class ZedDepthGLViewer:
         valid_nodes,
         visible_nodes=None,
         extended_visible_nodes=None,
+        particle_nodes=None,
         coordinate_frame="camera",
     ):
         cable_points = self._as_points(cable_points)
@@ -300,6 +304,7 @@ class ZedDepthGLViewer:
         visible_nodes = self._as_node_mask(visible_nodes, len(cable_nodes), valid_nodes)
         extended_visible_nodes = self._as_node_mask(extended_visible_nodes, len(cable_nodes), visible_nodes)
         extended_visible_nodes = extended_visible_nodes | visible_nodes
+        particle_nodes = self._as_particle_nodes(particle_nodes)
 
         with self.lock:
             self.pending_cable_points = cable_points
@@ -307,6 +312,7 @@ class ZedDepthGLViewer:
             self.pending_cable_valid = valid_nodes
             self.pending_cable_visible = visible_nodes
             self.pending_cable_extended_visible = extended_visible_nodes
+            self.pending_particle_nodes = particle_nodes
             self.pending_coordinate_frame = str(coordinate_frame)
 
     def reset_view(self):
@@ -352,6 +358,7 @@ class ZedDepthGLViewer:
             cable_valid = self.pending_cable_valid
             cable_visible = self.pending_cable_visible
             cable_extended_visible = self.pending_cable_extended_visible
+            particle_nodes = self.pending_particle_nodes
             coordinate_frame = self.pending_coordinate_frame
             self.pending_rgb_image = None
             self.pending_vertices = None
@@ -360,6 +367,7 @@ class ZedDepthGLViewer:
             self.pending_cable_valid = None
             self.pending_cable_visible = None
             self.pending_cable_extended_visible = None
+            self.pending_particle_nodes = None
             self.pending_coordinate_frame = None
 
         if rgb_image is not None:
@@ -374,6 +382,8 @@ class ZedDepthGLViewer:
             self.cable_visible = cable_visible
         if cable_extended_visible is not None:
             self.cable_extended_visible = cable_extended_visible
+        if particle_nodes is not None:
+            self.particle_nodes = particle_nodes
         if coordinate_frame is not None:
             self.coordinate_frame = coordinate_frame
 
@@ -571,6 +581,8 @@ class ZedDepthGLViewer:
                 glVertex3f(float(point[0]), float(point[1]), float(point[2]))
             glEnd()
 
+        self._draw_particle_chains()
+
         if self._has_cable_node_state():
             start_idx, end_idx = self._valid_endpoint_indices()
             glLineWidth(8.0)
@@ -600,6 +612,30 @@ class ZedDepthGLViewer:
             self._draw_endpoint_markers(start_idx, end_idx)
 
         glEnable(GL_DEPTH_TEST)
+
+    def _draw_particle_chains(self):
+        particles = np.asarray(self.particle_nodes, dtype=np.float32)
+        if particles.ndim != 3 or particles.shape[1] < 2 or particles.shape[2] < 3:
+            return
+
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        count = max(1, len(particles))
+        for rank, nodes in enumerate(particles):
+            finite = np.all(np.isfinite(nodes[:, :3]), axis=1)
+            if np.count_nonzero(finite) < 2:
+                continue
+            brightness = 1.0 - 0.55 * (rank / max(1, count - 1))
+            color = tuple(float(np.clip(channel * brightness, 0.0, 1.0)) for channel in PARTICLE_CHAIN_COLOR)
+            glColor3f(*color)
+            for idx in range(len(nodes) - 1):
+                if not (finite[idx] and finite[idx + 1]):
+                    continue
+                p0 = nodes[idx]
+                p1 = nodes[idx + 1]
+                glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
+                glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
+        glEnd()
 
     def _draw_point_set(self, points, color, point_size=5.0, max_points=900):
         points = np.asarray(points, dtype=np.float32)
@@ -1046,6 +1082,20 @@ class ZedDepthGLViewer:
             and len(self.cable_visible) == count
             and len(self.cable_extended_visible) == count
         )
+
+    @staticmethod
+    def _as_particle_nodes(particle_nodes):
+        if particle_nodes is None:
+            return np.empty((0, 0, 3), dtype=np.float32)
+        nodes = np.asarray(particle_nodes, dtype=np.float32)
+        if nodes.ndim != 3 or nodes.shape[1] < 2 or nodes.shape[2] < 3:
+            return np.empty((0, 0, 3), dtype=np.float32)
+        nodes = nodes[:, :, :3]
+        finite_chain = np.all(np.isfinite(nodes), axis=(1, 2))
+        nodes = nodes[finite_chain]
+        if len(nodes) == 0:
+            return np.empty((0, 0, 3), dtype=np.float32)
+        return np.ascontiguousarray(nodes, dtype=np.float32)
 
     def _node_color(self, idx, start_idx=None, end_idx=None):
         if start_idx is not None and int(idx) == int(start_idx):
