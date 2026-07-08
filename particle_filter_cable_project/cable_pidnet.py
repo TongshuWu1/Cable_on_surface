@@ -1,6 +1,6 @@
 from pathlib import Path
-from contextlib import nullcontext
 
+import cv2
 import numpy as np
 
 try:
@@ -169,67 +169,34 @@ class PIDNetSmallBinary(TorchModule):
 
 
 class PidNetSegmenter:
-    def __init__(self, checkpoint_path, device="auto", base_channels=24, amp=True):
+    def __init__(self, checkpoint_path, device="auto", base_channels=24):
         require_torch()
         self.checkpoint_path = Path(checkpoint_path)
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"PIDNet checkpoint not found: {self.checkpoint_path}")
         self.device = resolve_device(device)
-        self.use_amp = bool(amp) and self.device.type == "cuda"
-        if self.device.type == "cuda":
-            try:
-                torch.backends.cudnn.benchmark = True
-            except Exception:
-                pass
         payload = torch.load(self.checkpoint_path, map_location=self.device)
         config = payload.get("config", {}) if isinstance(payload, dict) else {}
         base_channels = int(config.get("base_channels", base_channels))
-        self.model = PIDNetSmallBinary(base_channels=base_channels)
-        if self.device.type == "cuda":
-            self.model = self.model.to(device=self.device, memory_format=torch.channels_last)
-        else:
-            self.model = self.model.to(self.device)
+        self.model = PIDNetSmallBinary(base_channels=base_channels).to(self.device)
         state_dict = payload.get("model_state", payload) if isinstance(payload, dict) else payload
         self.model.load_state_dict(state_dict)
         self.model.eval()
         self.mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
         self.std = torch.tensor(IMAGENET_STD, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
 
-    def _input_tensor(self, bgr):
-        bgr = np.asarray(bgr, dtype=np.uint8)
-        image = torch.from_numpy(np.ascontiguousarray(bgr[:, :, :3]))
-        image = image.to(self.device, non_blocking=True)
-        image = image.permute(2, 0, 1).unsqueeze(0)
-        image = image[:, [2, 1, 0], :, :].to(dtype=torch.float32).mul_(1.0 / 255.0)
-        if self.device.type == "cuda":
-            image = image.contiguous(memory_format=torch.channels_last)
-        else:
-            image = image.contiguous()
-        return (image - self.mean) / self.std
-
-    def _seg_logits(self, bgr):
-        image = self._input_tensor(bgr)
-        with cuda_autocast(self.use_amp):
-            return self.model(image)["seg"]
-
     @torch_inference_mode()
     def probability_map(self, bgr):
         bgr = np.asarray(bgr, dtype=np.uint8)
         if bgr.ndim != 3 or bgr.shape[2] < 3:
             return np.zeros(bgr.shape[:2], dtype=np.float32)
-        logits = self._seg_logits(bgr)
-        probability = torch.sigmoid(logits.float())[0, 0].detach().cpu().numpy()
+        rgb = cv2.cvtColor(bgr[:, :, :3], cv2.COLOR_BGR2RGB)
+        image = torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device, non_blocking=True)
+        image = image.permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        image = (image - self.mean) / self.std
+        logits = self.model(image)["seg"]
+        probability = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
         return np.ascontiguousarray(probability, dtype=np.float32)
-
-    @torch_inference_mode()
-    def binary_mask(self, bgr, threshold):
-        bgr = np.asarray(bgr, dtype=np.uint8)
-        if bgr.ndim != 3 or bgr.shape[2] < 3:
-            return np.zeros(bgr.shape[:2], dtype=np.uint8)
-        logits = self._seg_logits(bgr).float()[0, 0]
-        logit_threshold = probability_threshold_to_logit(threshold)
-        mask = (logits >= logit_threshold).to(torch.uint8) * 255
-        return np.ascontiguousarray(mask.detach().cpu().numpy(), dtype=np.uint8)
 
 
 class PidNetCableDetector(CableMaskDetector):
@@ -239,7 +206,6 @@ class PidNetCableDetector(CableMaskDetector):
         device="cuda",
         threshold=0.50,
         base_channels=24,
-        amp=True,
         min_area=80,
         keep_largest_component=False,
         max_components=0,
@@ -261,11 +227,12 @@ class PidNetCableDetector(CableMaskDetector):
             skeleton_prune_passes=skeleton_prune_passes,
             centerline_smooth_window=centerline_smooth_window,
         )
-        self.segmenter = PidNetSegmenter(checkpoint_path, device=device, base_channels=base_channels, amp=amp)
+        self.segmenter = PidNetSegmenter(checkpoint_path, device=device, base_channels=base_channels)
         self.threshold = float(threshold)
 
     def create_mask(self, bgr):
-        return self.segmenter.binary_mask(bgr, self.threshold)
+        probability = self.segmenter.probability_map(bgr)
+        return (probability >= self.threshold).astype(np.uint8) * 255
 
 
 def resolve_device(device):
@@ -276,17 +243,3 @@ def resolve_device(device):
     if resolved.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested for PIDNet, but torch.cuda.is_available() is false.")
     return resolved
-
-
-def cuda_autocast(enabled):
-    if torch is None or not bool(enabled):
-        return nullcontext()
-    try:
-        return torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
-    except TypeError:
-        return torch.cuda.amp.autocast(dtype=torch.float16, enabled=True)
-
-
-def probability_threshold_to_logit(threshold):
-    threshold = float(np.clip(threshold, 1e-6, 1.0 - 1e-6))
-    return float(np.log(threshold / (1.0 - threshold)))

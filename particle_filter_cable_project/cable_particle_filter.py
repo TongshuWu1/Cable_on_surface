@@ -18,19 +18,11 @@ except Exception:  # pragma: no cover - torch is optional for CPU-only use
 @dataclass
 class CableParticleFilterConfig:
     particle_count: int = 200
-    cable_length_m: float = 0.0
-    cable_length_scale: float = 1.0
     segment_length_m: float = 0.0
     initial_node_std_m: float = 0.025
     initial_direction_std: float = 0.10
-    initial_structured_fraction: float = 0.25
     process_node_std_m: float = 0.006
     process_direction_std: float = 0.020
-    velocity_prediction: bool = True
-    velocity_alpha: float = 0.35
-    velocity_decay: float = 0.90
-    velocity_deadband_mps: float = 0.06
-    max_velocity_mps: float = 0.40
     direction_smooth_passes: int = 1
     measurement_node_std_m: float = 0.030
     measurement_max_points: int = 1024
@@ -39,31 +31,25 @@ class CableParticleFilterConfig:
     endpoint_ordering: bool = True
     ordering_max_points: int = 384
     ordering_knn: int = 8
+    endpoint_refresh_interval: int = 0
     reference_ordering: bool = True
     reference_ordering_gate_m: float = 0.08
+    endpoint_penalty_weight: float = 1.0
+    measurement_reset_error_m: float = 0.25
     measurement_proposal_ratio: float = 0.30
     measurement_proposal_stable_ratio: float = 0.04
     measurement_proposal_start_error_m: float = 0.015
     measurement_proposal_full_error_m: float = 0.060
     measurement_proposal_node_std_m: float = 0.012
     measurement_proposal_direction_std: float = 0.025
-    measurement_proposal_wide_fraction: float = 0.20
-    measurement_proposal_current_fraction: float = 0.20
-    measurement_proposal_wide_std_multiplier: float = 3.0
-    estimate_mode: str = "top_clustered"
-    top_particle_count: int = 10
-    top_particle_cluster_gate_m: float = 0.030
-    endpoint_anchor_weight: float = 0.0
-    endpoint_anchor_projection: bool = False
-    endpoint_anchor_projection_gain: float = 0.0
-    endpoint_anchor_projection_passes: int = 1
-    endpoint_anchor_requires_marker: bool = True
+    score_keep_fraction: float = 0.80
+    coverage_penalty_m: float = 0.025
+    coverage_min_fraction: float = 0.05
+    bend_penalty_m: float = 0.030
     map_estimate_effective_ratio: float = 0.35
     min_measurement_points: int = 12
     min_segment_points: int = 4
     occlusion_assignment_max_distance_m: float = 0.12
-    occlusion_segment_scoring: bool = True
-    occlusion_segment_window: int = 1
     outlier_distance_m: float = 0.08
     resample_effective_ratio: float = 0.50
     max_prediction_frames: int = 12
@@ -79,14 +65,10 @@ class CableParticleFilterResult:
     lost_frames: int
     motion_noise_scale: float
     segment_length_m: float
-    prediction_step_m: float = 0.0
     measurement_point_count: int = 0
     visible_segments: np.ndarray | None = None
     visible_nodes: np.ndarray | None = None
     measurement_proposal_ratio: float = 0.0
-    estimate_mode: str = "top_clustered"
-    top_particles: np.ndarray | None = None
-    estimate_particle_count: int = 0
 
 
 class CableParticleFilter:
@@ -106,21 +88,14 @@ class CableParticleFilter:
         self.weights = None
         self.initialized = False
         self.lost_frames = 0
-        self.segment_length_m = fixed_segment_length_from_config(self.config, self.segment_count)
+        self.segment_length_m = fixed_segment_length_from_config(self.config)
         self.last_motion_noise_scale = 1.0
         self.last_visible_segments = np.zeros(self.segment_count, dtype=bool)
         self.last_visible_nodes = np.zeros(self.node_count, dtype=bool)
         self.last_measurement_point_count = 0
         self.last_measurement_proposal_ratio = 0.0
-        self.last_estimate_mode = str(getattr(self.config, "estimate_mode", "top_clustered"))
-        self.last_estimate_particle_count = 0
         self.last_ordered_measurement_nodes = None
-        self.last_endpoint_anchor_nodes = None
-        self.last_endpoint_anchor_from_marker = False
         self.measurement_update_count = 0
-        self.previous_estimate_nodes = None
-        self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
-        self.last_prediction_step_m = 0.0
 
     def step(self, measurement, dt=1.0 / 30.0, count_lost=True):
         dt = float(np.clip(dt, 1e-3, 0.20))
@@ -135,54 +110,34 @@ class CableParticleFilter:
                 self._initialize(measurement, measurement_points)
             else:
                 self._predict(dt, noise_scale=1.0)
-                reference_nodes = self._estimate_nodes()
-                measurement_nodes = self._measurement_nodes(
-                    measurement,
-                    measurement_points,
-                    reference_nodes=reference_nodes,
-                )
-                associated_points, segment_indices, visible_segments = self._associate_visible_points(
+                measurement_nodes = self._measurement_nodes(measurement, measurement_points)
+                if self._should_reset_to_measurement(measurement_nodes):
+                    self.initialized = False
+                    self._initialize(measurement, measurement_points)
+                    self.lost_frames = 0
+                    return self._estimate(measurement_used=True, prediction_only=False)
+                self._inject_measurement_proposals(measurement_nodes)
+                measurement_points, _segment_indices, visible_segments = self._associate_visible_points(
                     measurement_points,
                     candidate_nodes=measurement_nodes,
-                    reference_nodes=reference_nodes,
                 )
-                if associated_points is None:
-                    visible_segments = np.zeros(self.segment_count, dtype=bool)
-                    support_points = measurement_points
-                    support_segment_indices = None
-                else:
-                    support_points = associated_points
-                    support_segment_indices = segment_indices
-                endpoint_nodes = self._current_endpoint_anchor_nodes(measurement_nodes)
-                if not self.last_endpoint_anchor_from_marker:
-                    endpoint_nodes = mask_endpoint_nodes_by_visibility(endpoint_nodes, visible_segments, self.segment_count)
-                proposal_nodes = merge_visible_measurement_nodes(
-                    measurement_nodes,
-                    reference_nodes,
-                    visible_segments,
-                )
-                self._inject_measurement_proposals(proposal_nodes, current_nodes=reference_nodes)
-                self._anchor_particles_to_endpoints(endpoint_nodes)
-                if support_points is None:
+                if measurement_points is None:
                     self.last_measurement_point_count = 0
-                    result = self._prediction_only_after_update_drop()
-                    return self._finalize_result(result, dt)
-                self.last_measurement_point_count = int(len(support_points))
+                    return self._prediction_only_after_update_drop()
+                self.last_measurement_point_count = int(len(measurement_points))
                 self._weight(
-                    support_points,
+                    measurement_points,
                     visible_segments=visible_segments,
-                    endpoint_nodes=endpoint_nodes,
-                    segment_indices=support_segment_indices,
+                    measurement_nodes=measurement_nodes,
                 )
                 self._set_visibility(visible_segments)
                 result = self._estimate(measurement_used=True, prediction_only=False)
                 self._maybe_resample(noise_scale=self.last_motion_noise_scale)
                 self.lost_frames = 0
-                return self._finalize_result(result, dt)
+                return result
 
             self.lost_frames = 0
-            result = self._estimate(measurement_used=True, prediction_only=False)
-            return self._finalize_result(result, dt)
+            return self._estimate(measurement_used=True, prediction_only=False)
 
         if not self.initialized:
             return None
@@ -192,9 +147,6 @@ class CableParticleFilter:
             self.lost_frames += 1
         if self.lost_frames > int(self.config.max_prediction_frames):
             self.initialized = False
-            self.last_endpoint_anchor_nodes = None
-            self.last_endpoint_anchor_from_marker = False
-            self._reset_motion_state()
             return None
 
         self.last_motion_noise_scale = min(
@@ -206,109 +158,56 @@ class CableParticleFilter:
             self._set_visibility(np.zeros(self.segment_count, dtype=bool))
         result = self._estimate(measurement_used=False, prediction_only=True)
         self._maybe_resample(force=self.lost_frames > 1, noise_scale=self.last_motion_noise_scale)
-        return self._finalize_result(result, dt)
+        return result
 
     def _initialize(self, measurement, measurement_points):
         nodes = self._initial_nodes(measurement, measurement_points)
         if nodes is None:
             return
 
-        endpoint_nodes = measurement_endpoint_nodes(measurement, reference_nodes=nodes)
-        self.last_endpoint_anchor_from_marker = endpoint_nodes is not None
-        if endpoint_nodes is None:
-            endpoint_nodes = endpoint_nodes_from_chain(nodes)
         if self.segment_length_m is None:
             self.segment_length_m = estimate_equal_segment_length(nodes, self.segment_count)
         nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
         if nodes is None:
             return
-        marker_endpoint_nodes = measurement_endpoint_nodes(measurement, reference_nodes=nodes)
-        if marker_endpoint_nodes is not None:
-            endpoint_nodes = marker_endpoint_nodes
-            self.last_endpoint_anchor_from_marker = True
-        if endpoint_nodes is None:
-            endpoint_nodes = endpoint_nodes_from_chain(nodes)
-        self.last_endpoint_anchor_nodes = endpoint_nodes
         self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
+        directions = chain_directions(nodes)
         count = max(32, int(self.config.particle_count))
-        structured_fraction = float(
-            np.clip(getattr(self.config, "initial_structured_fraction", 0.25), 0.0, 0.80)
+
+        starts = nodes[0][None, :] + self.rng.normal(
+            0.0,
+            float(self.config.initial_node_std_m),
+            (count, 3),
         )
-        structured_count = min(count, max(1, int(round(count * structured_fraction))))
-        particle_sets = [
-            structured_initial_chains_around_nodes(
-                nodes,
-                structured_count,
-                self.segment_length_m,
-                node_std_m=float(self.config.initial_node_std_m),
-                direction_std=float(self.config.initial_direction_std),
-                direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-            )
-        ]
-        random_count = count - sum(len(particles) for particles in particle_sets)
-        if random_count > 0:
-            particle_sets.append(
-                sample_noisy_chains_around_nodes(
-                    nodes,
-                    random_count,
-                    self.segment_length_m,
-                    self.rng,
-                    node_std_m=float(self.config.initial_node_std_m),
-                    direction_std=float(self.config.initial_direction_std),
-                    direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-                )
-            )
-        particle_sets = [particles for particles in particle_sets if particles.ndim == 3 and len(particles)]
-        if not particle_sets:
-            return
-        self.particles = np.concatenate(particle_sets, axis=0)
-        if len(self.particles) > count:
-            self.particles = self.particles[:count]
-        if len(self.particles) < count:
-            extra = sample_noisy_chains_around_nodes(
-                nodes,
-                count - len(self.particles),
-                self.segment_length_m,
-                self.rng,
-                node_std_m=float(self.config.initial_node_std_m),
-                direction_std=float(self.config.initial_direction_std),
-                direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-            )
-            if len(extra):
-                self.particles = np.concatenate([self.particles, extra], axis=0)
-        self.particles = np.ascontiguousarray(self.particles, dtype=np.float64)
-        count = len(self.particles)
-        if count == 0:
-            return
+        direction_noise = self.rng.normal(
+            0.0,
+            float(self.config.initial_direction_std),
+            (count, self.segment_count, 3),
+        )
+        particle_directions = smooth_particle_directions(
+            normalize_vectors(directions[None, :, :] + direction_noise),
+            passes=int(getattr(self.config, "direction_smooth_passes", 1)),
+        )
+        self.particles = build_chains(starts, particle_directions, self.segment_length_m)
         self.weights = np.full(count, 1.0 / count, dtype=np.float64)
-        active_endpoint_nodes = self._current_endpoint_anchor_nodes(nodes)
-        self._anchor_particles_to_endpoints(active_endpoint_nodes)
         self.initialized = True
         self.last_motion_noise_scale = 1.0
         self.last_measurement_proposal_ratio = 0.0
         self.measurement_update_count = 1
         _points, _indices, visible_segments = self._associate_visible_points(measurement_points)
-        self.last_measurement_point_count = int(len(measurement_points))
-        self._weight(measurement_points, visible_segments=visible_segments, endpoint_nodes=active_endpoint_nodes)
         self._set_visibility(visible_segments)
-        self._reset_motion_state(nodes)
 
     def _predict(self, dt, noise_scale=1.0):
         if self.particles is None or self.segment_length_m is None:
             return
         noise_scale = float(np.clip(noise_scale, 0.25, self.config.max_motion_noise_scale))
         self.last_motion_noise_scale = noise_scale
-        predicted_particles = self.particles
-        prediction_delta = self._prediction_delta(dt)
-        if prediction_delta is not None:
-            predicted_particles = self.particles + prediction_delta[None, :, :]
-
-        starts = predicted_particles[:, 0, :] + self.rng.normal(
+        starts = self.particles[:, 0, :] + self.rng.normal(
             0.0,
             float(self.config.process_node_std_m) * noise_scale,
             (len(self.particles), 3),
         )
-        directions = particle_directions(predicted_particles)
+        directions = particle_directions(self.particles)
         directions = normalize_vectors(
             directions
             + self.rng.normal(
@@ -323,47 +222,32 @@ class CableParticleFilter:
         )
         self.particles = build_chains(starts, directions, self.segment_length_m)
 
-    def _prediction_delta(self, dt):
-        self.last_prediction_step_m = 0.0
-        if not bool(getattr(self.config, "velocity_prediction", True)):
-            return None
-
-        velocity = np.asarray(self.node_velocity_mps, dtype=np.float64)
-        if velocity.shape != (self.node_count, 3) or not np.all(np.isfinite(velocity)):
-            self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
-            return None
-
-        delta = velocity * float(np.clip(dt, 1e-3, 0.20))
-        max_step = max(0.0, float(getattr(self.config, "max_velocity_mps", 0.40))) * float(np.clip(dt, 1e-3, 0.20))
-        if max_step > 0.0:
-            delta = clamp_node_vectors(delta, max_norm=max_step)
-        step_m = max_node_vector_norm(delta)
-        self.last_prediction_step_m = float(step_m)
-        if step_m <= 1e-9:
-            return None
-        return np.ascontiguousarray(delta, dtype=np.float64)
-
-    def _weight(self, measurement_points, visible_segments=None, endpoint_nodes=None, segment_indices=None):
+    def _weight(self, measurement_points, visible_segments=None, measurement_nodes=None):
         sigma = max(float(self.config.measurement_node_std_m), 1e-5)
         outlier_distance = max(float(self.config.outlier_distance_m), sigma)
-        scoring_segment_indices = None
-        if bool(getattr(self.config, "occlusion_segment_scoring", True)):
-            scoring_segment_indices = segment_indices
+        expected_segments = None
+        if visible_segments is not None:
+            visible_segments = np.asarray(visible_segments, dtype=bool).reshape(-1)
+            expected_segments = np.flatnonzero(visible_segments)
         scores = particle_distance_scores(
             measurement_points,
             self.particles,
             outlier_distance=outlier_distance,
-            segment_indices=scoring_segment_indices,
-            segment_window=int(getattr(self.config, "occlusion_segment_window", 1)),
+            score_keep_fraction=float(self.config.score_keep_fraction),
+            coverage_penalty_m=float(self.config.coverage_penalty_m),
+            coverage_min_fraction=float(self.config.coverage_min_fraction),
+            bend_penalty_m=float(getattr(self.config, "bend_penalty_m", 0.0)),
+            expected_segments=expected_segments,
             backend=str(getattr(self.config, "scoring_backend", "auto")),
             chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
         )
-        endpoint_weight = max(0.0, float(getattr(self.config, "endpoint_anchor_weight", 0.0)))
-        if endpoint_weight > 0.0:
-            scores = scores + endpoint_weight * endpoint_anchor_scores(self.particles, endpoint_nodes)
 
         if not np.any(np.isfinite(scores)):
             return
+
+        endpoint_weight = float(getattr(self.config, "endpoint_penalty_weight", 0.0))
+        if endpoint_weight > 0.0 and measurement_nodes is not None:
+            scores = scores + endpoint_order_penalty(self.particles, measurement_nodes, weight=endpoint_weight)
 
         finite_scores = np.where(np.isfinite(scores), scores, np.nanmax(scores[np.isfinite(scores)]) + outlier_distance**2)
         log_likelihood = -0.5 * finite_scores / (sigma * sigma)
@@ -375,82 +259,6 @@ class CableParticleFilter:
             self.weights.fill(1.0 / len(self.weights))
             return
         self.weights = weighted / total
-
-    def _finalize_result(self, result, dt):
-        if result is None:
-            return None
-        self._update_motion_state(
-            result.points_xyz,
-            dt=dt,
-            measurement_used=bool(result.measurement_used),
-            prediction_only=bool(result.prediction_only),
-            visible_nodes=result.visible_nodes,
-        )
-        return result
-
-    def _reset_motion_state(self, nodes=None):
-        self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
-        node_array = finite_node_chain(nodes, self.node_count)
-        self.previous_estimate_nodes = None if node_array is None else node_array.copy()
-        self.last_prediction_step_m = 0.0
-
-    def _update_motion_state(self, nodes, dt, measurement_used, prediction_only, visible_nodes=None):
-        node_array = finite_node_chain(nodes, self.node_count)
-        if node_array is None:
-            return
-        if self.previous_estimate_nodes is None:
-            self.previous_estimate_nodes = node_array.copy()
-            self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
-            return
-
-        current_velocity = np.asarray(self.node_velocity_mps, dtype=np.float64)
-        if current_velocity.shape != (self.node_count, 3) or not np.all(np.isfinite(current_velocity)):
-            current_velocity = np.zeros((self.node_count, 3), dtype=np.float64)
-
-        if not bool(getattr(self.config, "velocity_prediction", True)):
-            self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
-            self.previous_estimate_nodes = node_array.copy()
-            return
-
-        decay = float(np.clip(getattr(self.config, "velocity_decay", 0.90), 0.0, 1.0))
-        if prediction_only or not measurement_used:
-            self.node_velocity_mps = current_velocity * decay
-            self.previous_estimate_nodes = node_array.copy()
-            return
-
-        visible = np.asarray(visible_nodes, dtype=bool).reshape(-1) if visible_nodes is not None else np.ones(self.node_count, dtype=bool)
-        if len(visible) != self.node_count:
-            visible = np.ones(self.node_count, dtype=bool)
-        if not np.any(visible):
-            self.node_velocity_mps = current_velocity * decay
-            self.previous_estimate_nodes = node_array.copy()
-            return
-
-        previous = finite_node_chain(self.previous_estimate_nodes, self.node_count)
-        if previous is None:
-            self.previous_estimate_nodes = node_array.copy()
-            self.node_velocity_mps = np.zeros((self.node_count, 3), dtype=np.float64)
-            return
-
-        measured_velocity = (node_array - previous) / max(float(dt), 1e-3)
-        max_velocity = max(0.0, float(getattr(self.config, "max_velocity_mps", 0.40)))
-        if max_velocity > 0.0:
-            measured_velocity = clamp_node_vectors(measured_velocity, max_norm=max_velocity)
-            current_velocity = clamp_node_vectors(current_velocity, max_norm=max_velocity)
-        deadband = max(0.0, float(getattr(self.config, "velocity_deadband_mps", 0.0)))
-        if deadband > 0.0:
-            measured_velocity = zero_small_node_vectors(measured_velocity, min_norm=deadband)
-            current_velocity = zero_small_node_vectors(current_velocity, min_norm=deadband)
-
-        alpha = float(np.clip(getattr(self.config, "velocity_alpha", 0.35), 0.0, 1.0))
-        updated_velocity = current_velocity * decay
-        updated_velocity[visible] = (1.0 - alpha) * current_velocity[visible] + alpha * measured_velocity[visible]
-        if max_velocity > 0.0:
-            updated_velocity = clamp_node_vectors(updated_velocity, max_norm=max_velocity)
-        if deadband > 0.0:
-            updated_velocity = zero_small_node_vectors(updated_velocity, min_norm=deadband)
-        self.node_velocity_mps = np.ascontiguousarray(updated_velocity, dtype=np.float64)
-        self.previous_estimate_nodes = node_array.copy()
 
     def _maybe_resample(self, force=False, noise_scale=1.0):
         if self.weights is None or self.particles is None:
@@ -499,113 +307,23 @@ class CableParticleFilter:
             lost_frames=int(self.lost_frames),
             motion_noise_scale=float(self.last_motion_noise_scale),
             segment_length_m=float(self.segment_length_m),
-            prediction_step_m=float(self.last_prediction_step_m),
             measurement_point_count=int(self.last_measurement_point_count),
             visible_segments=self.last_visible_segments.copy(),
             visible_nodes=self.last_visible_nodes.copy(),
             measurement_proposal_ratio=float(self.last_measurement_proposal_ratio),
-            estimate_mode=str(self.last_estimate_mode),
-            top_particles=self._top_particles(),
-            estimate_particle_count=int(self.last_estimate_particle_count),
         )
 
     def _estimate_nodes(self):
-        estimate_mode = str(getattr(self.config, "estimate_mode", "top_clustered")).strip().lower()
-        if estimate_mode not in {"auto", "map", "weighted", "top_weighted", "top_clustered"}:
-            estimate_mode = "top_clustered"
-        self.last_estimate_mode = estimate_mode
-
-        if estimate_mode == "map":
-            self.last_estimate_mode = "map"
-            self.last_estimate_particle_count = 1
-            return np.asarray(self.particles[int(np.argmax(self.weights))], dtype=np.float32)
-
-        if estimate_mode == "top_clustered":
-            return self._top_clustered_nodes()
-
-        if estimate_mode == "top_weighted":
-            return self._top_weighted_nodes()
-
-        if estimate_mode == "auto":
-            map_ratio = float(getattr(self.config, "map_estimate_effective_ratio", 0.0))
-            if map_ratio > 0.0 and self.particles is not None and self.weights is not None and len(self.weights):
-                effective_ratio = self._effective_sample_size() / max(len(self.weights), 1)
-                if effective_ratio <= map_ratio:
-                    self.last_estimate_mode = "map"
-                    self.last_estimate_particle_count = 1
-                    return np.asarray(self.particles[int(np.argmax(self.weights))], dtype=np.float32)
-            self.last_estimate_mode = "weighted"
-
+        map_ratio = float(getattr(self.config, "map_estimate_effective_ratio", 0.0))
+        if map_ratio > 0.0 and self.particles is not None and self.weights is not None and len(self.weights):
+            effective_ratio = self._effective_sample_size() / max(len(self.weights), 1)
+            if effective_ratio <= map_ratio:
+                return np.asarray(self.particles[int(np.argmax(self.weights))], dtype=np.float32)
         starts = self.particles[:, 0, :]
         start = np.average(starts, axis=0, weights=self.weights)
         directions = np.average(particle_directions(self.particles), axis=0, weights=self.weights)
         directions = normalize_vectors(directions)
-        self.last_estimate_particle_count = len(self.weights)
         return build_chain(start, directions, self.segment_length_m)
-
-    def _top_weighted_nodes(self):
-        if self.particles is None or self.weights is None or self.segment_length_m is None:
-            return None
-        indices = self._top_particle_indices(min_count=1)
-        return self._weighted_nodes_from_indices(indices, estimate_mode="top_weighted")
-
-    def _top_clustered_nodes(self):
-        if self.particles is None or self.weights is None or self.segment_length_m is None:
-            return None
-        indices = self._top_particle_indices(min_count=1)
-        if len(indices) == 0:
-            return None
-
-        reference = self.particles[indices[0], :, :3]
-        candidates = self.particles[indices, :, :3]
-        distances = np.mean(np.linalg.norm(candidates - reference[None, :, :], axis=2), axis=1)
-        gate_m = max(0.0, float(getattr(self.config, "top_particle_cluster_gate_m", 0.030)))
-        if gate_m > 0.0:
-            clustered = indices[distances <= gate_m]
-        else:
-            clustered = indices
-        if len(clustered) == 0:
-            clustered = indices[:1]
-        return self._weighted_nodes_from_indices(clustered, estimate_mode="top_clustered")
-
-    def _weighted_nodes_from_indices(self, indices, estimate_mode):
-        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
-        if len(indices) == 0:
-            return None
-        top_weights = np.asarray(self.weights[indices], dtype=np.float64)
-        total = float(np.sum(top_weights))
-        if not np.isfinite(total) or total <= 1e-12:
-            top_weights = np.full(len(indices), 1.0 / len(indices), dtype=np.float64)
-        else:
-            top_weights = top_weights / total
-        top_particles = self.particles[indices]
-        start = np.average(top_particles[:, 0, :], axis=0, weights=top_weights)
-        directions = np.average(particle_directions(top_particles), axis=0, weights=top_weights)
-        directions = normalize_vectors(directions)
-        self.last_estimate_mode = str(estimate_mode)
-        self.last_estimate_particle_count = int(len(indices))
-        return build_chain(start, directions, self.segment_length_m)
-
-    def _top_particles(self):
-        if self.particles is None or self.weights is None:
-            return np.empty((0, self.node_count, 3), dtype=np.float32)
-        indices = self._top_particle_indices(min_count=0)
-        if len(indices) == 0:
-            return np.empty((0, self.node_count, 3), dtype=np.float32)
-        return np.ascontiguousarray(self.particles[indices, :, :3], dtype=np.float32)
-
-    def _top_particle_indices(self, min_count=0):
-        if self.weights is None:
-            return np.empty(0, dtype=np.int64)
-        count = max(0, int(getattr(self.config, "top_particle_count", 10)))
-        count = max(int(min_count), count)
-        if count == 0:
-            return np.empty(0, dtype=np.int64)
-        count = min(count, len(self.weights))
-        if count >= len(self.weights):
-            return np.argsort(self.weights)[::-1]
-        candidates = np.argpartition(self.weights, -count)[-count:]
-        return candidates[np.argsort(self.weights[candidates])[::-1]]
 
     def _measurement_points(self, measurement):
         if measurement is None:
@@ -629,76 +347,48 @@ class CableParticleFilter:
             nodes = self._fit_measurement_point_chain(measurement_points)
         return nodes
 
-    def _measurement_nodes(self, measurement, measurement_points, reference_nodes=None):
-        self.last_endpoint_anchor_nodes = None
-        self.last_endpoint_anchor_from_marker = False
+    def _measurement_nodes(self, measurement, measurement_points):
         candidate = valid_points(getattr(measurement, "points_xyz", None))
         if len(candidate) >= 2:
             nodes = fit_polyline_segments(candidate, segment_count=self.segment_count)
         else:
+            reference_nodes = self._estimate_nodes() if self.initialized and self.particles is not None else None
+            force_endpoint = self._should_refresh_endpoint_ordering()
             nodes = self._fit_measurement_point_chain(
                 measurement_points,
                 reference_nodes=reference_nodes,
-                allow_endpoint_fallback=self.lost_frames > 0,
+                allow_endpoint_fallback=self.lost_frames > 0 or force_endpoint,
+                force_endpoint=force_endpoint,
             )
             self.measurement_update_count += 1
         if nodes is None or self.segment_length_m is None:
             return None
-        if reference_nodes is not None:
-            nodes = align_polyline_orientation(reference_nodes, nodes)
-        endpoint_nodes = measurement_endpoint_nodes(measurement, reference_nodes=nodes)
-        if endpoint_nodes is not None:
-            self.last_endpoint_anchor_from_marker = True
-        else:
-            endpoint_nodes = endpoint_nodes_from_chain(nodes)
         nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
         if nodes is None:
             return None
-        marker_endpoint_nodes = measurement_endpoint_nodes(measurement, reference_nodes=nodes)
-        if marker_endpoint_nodes is not None:
-            endpoint_nodes = marker_endpoint_nodes
-            self.last_endpoint_anchor_from_marker = True
-        self.last_endpoint_anchor_nodes = endpoint_nodes
+        if self.initialized and self.particles is not None:
+            nodes = align_polyline_orientation(self._estimate_nodes(), nodes)
         self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
         return np.ascontiguousarray(nodes, dtype=np.float64)
-
-    def _current_endpoint_anchor_nodes(self, measurement_nodes=None):
-        endpoint_nodes = endpoint_pair_array(self.last_endpoint_anchor_nodes, allow_partial=True)
-        requires_marker = bool(getattr(self.config, "endpoint_anchor_requires_marker", True))
-        if endpoint_nodes is not None and (self.last_endpoint_anchor_from_marker or not requires_marker):
-            return endpoint_nodes
-        if requires_marker:
-            return None
-        return endpoint_nodes_from_chain(measurement_nodes)
-
-    def _anchor_particles_to_endpoints(self, endpoint_nodes):
-        if (
-            not bool(getattr(self.config, "endpoint_anchor_projection", True))
-            or self.particles is None
-            or self.segment_length_m is None
-        ):
-            return
-        endpoint_nodes = endpoint_pair_array(endpoint_nodes, allow_partial=True)
-        if endpoint_nodes is None:
-            return
-        passes = max(1, int(getattr(self.config, "endpoint_anchor_projection_passes", 1)))
-        for _ in range(passes):
-            anchored = anchor_particle_chains_to_endpoints(
-                self.particles,
-                endpoint_nodes,
-                self.segment_length_m,
-                gain=float(getattr(self.config, "endpoint_anchor_projection_gain", 1.0)),
-            )
-            if anchored.shape != self.particles.shape:
-                return
-            self.particles = anchored
 
     def _fit_measurement_point_chain(
         self,
         measurement_points,
         reference_nodes=None,
         allow_endpoint_fallback=True,
+        force_endpoint=False,
     ):
+        if bool(force_endpoint):
+            nodes = fit_unordered_point_cloud_chain(
+                measurement_points,
+                segment_count=self.segment_count,
+                endpoint_ordering=bool(getattr(self.config, "endpoint_ordering", True)),
+                max_points=int(getattr(self.config, "ordering_max_points", 768)),
+                knn=int(getattr(self.config, "ordering_knn", 10)),
+            )
+            if nodes is not None:
+                return nodes
+
         if bool(getattr(self.config, "reference_ordering", True)) and reference_nodes is not None:
             nodes = fit_reference_ordered_point_cloud_chain(
                 measurement_points,
@@ -727,12 +417,20 @@ class CableParticleFilter:
                 return cached.copy()
         return None
 
-    def _inject_measurement_proposals(self, measurement_nodes, current_nodes=None):
+    def _should_refresh_endpoint_ordering(self):
+        interval = int(getattr(self.config, "endpoint_refresh_interval", 0))
+        if interval <= 0 or not bool(getattr(self.config, "endpoint_ordering", True)):
+            return False
+        if self.lost_frames > 0:
+            return True
+        return int(self.measurement_update_count) > 0 and int(self.measurement_update_count) % interval == 0
+
+    def _inject_measurement_proposals(self, measurement_nodes):
         if measurement_nodes is None or self.particles is None or self.weights is None or self.segment_length_m is None:
             self.last_measurement_proposal_ratio = 0.0
             return
 
-        ratio = self._adaptive_measurement_proposal_ratio(measurement_nodes, current_nodes=current_nodes)
+        ratio = self._adaptive_measurement_proposal_ratio(measurement_nodes)
         self.last_measurement_proposal_ratio = float(ratio)
         if ratio <= 0.0:
             return
@@ -740,12 +438,15 @@ class CableParticleFilter:
         proposal_count = int(round(ratio * total_count))
         proposal_count = int(np.clip(proposal_count, 1, total_count))
 
-        proposals = self._mixed_measurement_proposals(measurement_nodes, proposal_count, current_nodes=current_nodes)
-        if len(proposals) == 0:
-            self.last_measurement_proposal_ratio = 0.0
-            return
-        proposal_count = min(proposal_count, len(proposals))
-        proposals = proposals[:proposal_count]
+        proposals = sample_noisy_chains_around_nodes(
+            measurement_nodes,
+            proposal_count,
+            self.segment_length_m,
+            self.rng,
+            node_std_m=float(self.config.measurement_proposal_node_std_m),
+            direction_std=float(self.config.measurement_proposal_direction_std),
+            direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
+        )
         replace_indices = self.rng.choice(total_count, size=proposal_count, replace=False)
         self.particles[replace_indices] = proposals
 
@@ -757,94 +458,15 @@ class CableParticleFilter:
         else:
             self.weights.fill(1.0 / total_count)
 
-    def _mixed_measurement_proposals(self, measurement_nodes, proposal_count, current_nodes=None):
-        proposal_count = max(0, int(proposal_count))
-        if proposal_count == 0 or self.segment_length_m is None:
-            return np.empty((0, self.node_count, 3), dtype=np.float64)
+    def _should_reset_to_measurement(self, measurement_nodes):
+        threshold = float(getattr(self.config, "measurement_reset_error_m", 0.0))
+        if threshold <= 0.0 or measurement_nodes is None or not self.initialized:
+            return False
+        current_nodes = self._estimate_nodes()
+        error_m = mean_node_distance(current_nodes, measurement_nodes)
+        return bool(np.isfinite(error_m) and error_m > threshold)
 
-        base_node_std = max(0.0, float(self.config.measurement_proposal_node_std_m))
-        base_direction_std = max(0.0, float(self.config.measurement_proposal_direction_std))
-        smooth_passes = int(getattr(self.config, "direction_smooth_passes", 1))
-        current_nodes = finite_node_chain(current_nodes, self.node_count)
-
-        current_fraction = float(np.clip(getattr(self.config, "measurement_proposal_current_fraction", 0.0), 0.0, 0.8))
-        wide_fraction = float(np.clip(getattr(self.config, "measurement_proposal_wide_fraction", 0.0), 0.0, 0.8))
-        if current_nodes is None:
-            current_fraction = 0.0
-        if current_fraction + wide_fraction > 0.9:
-            scale = 0.9 / (current_fraction + wide_fraction)
-            current_fraction *= scale
-            wide_fraction *= scale
-
-        current_count = int(round(proposal_count * current_fraction))
-        wide_count = int(round(proposal_count * wide_fraction))
-        if current_count + wide_count > proposal_count:
-            overflow = current_count + wide_count - proposal_count
-            wide_drop = min(wide_count, overflow)
-            wide_count -= wide_drop
-            current_count -= max(0, overflow - wide_drop)
-        measurement_count = proposal_count - current_count - wide_count
-
-        proposal_sets = []
-        if measurement_count > 0:
-            proposal_sets.append(
-                sample_noisy_chains_around_nodes(
-                    measurement_nodes,
-                    measurement_count,
-                    self.segment_length_m,
-                    self.rng,
-                    node_std_m=base_node_std,
-                    direction_std=base_direction_std,
-                    direction_smooth_passes=smooth_passes,
-                )
-            )
-        if wide_count > 0:
-            multiplier = max(1.0, float(getattr(self.config, "measurement_proposal_wide_std_multiplier", 3.0)))
-            proposal_sets.append(
-                sample_noisy_chains_around_nodes(
-                    measurement_nodes,
-                    wide_count,
-                    self.segment_length_m,
-                    self.rng,
-                    node_std_m=base_node_std * multiplier,
-                    direction_std=base_direction_std * multiplier,
-                    direction_smooth_passes=smooth_passes,
-                )
-            )
-        if current_count > 0 and current_nodes is not None:
-            proposal_sets.append(
-                sample_noisy_chains_around_nodes(
-                    current_nodes,
-                    current_count,
-                    self.segment_length_m,
-                    self.rng,
-                    node_std_m=base_node_std * 0.75,
-                    direction_std=base_direction_std * 0.75,
-                    direction_smooth_passes=smooth_passes,
-                )
-            )
-
-        proposal_sets = [item for item in proposal_sets if item.ndim == 3 and len(item)]
-        if not proposal_sets:
-            return np.empty((0, self.node_count, 3), dtype=np.float64)
-        proposals = np.concatenate(proposal_sets, axis=0)
-        if len(proposals) > proposal_count:
-            proposals = proposals[:proposal_count]
-        if len(proposals) < proposal_count:
-            extra = sample_noisy_chains_around_nodes(
-                measurement_nodes,
-                proposal_count - len(proposals),
-                self.segment_length_m,
-                self.rng,
-                node_std_m=base_node_std,
-                direction_std=base_direction_std,
-                direction_smooth_passes=smooth_passes,
-            )
-            if len(extra):
-                proposals = np.concatenate([proposals, extra], axis=0)
-        return np.ascontiguousarray(proposals, dtype=np.float64)
-
-    def _adaptive_measurement_proposal_ratio(self, measurement_nodes, current_nodes=None):
+    def _adaptive_measurement_proposal_ratio(self, measurement_nodes):
         max_ratio = float(np.clip(self.config.measurement_proposal_ratio, 0.0, 1.0))
         if max_ratio <= 0.0 or measurement_nodes is None:
             return 0.0
@@ -852,6 +474,7 @@ class CableParticleFilter:
             return max_ratio
 
         stable_ratio = float(np.clip(self.config.measurement_proposal_stable_ratio, 0.0, max_ratio))
+        current_nodes = self._estimate_nodes() if self.initialized else None
         error_m = mean_node_distance(current_nodes, measurement_nodes)
         if not np.isfinite(error_m):
             return max_ratio
@@ -866,9 +489,8 @@ class CableParticleFilter:
         blend = (error_m - start_error) / (full_error - start_error)
         return stable_ratio + blend * (max_ratio - stable_ratio)
 
-    def _associate_visible_points(self, measurement_points, candidate_nodes=None, reference_nodes=None):
-        if reference_nodes is None and self.initialized:
-            reference_nodes = self._estimate_nodes()
+    def _associate_visible_points(self, measurement_points, candidate_nodes=None):
+        reference_nodes = self._estimate_nodes() if self.initialized else None
         if reference_nodes is None:
             visible_segments = np.ones(self.segment_count, dtype=bool)
             return measurement_points, None, visible_segments
@@ -911,9 +533,6 @@ class CableParticleFilter:
         self._set_visibility(np.zeros(self.segment_count, dtype=bool))
         if self.lost_frames > int(self.config.max_prediction_frames):
             self.initialized = False
-            self.last_endpoint_anchor_nodes = None
-            self.last_endpoint_anchor_from_marker = False
-            self._reset_motion_state()
             return None
         result = self._estimate(measurement_used=False, prediction_only=True)
         self._maybe_resample(force=self.lost_frames > 1, noise_scale=self.last_motion_noise_scale)
@@ -984,18 +603,14 @@ def filtered_cable_estimate(measurement, result):
         source_points=source_points,
         residual_m=polyline_residual(source_points, result.points_xyz) if len(source_points) else 0.0,
         method=(
-            f"raw fixed-length segment particle filter {mode} {result.estimate_mode} estimate | {base_method} | "
+            f"raw fixed-length segment particle filter {mode} | {base_method} | "
             f"segment_length={result.segment_length_m:.4f}m ess={result.effective_sample_size:.0f} "
             f"support={result.measurement_point_count} lost={result.lost_frames}"
         ),
     )
 
 
-def fixed_segment_length_from_config(config, segment_count=None):
-    cable_length = float(getattr(config, "cable_length_m", 0.0))
-    if cable_length > 0.0 and segment_count is not None:
-        length_scale = float(np.clip(getattr(config, "cable_length_scale", 1.0), 0.50, 1.20))
-        return (cable_length * length_scale) / max(1, int(segment_count))
+def fixed_segment_length_from_config(config):
     length = float(getattr(config, "segment_length_m", 0.0))
     return length if length > 0.0 else None
 
@@ -1317,126 +932,13 @@ def project_equal_length_chain(nodes, segment_length_m, node_count=None):
     return build_chain(nodes[0], directions, float(segment_length_m))
 
 
-def endpoint_nodes_from_chain(nodes):
-    return endpoint_pair_array(nodes, allow_partial=False)
-
-
-def measurement_endpoint_nodes(measurement, reference_nodes=None):
-    endpoints = endpoint_pair_array(getattr(measurement, "endpoint_nodes", None), allow_partial=True)
-    if endpoints is None:
-        return None
-    return align_endpoint_pair_to_reference(endpoints, reference_nodes)
-
-
-def align_endpoint_pair_to_reference(endpoint_nodes, reference_nodes=None):
-    endpoints = endpoint_pair_array(endpoint_nodes, allow_partial=True)
-    reference = endpoint_pair_array(reference_nodes, allow_partial=False)
-    if endpoints is None or reference is None:
-        return endpoints
-
-    finite = np.all(np.isfinite(endpoints), axis=1)
-    if np.all(finite):
-        direct = float(np.linalg.norm(endpoints[0] - reference[0]) + np.linalg.norm(endpoints[-1] - reference[-1]))
-        reverse = float(np.linalg.norm(endpoints[-1] - reference[0]) + np.linalg.norm(endpoints[0] - reference[-1]))
-        return endpoints if direct <= reverse else endpoints[::-1].copy()
-
-    if np.any(finite):
-        idx = int(np.flatnonzero(finite)[0])
-        direct = float(np.linalg.norm(endpoints[idx] - reference[idx]))
-        reverse = float(np.linalg.norm(endpoints[idx] - reference[1 - idx]))
-        return endpoints if direct <= reverse else endpoints[::-1].copy()
-    return None
-
-
-def endpoint_pair_array(nodes, allow_partial=False):
-    if nodes is None:
-        return None
-    points = np.asarray(nodes, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] < 3 or len(points) < 2:
-        return None
-    if len(points) == 2:
-        endpoints = np.ascontiguousarray(points[:, :3], dtype=np.float64)
-    else:
-        endpoints = np.ascontiguousarray([points[0, :3], points[-1, :3]], dtype=np.float64)
-    finite = np.all(np.isfinite(endpoints), axis=1)
-    if allow_partial:
-        return endpoints if np.any(finite) else None
-    return endpoints if np.all(finite) else None
-
-
-def mask_endpoint_nodes_by_visibility(endpoint_nodes, visible_segments, segment_count):
-    endpoints = endpoint_pair_array(endpoint_nodes, allow_partial=False)
-    if endpoints is None:
-        return None
-    visible = np.asarray(visible_segments, dtype=bool).reshape(-1)
-    if len(visible) != int(segment_count):
-        return endpoints
-    masked = endpoints.copy()
-    if len(visible) and not bool(visible[0]):
-        masked[0, :] = np.nan
-    if len(visible) and not bool(visible[-1]):
-        masked[-1, :] = np.nan
-    return masked if np.any(np.all(np.isfinite(masked), axis=1)) else None
-
-
-def endpoint_anchor_scores(particles, endpoint_nodes):
-    particles = valid_particles(particles)
-    endpoint_nodes = endpoint_pair_array(endpoint_nodes, allow_partial=True)
-    if len(particles) == 0:
-        return np.empty(0, dtype=np.float64)
-    if endpoint_nodes is None:
-        return np.zeros(len(particles), dtype=np.float64)
-
-    scores = np.zeros(len(particles), dtype=np.float64)
-    count = np.zeros(len(particles), dtype=np.float64)
-    if np.all(np.isfinite(endpoint_nodes[0])):
-        start_delta = particles[:, 0, :3] - endpoint_nodes[0][None, :]
-        scores += np.sum(start_delta * start_delta, axis=1)
-        count += 1.0
-    if np.all(np.isfinite(endpoint_nodes[-1])):
-        end_delta = particles[:, -1, :3] - endpoint_nodes[-1][None, :]
-        scores += np.sum(end_delta * end_delta, axis=1)
-        count += 1.0
-    valid = count > 0.0
-    scores[valid] /= count[valid]
-    return scores
-
-
-def anchor_particle_chains_to_endpoints(particles, endpoint_nodes, segment_length_m, gain=1.0):
-    original = np.asarray(particles, dtype=np.float64)
-    particles = valid_particles(original)
-    endpoint_nodes = endpoint_pair_array(endpoint_nodes, allow_partial=True)
-    if len(particles) == 0 or endpoint_nodes is None:
-        return original
-
-    gain = float(np.clip(gain, 0.0, 1.0))
-    if gain <= 0.0:
-        return particles
-    node_count = particles.shape[1]
-    progress = np.linspace(0.0, 1.0, node_count, dtype=np.float64)
-    start_delta = np.zeros((len(particles), 3), dtype=np.float64)
-    end_delta = np.zeros((len(particles), 3), dtype=np.float64)
-    if np.all(np.isfinite(endpoint_nodes[0])):
-        start_delta = gain * (endpoint_nodes[0][None, :] - particles[:, 0, :3])
-    if np.all(np.isfinite(endpoint_nodes[-1])):
-        end_delta = gain * (endpoint_nodes[-1][None, :] - particles[:, -1, :3])
-    warped = (
-        particles
-        + (1.0 - progress)[None, :, None] * start_delta[:, None, :]
-        + progress[None, :, None] * end_delta[:, None, :]
-    )
-    directions = particle_directions(warped)
-    starts = warped[:, 0, :3]
-    return build_chains(starts, directions, float(segment_length_m))
-
-
 def build_chain(start, directions, segment_length_m):
     start = np.asarray(start, dtype=np.float64).reshape(3)
     directions = normalize_vectors(directions)
     nodes = np.empty((len(directions) + 1, 3), dtype=np.float64)
     nodes[0] = start
-    if len(directions):
-        nodes[1:] = start[None, :] + np.cumsum(float(segment_length_m) * directions, axis=0)
+    for index, direction in enumerate(directions):
+        nodes[index + 1] = nodes[index] + float(segment_length_m) * direction
     return nodes.astype(np.float32)
 
 
@@ -1445,84 +947,9 @@ def build_chains(starts, directions, segment_length_m):
     directions = normalize_vectors(directions)
     output = np.empty((len(starts), directions.shape[1] + 1, 3), dtype=np.float64)
     output[:, 0, :] = starts
-    if directions.shape[1]:
-        output[:, 1:, :] = starts[:, None, :] + np.cumsum(float(segment_length_m) * directions, axis=1)
+    for index in range(directions.shape[1]):
+        output[:, index + 1, :] = output[:, index, :] + float(segment_length_m) * directions[:, index, :]
     return np.ascontiguousarray(output, dtype=np.float64)
-
-
-def structured_initial_chains_around_nodes(
-    nodes,
-    count,
-    segment_length_m,
-    node_std_m=0.020,
-    direction_std=0.080,
-    direction_smooth_passes=1,
-):
-    """Deterministic initial particle bank around the measured cable chain."""
-    nodes = valid_points(nodes)
-    count = max(0, int(count))
-    if count == 0 or len(nodes) < 2:
-        return np.empty((0, 0, 3), dtype=np.float64)
-
-    directions = chain_directions(nodes)
-    axes = chain_frame_axes(nodes, directions)
-    start = np.asarray(nodes[0], dtype=np.float64)
-    node_std_m = max(0.0, float(node_std_m))
-    direction_std = max(0.0, float(direction_std))
-    direction_smooth_passes = int(direction_smooth_passes)
-
-    particles = [build_chain(start, directions, segment_length_m).astype(np.float64)]
-    if len(particles) >= count:
-        return np.ascontiguousarray(particles[:count], dtype=np.float64)
-
-    start_offsets = []
-    if node_std_m > 0.0:
-        for radius in (0.5 * node_std_m, node_std_m):
-            for axis in axes:
-                for sign in (-1.0, 1.0):
-                    start_offsets.append(sign * radius * axis)
-
-    direction_variants = []
-    if direction_std > 0.0 and len(directions):
-        progress = np.linspace(0.0, 1.0, len(directions), dtype=np.float64)
-        modes = [np.sin(np.pi * progress)]
-        if len(directions) > 2:
-            modes.append(np.sin(2.0 * np.pi * progress))
-        for amplitude in (0.5 * direction_std, direction_std):
-            for mode in modes:
-                if not np.any(np.abs(mode) > 1e-9):
-                    continue
-                for axis in axes[1:]:
-                    for sign in (-1.0, 1.0):
-                        variant = directions + sign * amplitude * mode[:, None] * axis[None, :]
-                        variant = smooth_particle_directions(
-                            normalize_vectors(variant[None, :, :]),
-                            passes=direction_smooth_passes,
-                        )[0]
-                        direction_variants.append(variant)
-
-    def append_particle(start_offset, direction_values):
-        if len(particles) >= count:
-            return True
-        start_point = start + np.asarray(start_offset, dtype=np.float64)
-        particle = build_chain(start_point, direction_values, segment_length_m).astype(np.float64)
-        particles.append(particle)
-        return len(particles) >= count
-
-    for offset in start_offsets:
-        if append_particle(offset, directions):
-            return np.ascontiguousarray(particles[:count], dtype=np.float64)
-
-    for variant in direction_variants:
-        if append_particle(np.zeros(3, dtype=np.float64), variant):
-            return np.ascontiguousarray(particles[:count], dtype=np.float64)
-
-    for offset in start_offsets:
-        for variant in direction_variants:
-            if append_particle(offset, variant):
-                return np.ascontiguousarray(particles[:count], dtype=np.float64)
-
-    return np.ascontiguousarray(particles[:count], dtype=np.float64)
 
 
 def sample_noisy_chains_around_nodes(
@@ -1561,49 +988,6 @@ def chain_directions(nodes):
     return normalize_vectors(directions)
 
 
-def chain_frame_axes(nodes, directions=None):
-    points = valid_points(nodes)
-    seed_axes = []
-    if len(points) >= 3:
-        centered = points - np.mean(points, axis=0, keepdims=True)
-        try:
-            _u, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
-        except np.linalg.LinAlgError:
-            singular_values = np.empty(0, dtype=np.float64)
-            vh = np.empty((0, 3), dtype=np.float64)
-        for value, axis in zip(singular_values, vh):
-            if np.isfinite(value) and value > 1e-9:
-                seed_axes.append(axis)
-
-    if not seed_axes and directions is not None:
-        direction_values = normalize_vectors(directions)
-        mean_direction = np.mean(direction_values, axis=0)
-        if np.linalg.norm(mean_direction) > 1e-9:
-            seed_axes.append(mean_direction)
-        elif len(direction_values):
-            seed_axes.append(direction_values[0])
-
-    if not seed_axes:
-        seed_axes.append(np.array([1.0, 0.0, 0.0], dtype=np.float64))
-
-    axes = []
-    identity_axes = list(np.eye(3, dtype=np.float64))
-    for axis in [*seed_axes, *identity_axes]:
-        vector = np.asarray(axis, dtype=np.float64).reshape(3).copy()
-        if not np.all(np.isfinite(vector)):
-            continue
-        for existing in axes:
-            vector -= float(np.dot(vector, existing)) * existing
-        norm = float(np.linalg.norm(vector))
-        if norm > 1e-9:
-            axes.append(vector / norm)
-        if len(axes) == 3:
-            break
-    while len(axes) < 3:
-        axes.append(identity_axes[len(axes)])
-    return tuple(np.asarray(axis, dtype=np.float64) for axis in axes[:3])
-
-
 def particle_directions(particles):
     return normalize_vectors(np.diff(np.asarray(particles, dtype=np.float64), axis=1))
 
@@ -1632,22 +1016,21 @@ def smooth_particle_directions(directions, passes=1):
     return smoothed
 
 
-def valid_points(points, dtype=np.float64):
-    dtype = np.dtype(dtype)
-    points = np.asarray(points, dtype=dtype)
+def valid_points(points):
+    points = np.asarray(points, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] < 3:
-        return np.empty((0, 3), dtype=dtype)
+        return np.empty((0, 3), dtype=np.float64)
     points = points[:, :3]
-    return np.ascontiguousarray(points[np.all(np.isfinite(points), axis=1)], dtype=dtype)
+    return np.ascontiguousarray(points[np.all(np.isfinite(points), axis=1)], dtype=np.float64)
 
 
-def sample_points(points, max_points, dtype=np.float64):
-    points = valid_points(points, dtype=dtype)
+def sample_points(points, max_points):
+    points = valid_points(points)
     max_points = max(0, int(max_points))
     if max_points > 0 and len(points) > max_points:
         indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
         points = points[indices]
-    return np.ascontiguousarray(points, dtype=np.dtype(dtype))
+    return np.ascontiguousarray(points, dtype=np.float64)
 
 
 def assign_points_to_nearest_segments(points, nodes):
@@ -1672,19 +1055,27 @@ def assign_points_to_reference_arclength(points, nodes):
     segment_vectors = nodes[1:] - nodes[:-1]
     segment_lengths = np.linalg.norm(segment_vectors, axis=1)
     cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
-    length_sq = np.sum(segment_vectors * segment_vectors, axis=1)
-    safe_length_sq = np.maximum(length_sq, 1e-12)
-    point_delta = points[:, None, :] - nodes[:-1][None, :, :]
-    projection_fraction = np.sum(point_delta * segment_vectors[None, :, :], axis=2) / safe_length_sq[None, :]
-    projection_fraction = np.clip(projection_fraction, 0.0, 1.0)
-    projection_fraction[:, length_sq <= 1e-12] = 0.0
-    projected = nodes[:-1][None, :, :] + projection_fraction[:, :, None] * segment_vectors[None, :, :]
-    squared = np.sum((points[:, None, :] - projected) ** 2, axis=2)
+    best_squared = np.full(len(points), np.inf, dtype=np.float64)
+    best_segments = np.zeros(len(points), dtype=np.int64)
+    best_arclength = np.zeros(len(points), dtype=np.float64)
 
-    best_segments = np.argmin(squared, axis=1).astype(np.int64)
-    rows = np.arange(len(points))
-    best_squared = squared[rows, best_segments]
-    best_arclength = cumulative[best_segments] + projection_fraction[rows, best_segments] * segment_lengths[best_segments]
+    for index, (start, vector, length, length_start) in enumerate(
+        zip(nodes[:-1], segment_vectors, segment_lengths, cumulative[:-1])
+    ):
+        length_sq = float(np.dot(vector, vector))
+        if length_sq <= 1e-12:
+            projection_fraction = np.zeros(len(points), dtype=np.float64)
+            projected = start[None, :]
+        else:
+            projection_fraction = np.clip(((points - start[None, :]) @ vector) / length_sq, 0.0, 1.0)
+            projected = start[None, :] + projection_fraction[:, None] * vector[None, :]
+        squared = np.sum((points - projected) ** 2, axis=1)
+        update = squared < best_squared
+        if np.any(update):
+            best_squared[update] = squared[update]
+            best_segments[update] = int(index)
+            best_arclength[update] = float(length_start) + projection_fraction[update] * float(length)
+
     return best_segments, np.sqrt(best_squared), best_arclength
 
 
@@ -1692,210 +1083,75 @@ def particle_distance_scores(
     points,
     particles,
     outlier_distance=np.inf,
-    segment_indices=None,
-    segment_window=0,
+    score_keep_fraction=1.0,
+    coverage_penalty_m=0.0,
+    coverage_min_fraction=0.05,
+    bend_penalty_m=0.0,
+    expected_segments=None,
     backend="auto",
-    chunk_points=512,
-):
-    device = torch_scoring_device(backend)
-    scoring_dtype = np.float32 if device is not None else np.float64
-    points = valid_points(points, dtype=scoring_dtype)
-    particles = valid_particles(particles, dtype=scoring_dtype)
-    if len(points) == 0 or len(particles) == 0 or particles.shape[1] < 2:
-        return np.full(len(particles), np.inf, dtype=np.float64)
-
-    segment_indices = valid_segment_indices(segment_indices, len(points), particles.shape[1] - 1)
-    if segment_indices is not None:
-        if device is not None:
-            torch_scores = particle_assigned_segment_distance_scores_torch(
-                points,
-                particles,
-                segment_indices,
-                outlier_distance=outlier_distance,
-                segment_window=segment_window,
-                chunk_points=chunk_points,
-                device=device,
-            )
-            if torch_scores is not None:
-                return torch_scores
-        return particle_assigned_segment_distance_scores(
-            points,
-            particles,
-            segment_indices,
-            outlier_distance=outlier_distance,
-            segment_window=segment_window,
-            chunk_points=chunk_points,
-        )
-
-    if device is not None:
-        torch_scores = particle_distance_scores_torch(
-            points,
-            particles,
-            outlier_distance=outlier_distance,
-            backend=backend,
-            chunk_points=chunk_points,
-            device=device,
-        )
-        if torch_scores is not None:
-            return torch_scores
-
-    all_squared_distances = point_to_particle_segment_squared_distances(points, particles[:, :-1, :3], particles[:, 1:, :3])
-    if all_squared_distances.size:
-        squared_distances = np.min(all_squared_distances, axis=1)
-    else:
-        squared_distances = np.empty((len(particles), 0), dtype=np.float64)
-    if squared_distances.size == 0:
-        return np.full(len(particles), np.inf, dtype=np.float64)
-    if np.isfinite(float(outlier_distance)):
-        squared_distances = np.minimum(squared_distances, float(outlier_distance) * float(outlier_distance))
-    return np.mean(squared_distances, axis=1)
-
-
-def valid_segment_indices(segment_indices, point_count, segment_count):
-    if segment_indices is None:
-        return None
-    indices = np.asarray(segment_indices, dtype=np.int64).reshape(-1)
-    if len(indices) != int(point_count):
-        return None
-    if int(segment_count) <= 0:
-        return None
-    return np.ascontiguousarray(np.clip(indices, 0, int(segment_count) - 1), dtype=np.int64)
-
-
-def segment_index_windows(segment_indices, segment_count, segment_window=0):
-    indices = np.asarray(segment_indices, dtype=np.int64).reshape(-1)
-    segment_count = max(1, int(segment_count))
-    window = max(0, int(segment_window))
-    offsets = np.arange(-window, window + 1, dtype=np.int64)
-    windows = indices[:, None] + offsets[None, :]
-    return np.ascontiguousarray(np.clip(windows, 0, segment_count - 1), dtype=np.int64)
-
-
-def particle_assigned_segment_distance_scores(
-    points,
-    particles,
-    segment_indices,
-    outlier_distance=np.inf,
-    segment_window=0,
     chunk_points=512,
 ):
     points = valid_points(points)
     particles = valid_particles(particles)
-    segment_indices = valid_segment_indices(segment_indices, len(points), particles.shape[1] - 1)
-    if len(points) == 0 or len(particles) == 0 or segment_indices is None:
+    if len(points) == 0 or len(particles) == 0 or particles.shape[1] < 2:
         return np.full(len(particles), np.inf, dtype=np.float64)
 
-    segment_count = particles.shape[1] - 1
-    score_sum = np.zeros(len(particles), dtype=np.float64)
-    total_points = 0
-    chunk_points = max(1, int(chunk_points))
-    for start_index in range(0, len(points), chunk_points):
-        chunk = points[start_index : start_index + chunk_points, :3]
-        index_window = segment_index_windows(
-            segment_indices[start_index : start_index + len(chunk)],
-            segment_count,
-            segment_window=segment_window,
+    torch_scores = particle_distance_scores_torch(
+        points,
+        particles,
+        outlier_distance=outlier_distance,
+        score_keep_fraction=score_keep_fraction,
+        coverage_penalty_m=coverage_penalty_m,
+        coverage_min_fraction=coverage_min_fraction,
+        bend_penalty_m=bend_penalty_m,
+        expected_segments=expected_segments,
+        backend=backend,
+        chunk_points=chunk_points,
+    )
+    if torch_scores is not None:
+        return torch_scores
+
+    all_squared_distances = point_to_particle_segment_squared_distances(points, particles[:, :-1, :3], particles[:, 1:, :3])
+    if all_squared_distances.size:
+        squared_distances = np.min(all_squared_distances, axis=1)
+        nearest_segments = np.argmin(all_squared_distances, axis=1)
+    else:
+        squared_distances = np.empty((len(particles), 0), dtype=np.float64)
+        nearest_segments = np.empty((len(particles), 0), dtype=np.int64)
+    expected_segments = expected_segment_indices(expected_segments, particles.shape[1] - 1)
+    if squared_distances.size == 0:
+        return np.full(len(particles), np.inf, dtype=np.float64)
+
+    scores = trimmed_mean_squared_values(
+        squared_distances,
+        outlier_distance=float(outlier_distance),
+        keep_fraction=float(score_keep_fraction),
+    )
+    if coverage_penalty_m > 0.0 and len(expected_segments):
+        scores = scores + segment_coverage_penalty(
+            nearest_segments,
+            expected_segments=expected_segments,
+            penalty_m=float(coverage_penalty_m),
+            min_fraction=float(coverage_min_fraction),
         )
-        starts = particles[:, index_window, :3]
-        ends = particles[:, index_window + 1, :3]
-        segment = ends - starts
-        length_sq = np.sum(segment * segment, axis=3)
-        point_delta = chunk[None, :, None, :] - starts
-        t = np.sum(point_delta * segment, axis=3) / np.maximum(length_sq, 1e-12)
-        t = np.clip(t, 0.0, 1.0)
-        projection = starts + t[:, :, :, None] * segment
-        delta = chunk[None, :, None, :] - projection
-        squared = np.sum(delta * delta, axis=3)
-        best = np.min(squared, axis=2)
-        if np.isfinite(float(outlier_distance)):
-            best = np.minimum(best, float(outlier_distance) * float(outlier_distance))
-        score_sum += np.sum(best, axis=1)
-        total_points += len(chunk)
-
-    if total_points <= 0:
-        return np.full(len(particles), np.inf, dtype=np.float64)
-    return score_sum / float(total_points)
-
-
-def particle_assigned_segment_distance_scores_torch(
-    points,
-    particles,
-    segment_indices,
-    outlier_distance=np.inf,
-    segment_window=0,
-    chunk_points=512,
-    device=None,
-):
-    device = torch_scoring_device("auto") if device is None else device
-    if device is None:
-        return None
-
-    try:
-        with torch.inference_mode():
-            points_t = torch.as_tensor(points[:, :3], dtype=torch.float32, device=device)
-            particles_t = torch.as_tensor(particles[:, :, :3], dtype=torch.float32, device=device)
-            indices_t = torch.as_tensor(segment_indices, dtype=torch.long, device=device)
-            starts_all = particles_t[:, :-1, :]
-            ends_all = particles_t[:, 1:, :]
-            segment_count = starts_all.shape[1]
-            window = max(0, int(segment_window))
-            offsets = torch.arange(-window, window + 1, dtype=torch.long, device=device)
-
-            best_chunks = []
-            chunk_points = max(1, int(chunk_points))
-            particle_count = int(particles_t.shape[0])
-            for start_index in range(0, points_t.shape[0], chunk_points):
-                chunk = points_t[start_index : start_index + chunk_points]
-                chunk_indices = indices_t[start_index : start_index + chunk.shape[0]]
-                index_window = torch.clamp(chunk_indices[:, None] + offsets[None, :], 0, segment_count - 1)
-                gather_index = index_window[None, :, :, None].expand(particle_count, -1, -1, 3)
-                starts = torch.gather(
-                    starts_all[:, None, :, :].expand(-1, chunk.shape[0], -1, -1),
-                    2,
-                    gather_index,
-                )
-                ends = torch.gather(
-                    ends_all[:, None, :, :].expand(-1, chunk.shape[0], -1, -1),
-                    2,
-                    gather_index,
-                )
-                segment = ends - starts
-                length_sq = torch.sum(segment * segment, dim=3).clamp_min(1e-12)
-                point_delta = chunk[None, :, None, :] - starts
-                t = torch.sum(point_delta * segment, dim=3) / length_sq
-                t = torch.clamp(t, 0.0, 1.0)
-                projection = starts + t[:, :, :, None] * segment
-                delta = chunk[None, :, None, :] - projection
-                squared = torch.sum(delta * delta, dim=3)
-                best = torch.min(squared, dim=2).values
-                best_chunks.append(best)
-
-            if not best_chunks:
-                return np.full(len(particles), np.inf, dtype=np.float64)
-            squared_distances = torch.cat(best_chunks, dim=1)
-            outlier_distance = float(outlier_distance)
-            if np.isfinite(outlier_distance):
-                squared_distances = torch.clamp(squared_distances, max=outlier_distance * outlier_distance)
-            scores = torch.mean(squared_distances, dim=1)
-            return scores.detach().cpu().numpy().astype(np.float64, copy=False)
-    except RuntimeError:
-        if torch is not None and torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        return None
+    if float(bend_penalty_m) > 0.0:
+        scores = scores + particle_bend_penalty(particles, penalty_m=float(bend_penalty_m))
+    return scores
 
 
 def particle_distance_scores_torch(
     points,
     particles,
     outlier_distance=np.inf,
+    score_keep_fraction=1.0,
+    coverage_penalty_m=0.0,
+    coverage_min_fraction=0.05,
+    bend_penalty_m=0.0,
+    expected_segments=None,
     backend="auto",
     chunk_points=512,
-    device=None,
 ):
-    device = torch_scoring_device(backend) if device is None else device
+    device = torch_scoring_device(backend)
     if device is None:
         return None
 
@@ -1909,6 +1165,7 @@ def particle_distance_scores_torch(
             length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
 
             best_chunks = []
+            nearest_chunks = []
             chunk_points = max(1, int(chunk_points))
             for start_index in range(0, points_t.shape[0], chunk_points):
                 chunk = points_t[start_index : start_index + chunk_points]
@@ -1920,15 +1177,38 @@ def particle_distance_scores_torch(
                 squared = torch.sum(delta * delta, dim=3)
                 best, nearest = torch.min(squared, dim=1)
                 best_chunks.append(best)
+                nearest_chunks.append(nearest)
 
             if not best_chunks:
                 return np.full(len(particles), np.inf, dtype=np.float64)
             squared_distances = torch.cat(best_chunks, dim=1)
+            nearest_segments = torch.cat(nearest_chunks, dim=1)
 
             outlier_distance = float(outlier_distance)
             if np.isfinite(outlier_distance):
                 squared_distances = torch.clamp(squared_distances, max=outlier_distance * outlier_distance)
-            scores = torch.mean(squared_distances, dim=1)
+            keep_fraction = float(np.clip(score_keep_fraction, 1e-6, 1.0))
+            keep_count = max(1, int(np.ceil(squared_distances.shape[1] * keep_fraction)))
+            if keep_count >= squared_distances.shape[1]:
+                scores = torch.mean(squared_distances, dim=1)
+            else:
+                selected, _indices = torch.topk(squared_distances, keep_count, dim=1, largest=False)
+                scores = torch.mean(selected, dim=1)
+
+            expected = expected_segment_indices(expected_segments, particles.shape[1] - 1)
+            if float(coverage_penalty_m) > 0.0 and len(expected):
+                required = max(1, int(np.ceil(nearest_segments.shape[1] * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
+                missing = torch.zeros(nearest_segments.shape[0], dtype=torch.float32, device=device)
+                for segment_index in expected:
+                    counts = torch.count_nonzero(nearest_segments == int(segment_index), dim=1)
+                    missing = missing + (counts < required).to(torch.float32)
+                scores = scores + missing * float(coverage_penalty_m) * float(coverage_penalty_m)
+
+            if float(bend_penalty_m) > 0.0 and particles_t.shape[1] > 2:
+                directions = segment / torch.sqrt(length_sq[:, :, None])
+                dots = torch.sum(directions[:, :-1, :] * directions[:, 1:, :], dim=2).clamp(-1.0, 1.0)
+                bend = torch.mean(torch.clamp(1.0 - dots, min=0.0), dim=1)
+                scores = scores + bend * float(bend_penalty_m) * float(bend_penalty_m)
 
             return scores.detach().cpu().numpy().astype(np.float64, copy=False)
     except RuntimeError:
@@ -1949,6 +1229,71 @@ def torch_scoring_device(backend):
     if backend in {"auto", "cuda"} and torch.cuda.is_available():
         return torch.device("cuda")
     return None
+
+
+def expected_segment_indices(expected_segments, segment_count):
+    if expected_segments is None:
+        return np.arange(int(segment_count), dtype=np.int64)
+    expected = np.asarray(expected_segments, dtype=np.int64).reshape(-1)
+    if len(expected) == 0:
+        return expected
+    return np.unique(np.clip(expected, 0, int(segment_count) - 1))
+
+
+def trimmed_mean_squared_values(squared_distances, outlier_distance=np.inf, keep_fraction=1.0):
+    squared = np.asarray(squared_distances, dtype=np.float64)
+    if squared.ndim != 2 or squared.shape[1] == 0:
+        return np.full(squared.shape[0] if squared.ndim == 2 else 0, np.inf, dtype=np.float64)
+
+    outlier_distance = float(outlier_distance)
+    if np.isfinite(outlier_distance):
+        squared = np.minimum(squared, outlier_distance * outlier_distance)
+    keep_fraction = float(np.clip(keep_fraction, 1e-6, 1.0))
+    keep_count = max(1, int(np.ceil(squared.shape[1] * keep_fraction)))
+    if keep_count >= squared.shape[1]:
+        return np.mean(squared, axis=1)
+
+    selected = np.partition(squared, keep_count - 1, axis=1)[:, :keep_count]
+    return np.mean(selected, axis=1)
+
+
+def segment_coverage_penalty(nearest_segments, expected_segments, penalty_m=0.025, min_fraction=0.05):
+    nearest_segments = np.asarray(nearest_segments, dtype=np.int64)
+    if nearest_segments.ndim != 2 or nearest_segments.shape[1] == 0:
+        return np.zeros(nearest_segments.shape[0] if nearest_segments.ndim == 2 else 0, dtype=np.float64)
+
+    expected_segments = np.asarray(expected_segments, dtype=np.int64).reshape(-1)
+    if len(expected_segments) == 0:
+        return np.zeros(nearest_segments.shape[0], dtype=np.float64)
+
+    required = max(1, int(np.ceil(nearest_segments.shape[1] * float(np.clip(min_fraction, 0.0, 1.0)))))
+    missing_counts = np.zeros(nearest_segments.shape[0], dtype=np.float64)
+    for segment_index in expected_segments:
+        counts = np.count_nonzero(nearest_segments == int(segment_index), axis=1)
+        missing_counts += counts < required
+    return missing_counts * float(penalty_m) * float(penalty_m)
+
+
+def particle_bend_penalty(particles, penalty_m=0.030):
+    particles = valid_particles(particles)
+    if len(particles) == 0 or particles.shape[1] < 3:
+        return np.zeros(len(particles), dtype=np.float64)
+    directions = particle_directions(particles)
+    dots = np.sum(directions[:, :-1, :] * directions[:, 1:, :], axis=2)
+    bend = np.mean(np.maximum(0.0, 1.0 - np.clip(dots, -1.0, 1.0)), axis=1)
+    return bend * float(penalty_m) * float(penalty_m)
+
+
+def endpoint_order_penalty(particles, measurement_nodes, weight=1.0):
+    particles = valid_particles(particles)
+    nodes = valid_points(measurement_nodes)
+    if len(particles) == 0 or len(nodes) < 2:
+        return np.zeros(len(particles), dtype=np.float64)
+    start = nodes[0]
+    end = nodes[-1]
+    start_error = np.sum((particles[:, 0, :3] - start[None, :]) ** 2, axis=1)
+    end_error = np.sum((particles[:, -1, :3] - end[None, :]) ** 2, axis=1)
+    return 0.5 * float(weight) * (start_error + end_error)
 
 
 def point_to_particle_segment_squared_distances(points, starts, ends):
@@ -1974,24 +1319,17 @@ def point_to_all_segment_distances(points, nodes):
     if len(points) == 0 or len(nodes) < 2:
         return np.empty((0, 0), dtype=np.float64)
 
-    starts = nodes[:-1]
-    segment = nodes[1:] - starts
-    length_sq = np.sum(segment * segment, axis=1)
-    safe_length_sq = np.maximum(length_sq, 1e-12)
-    point_delta = points[:, None, :] - starts[None, :, :]
-    t = np.sum(point_delta * segment[None, :, :], axis=2) / safe_length_sq[None, :]
-    t = np.clip(t, 0.0, 1.0)
-    t[:, length_sq <= 1e-12] = 0.0
-    projection = starts[None, :, :] + t[:, :, None] * segment[None, :, :]
-    return np.linalg.norm(points[:, None, :] - projection, axis=2)
+    output = np.empty((len(points), len(nodes) - 1), dtype=np.float64)
+    for index, (start, end) in enumerate(zip(nodes[:-1], nodes[1:])):
+        output[:, index] = point_to_segment_distances(points, start, end)
+    return output
 
 
-def valid_particles(particles, dtype=np.float64):
-    dtype = np.dtype(dtype)
-    particles = np.asarray(particles, dtype=dtype)
+def valid_particles(particles):
+    particles = np.asarray(particles, dtype=np.float64)
     if particles.ndim != 3 or particles.shape[1] < 2 or particles.shape[2] < 3:
-        return np.empty((0, 0, 3), dtype=dtype)
-    return np.ascontiguousarray(particles[:, :, :3], dtype=dtype)
+        return np.empty((0, 0, 3), dtype=np.float64)
+    return np.ascontiguousarray(particles[:, :, :3], dtype=np.float64)
 
 
 def point_to_segment_distances(points, start, end):
@@ -2031,21 +1369,6 @@ def node_visibility_from_segments(visible_segments, node_count):
     return visible_nodes
 
 
-def merge_visible_measurement_nodes(measurement_nodes, reference_nodes, visible_segments):
-    measurement = finite_node_chain(measurement_nodes, len(measurement_nodes) if measurement_nodes is not None else 0)
-    reference = finite_node_chain(reference_nodes, len(reference_nodes) if reference_nodes is not None else 0)
-    if measurement is None:
-        return reference
-    if reference is None or reference.shape != measurement.shape:
-        return measurement
-    visible_nodes = node_visibility_from_segments(visible_segments, len(measurement))
-    if len(visible_nodes) != len(measurement):
-        return measurement
-    merged = reference.copy()
-    merged[visible_nodes] = measurement[visible_nodes]
-    return np.ascontiguousarray(merged, dtype=np.float64)
-
-
 def align_polyline_orientation(reference_nodes, candidate_nodes):
     reference = np.asarray(reference_nodes, dtype=np.float64)
     candidate = np.asarray(candidate_nodes, dtype=np.float64)
@@ -2067,59 +1390,6 @@ def mean_node_distance(reference_nodes, candidate_nodes):
     if len(distances) == 0:
         return np.inf
     return float(np.mean(distances))
-
-
-def finite_node_chain(nodes, node_count):
-    if nodes is None:
-        return None
-    nodes = np.asarray(nodes, dtype=np.float64)
-    expected_shape = (int(node_count), 3)
-    if nodes.shape != expected_shape:
-        return None
-    if not np.all(np.isfinite(nodes)):
-        return None
-    return np.ascontiguousarray(nodes, dtype=np.float64)
-
-
-
-def max_node_vector_norm(vectors):
-    vectors = np.asarray(vectors, dtype=np.float64)
-    if vectors.ndim != 2 or vectors.shape[1] < 3 or len(vectors) == 0:
-        return 0.0
-    finite = np.all(np.isfinite(vectors[:, :3]), axis=1)
-    if not np.any(finite):
-        return 0.0
-    return float(np.max(np.linalg.norm(vectors[finite, :3], axis=1)))
-
-
-def clamp_node_vectors(vectors, max_norm):
-    vectors = np.asarray(vectors, dtype=np.float64).copy()
-    if vectors.ndim != 2 or vectors.shape[1] < 3:
-        return vectors
-    max_norm = max(0.0, float(max_norm))
-    if max_norm <= 0.0:
-        return np.zeros_like(vectors, dtype=np.float64)
-    finite = np.all(np.isfinite(vectors[:, :3]), axis=1)
-    norms = np.linalg.norm(vectors[:, :3], axis=1)
-    scale = np.ones(len(vectors), dtype=np.float64)
-    too_large = finite & (norms > max_norm)
-    scale[too_large] = max_norm / np.maximum(norms[too_large], 1e-12)
-    vectors[:, :3] *= scale[:, None]
-    vectors[~finite, :3] = 0.0
-    return np.ascontiguousarray(vectors[:, :3], dtype=np.float64)
-
-
-def zero_small_node_vectors(vectors, min_norm):
-    vectors = np.asarray(vectors, dtype=np.float64).copy()
-    if vectors.ndim != 2 or vectors.shape[1] < 3:
-        return vectors
-    min_norm = max(0.0, float(min_norm))
-    if min_norm <= 0.0:
-        return np.ascontiguousarray(vectors[:, :3], dtype=np.float64)
-    finite = np.all(np.isfinite(vectors[:, :3]), axis=1)
-    norms = np.linalg.norm(vectors[:, :3], axis=1)
-    vectors[(~finite) | (norms < min_norm), :3] = 0.0
-    return np.ascontiguousarray(vectors[:, :3], dtype=np.float64)
 
 
 def segment_lengths(nodes):
