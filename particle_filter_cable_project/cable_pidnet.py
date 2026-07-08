@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover - handled by require_torch
     nn = None
     F = None
 
-from cable_detection import CableMaskDetector
+from cable_detection import CableDetection2D, CableMaskDetector, resize_detection
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -188,17 +188,22 @@ class PidNetSegmenter:
         self.std = torch.tensor(IMAGENET_STD, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
 
     @torch_inference_mode()
-    def probability_map(self, bgr):
+    def probability_maps(self, bgr):
         bgr = np.asarray(bgr, dtype=np.uint8)
         if bgr.ndim != 3 or bgr.shape[2] < 3:
-            return np.zeros(bgr.shape[:2], dtype=np.float32)
+            return np.zeros((*bgr.shape[:2], 1), dtype=np.float32)
         rgb = cv2.cvtColor(bgr[:, :, :3], cv2.COLOR_BGR2RGB)
         image = torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device, non_blocking=True)
         image = image.permute(2, 0, 1).unsqueeze(0).float() / 255.0
         image = (image - self.mean) / self.std
         logits = self.model(image)["seg"]
-        probability = torch.sigmoid(logits)[0, 0].detach().cpu().numpy()
-        return np.ascontiguousarray(probability, dtype=np.float32)
+        probability = torch.sigmoid(logits)[0].detach().cpu().numpy()
+        return np.ascontiguousarray(np.moveaxis(probability, 0, -1), dtype=np.float32)
+
+    @torch_inference_mode()
+    def probability_map(self, bgr):
+        probability = self.probability_maps(bgr)
+        return np.ascontiguousarray(probability[:, :, 0], dtype=np.float32)
 
 
 class PidNetCableDetector(CableMaskDetector):
@@ -236,6 +241,70 @@ class PidNetCableDetector(CableMaskDetector):
         probability = self.segmenter.probability_map(bgr)
         return (probability >= self.threshold).astype(np.uint8) * 255
 
+    def create_endpoint_mask(self, bgr, threshold=None):
+        probability = self.segmenter.probability_maps(bgr)
+        threshold = self.threshold if threshold is None else float(threshold)
+        return probability_channel_mask(probability, 1, threshold)
+
+    def detect_with_channel_masks(self, bgr, scale=1.0, extract_geometry=True, endpoint_threshold=None):
+        bgr = np.asarray(bgr, dtype=np.uint8)
+        original_h, original_w = bgr.shape[:2]
+        scale = float(np.clip(scale, 0.10, 1.0))
+        if scale < 0.999:
+            scaled_w = max(2, int(round(original_w * scale)))
+            scaled_h = max(2, int(round(original_h * scale)))
+            detector_input = cv2.resize(bgr, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+        else:
+            detector_input = bgr
+
+        probability = self.segmenter.probability_maps(detector_input)
+        cable_raw = probability_channel_mask(probability, 0, self.threshold)
+        endpoint_mask = probability_channel_mask(
+            probability,
+            1,
+            self.threshold if endpoint_threshold is None else float(endpoint_threshold),
+        )
+        detection = self._detection_from_raw_mask(cable_raw, extract_geometry=extract_geometry)
+        if scale < 0.999:
+            detection = resize_detection(detection, (original_h, original_w))
+            endpoint_mask = resize_mask(endpoint_mask, (original_h, original_w))
+        return detection, endpoint_mask
+
+    def _detection_from_raw_mask(self, raw_mask, extract_geometry=True):
+        mask, component_count = self.clean_mask(raw_mask)
+        if not extract_geometry:
+            skeleton = np.zeros_like(mask, dtype=np.uint8)
+            return CableDetection2D(
+                mask=mask,
+                skeleton=skeleton,
+                centerline_xy=np.empty((0, 2), dtype=np.float32),
+                component_count=component_count,
+                branch_count=0,
+                centerline_paths_xy=(),
+            )
+        return self._detect_crop_from_clean_mask(mask, component_count)
+
+    def _detect_crop_from_clean_mask(self, mask, component_count):
+        from cable_detection import prune_short_skeleton_branches, skeleton_centerline_paths, skeletonize_mask, smooth_polyline_xy, stitch_centerline_paths
+
+        skeleton = skeletonize_mask(mask)
+        skeleton = prune_short_skeleton_branches(
+            skeleton,
+            max_branch_length=self.skeleton_prune_px,
+            max_passes=self.skeleton_prune_passes,
+        )
+        centerline_paths_xy, branch_count = skeleton_centerline_paths(skeleton)
+        centerline_xy = stitch_centerline_paths(centerline_paths_xy)
+        centerline_xy = smooth_polyline_xy(centerline_xy, self.centerline_smooth_window)
+        return CableDetection2D(
+            mask=mask,
+            skeleton=skeleton,
+            centerline_xy=centerline_xy,
+            component_count=component_count,
+            branch_count=branch_count,
+            centerline_paths_xy=tuple(centerline_paths_xy),
+        )
+
 
 def resolve_device(device):
     require_torch()
@@ -253,3 +322,19 @@ def infer_output_channels_from_state_dict(state_dict):
         if weight is not None and hasattr(weight, "shape") and len(weight.shape) >= 1:
             return int(weight.shape[0])
     return 1
+
+
+def probability_channel_mask(probability, channel, threshold):
+    probability = np.asarray(probability, dtype=np.float32)
+    if probability.ndim != 3 or probability.shape[2] <= int(channel):
+        return np.zeros(probability.shape[:2], dtype=np.uint8)
+    mask = (probability[:, :, int(channel)] >= float(threshold)).astype(np.uint8) * 255
+    return np.ascontiguousarray(mask, dtype=np.uint8)
+
+
+def resize_mask(mask, output_shape):
+    output_h, output_w = [int(v) for v in output_shape[:2]]
+    mask = np.asarray(mask, dtype=np.uint8)
+    if mask.shape[:2] == (output_h, output_w):
+        return np.ascontiguousarray(mask, dtype=np.uint8)
+    return np.ascontiguousarray(cv2.resize(mask, (output_w, output_h), interpolation=cv2.INTER_NEAREST), dtype=np.uint8)

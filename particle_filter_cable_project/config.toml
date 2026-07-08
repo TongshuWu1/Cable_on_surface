@@ -13,7 +13,7 @@ input_svo_file = ""
 ip_address = ""
 resolution = "HD720"
 fps = 60
-depth_mode = "NEURAL_PLUS"
+depth_mode = "NEURAL"
 
 [depth]
 # Working depth range in meters. Keep this tight around the cable workspace.
@@ -44,8 +44,30 @@ hold_frames = 8
 # Relative paths are resolved from this config file.
 checkpoint = "models/pidnet_cable_best.pt"
 device = "cuda"
-threshold = 0.75
+threshold = 0.25
 base_channels = 24
+
+[endpoint]
+# Endpoint anchor source:
+#   "neural" -> use the PIDNet endpoint/blue-tape output channel
+#   "blue"   -> use HSV blue tape thresholding
+#   "normal" -> use inferred cable endpoints only
+#   "none"   -> disable endpoint anchors
+mode = "neural"
+
+[endpoint_markers]
+enabled = true
+h_min = 90
+h_max = 135
+s_min = 70
+v_min = 40
+min_area_px = 50
+min_points = 8
+open_kernel = 3
+close_kernel = 5
+max_points_per_marker = 256
+tape_length_m = 0.035
+offset_to_tips = true
 
 [detector]
 # Options: "pidnet" for trained neural segmentation, "hsv" for HSV range or
@@ -120,6 +142,10 @@ confidence_update_every = 2
 [cable]
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
 segments = 12
+
+# Physical cable length in meters. Measured real cable is 56 cm.
+length_m = 0.56
+length_scale = 1.0
 
 # Fixed segment length in meters. 0 estimates the length once from the first
 # valid 3D measurement and then keeps it fixed.

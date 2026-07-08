@@ -10,7 +10,11 @@ import pyzed.sl as sl
 
 from cable_detection import (
     HsvCableDetector,
+    attach_endpoint_markers_to_measurement,
     cable_measurement_from_mask_points,
+    cleanup_marker_mask,
+    detect_blue_endpoint_markers,
+    endpoint_markers_from_mask,
     fit_cable_segments_from_zed_point_cloud,
     polyline_residual,
 )
@@ -109,6 +113,19 @@ def parse_args():
     parser.add_argument("--neural-detector-device", default=config_value(config, "pidnet", "device", "cuda"), help="PyTorch device for PIDNet detector. Default: cuda.")
     parser.add_argument("--neural-detector-threshold", type=float, default=config_value(config, "pidnet", "threshold", 0.50), help="PIDNet probability threshold for the binary cable mask.")
     parser.add_argument("--neural-detector-base-channels", type=int, default=config_value(config, "pidnet", "base_channels", 24))
+    parser.add_argument("--endpoint-mode", choices=("neural", "blue", "normal", "none"), default=str(config_value(config, "endpoint", "mode", "neural")).lower(), help="Endpoint anchor source. neural uses the PIDNet endpoint channel; blue uses HSV blue tape; normal uses inferred cable endpoints; none disables endpoint anchors.")
+    parser.add_argument("--endpoint-markers", action=argparse.BooleanOptionalAction, default=config_value(config, "endpoint_markers", "enabled", True), help="Detect endpoint/tape markers and use them as measured cable endpoints.")
+    parser.add_argument("--endpoint-marker-h-min", type=int, default=config_value(config, "endpoint_markers", "h_min", 90))
+    parser.add_argument("--endpoint-marker-h-max", type=int, default=config_value(config, "endpoint_markers", "h_max", 135))
+    parser.add_argument("--endpoint-marker-s-min", type=int, default=config_value(config, "endpoint_markers", "s_min", 70))
+    parser.add_argument("--endpoint-marker-v-min", type=int, default=config_value(config, "endpoint_markers", "v_min", 40))
+    parser.add_argument("--endpoint-marker-min-area", type=int, default=config_value(config, "endpoint_markers", "min_area_px", 50))
+    parser.add_argument("--endpoint-marker-min-points", type=int, default=config_value(config, "endpoint_markers", "min_points", 8))
+    parser.add_argument("--endpoint-marker-open-kernel", type=int, default=config_value(config, "endpoint_markers", "open_kernel", 3))
+    parser.add_argument("--endpoint-marker-close-kernel", type=int, default=config_value(config, "endpoint_markers", "close_kernel", 5))
+    parser.add_argument("--endpoint-marker-points", type=int, default=config_value(config, "endpoint_markers", "max_points_per_marker", 256))
+    parser.add_argument("--endpoint-marker-tape-length", type=float, default=config_value(config, "endpoint_markers", "tape_length_m", 0.035))
+    parser.add_argument("--endpoint-marker-offset-to-tips", action=argparse.BooleanOptionalAction, default=config_value(config, "endpoint_markers", "offset_to_tips", True))
     parser.add_argument("--detector-min-area", type=int, default=config_value(config, "detector", "min_area_px", 80))
     parser.add_argument("--detector-open-kernel", type=int, default=config_value(config, "detector", "open_kernel", 3))
     parser.add_argument("--detector-close-kernel", type=int, default=config_value(config, "detector", "close_kernel", 5))
@@ -131,6 +148,8 @@ def parse_args():
     parser.add_argument("--hsv-gaussian-negative-mean", type=float, nargs=4, default=config_value(config, "hsv", "gaussian_negative_mean", None))
     parser.add_argument("--hsv-gaussian-negative-std", type=float, nargs=4, default=config_value(config, "hsv", "gaussian_negative_std", None))
     parser.add_argument("--cable-segments", type=int, default=config_value(config, "cable", "segments", 2))
+    parser.add_argument("--cable-length", type=float, default=config_value(config, "cable", "length_m", 0.0), help="Physical cable length in meters. Used to derive segment_length_m when segment_length_m is 0.")
+    parser.add_argument("--cable-length-scale", type=float, default=config_value(config, "cable", "length_scale", 1.0), help="Scale factor applied to cable-length before deriving segment length.")
     parser.add_argument("--cable-max-points", type=int, default=config_value(config, "cable", "max_visual_points", 1000))
     parser.add_argument("--node-search-px", type=int, default=config_value(config, "measurement", "node_search_px", 2))
     parser.add_argument(
@@ -321,6 +340,8 @@ def parse_args():
     if args.input_svo_file and args.ip_address:
         raise ValueError("Specify only one input source: --input-svo-file or --ip-address.")
     args.cable_segments = max(1, int(args.cable_segments))
+    args.cable_length = max(0.0, float(args.cable_length))
+    args.cable_length_scale = max(0.0, float(args.cable_length_scale))
     args.cloud_update_every = max(1, int(args.cloud_update_every))
     args.confidence_update_every = max(0, int(args.confidence_update_every))
     args.detector_scale = float(np.clip(args.detector_scale, 0.10, 1.0))
@@ -333,12 +354,32 @@ def parse_args():
     args.viewer_hold_frames = max(0, int(args.viewer_hold_frames))
     args.hsv_geometry_every = max(0, int(args.hsv_geometry_every))
     args.hsv_mask_points = max(2, int(args.hsv_mask_points))
+    args.endpoint_mode = str(args.endpoint_mode).strip().lower()
+    if args.endpoint_mode not in ("neural", "blue", "normal", "none"):
+        raise ValueError('endpoint.mode must be one of "neural", "blue", "normal", or "none".')
+    args.endpoint_marker_h_min = int(np.clip(args.endpoint_marker_h_min, 0, 179))
+    args.endpoint_marker_h_max = int(np.clip(args.endpoint_marker_h_max, 0, 179))
+    args.endpoint_marker_s_min = int(np.clip(args.endpoint_marker_s_min, 0, 255))
+    args.endpoint_marker_v_min = int(np.clip(args.endpoint_marker_v_min, 0, 255))
+    args.endpoint_marker_min_area = max(1, int(args.endpoint_marker_min_area))
+    args.endpoint_marker_min_points = max(1, int(args.endpoint_marker_min_points))
+    args.endpoint_marker_open_kernel = max(0, int(args.endpoint_marker_open_kernel))
+    args.endpoint_marker_close_kernel = max(0, int(args.endpoint_marker_close_kernel))
+    args.endpoint_marker_points = max(1, int(args.endpoint_marker_points))
+    args.endpoint_marker_tape_length = max(0.0, float(args.endpoint_marker_tape_length))
+    if args.endpoint_mode in ("neural", "blue"):
+        args.endpoint_markers = True
+    else:
+        args.endpoint_markers = False
     args.measurement_centerline_points = max(2, int(args.measurement_centerline_points))
     args.measurement_smoothing_alpha = float(np.clip(args.measurement_smoothing_alpha, 0.0, 1.0))
     args.measurement_smoothing_gate = max(0.0, float(args.measurement_smoothing_gate))
     args.measurement_mask_centerline_gate = max(0.0, float(args.measurement_mask_centerline_gate))
     args.measurement_mask_centerline_max_residual = max(0.0, float(args.measurement_mask_centerline_max_residual))
     args.measurement_gate_reacquire_after = max(0, int(args.measurement_gate_reacquire_after))
+    args.cable_segment_length = max(0.0, float(args.cable_segment_length))
+    if args.cable_segment_length <= 0.0 and args.cable_length > 0.0:
+        args.cable_segment_length = args.cable_length * args.cable_length_scale / max(args.cable_segments, 1)
     args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
     args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
     args.pf_reference_ordering_gate = max(0.0, float(args.pf_reference_ordering_gate))
@@ -438,6 +479,83 @@ def detector_description(args):
             f"V {int(args.hsv_v_min)}-{int(args.hsv_v_max)}"
         )
     return f"PIDNet mask threshold {float(args.neural_detector_threshold):.2f}"
+
+
+def detect_endpoint_markers(
+    cable_detector,
+    bgr,
+    point_cloud,
+    args,
+    confidence_measure=None,
+    reference_nodes=None,
+    endpoint_mask=None,
+):
+    if not bool(args.endpoint_markers) or args.endpoint_mode == "none":
+        return None
+    if args.endpoint_mode == "normal":
+        return None
+    if args.endpoint_mode == "blue":
+        return detect_blue_endpoint_markers(
+            bgr,
+            point_cloud,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            confidence_map=confidence_measure,
+            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+            reference_nodes=reference_nodes,
+            hue_min=args.endpoint_marker_h_min,
+            hue_max=args.endpoint_marker_h_max,
+            saturation_min=args.endpoint_marker_s_min,
+            value_min=args.endpoint_marker_v_min,
+            min_area_px=args.endpoint_marker_min_area,
+            min_points_per_marker=args.endpoint_marker_min_points,
+            open_kernel=args.endpoint_marker_open_kernel,
+            close_kernel=args.endpoint_marker_close_kernel,
+            max_points_per_marker=args.endpoint_marker_points,
+            tape_length_m=args.endpoint_marker_tape_length,
+            offset_to_tips=bool(args.endpoint_marker_offset_to_tips),
+        )
+    if endpoint_mask is None:
+        if not hasattr(cable_detector, "create_endpoint_mask"):
+            return None
+        endpoint_mask = cable_detector.create_endpoint_mask(bgr)
+    endpoint_mask = cleanup_marker_mask(
+        endpoint_mask,
+        open_kernel=args.endpoint_marker_open_kernel,
+        close_kernel=args.endpoint_marker_close_kernel,
+    )
+    return endpoint_markers_from_mask(
+        endpoint_mask,
+        point_cloud,
+        depth_min=args.depth_min,
+        depth_max=args.depth_max,
+        confidence_map=confidence_measure,
+        max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+        reference_nodes=reference_nodes,
+        min_area_px=args.endpoint_marker_min_area,
+        min_points_per_marker=args.endpoint_marker_min_points,
+        max_points_per_marker=args.endpoint_marker_points,
+        tape_length_m=args.endpoint_marker_tape_length,
+        offset_to_tips=bool(args.endpoint_marker_offset_to_tips),
+    )
+
+
+def anchor_measurement_to_endpoint_markers(measurement):
+    if measurement is None:
+        return None
+    endpoint_nodes = np.asarray(getattr(measurement, "endpoint_nodes", None), dtype=np.float32)
+    if endpoint_nodes.ndim != 2 or endpoint_nodes.shape[0] < 2 or endpoint_nodes.shape[1] < 3:
+        return measurement
+    nodes = np.asarray(getattr(measurement, "points_xyz", None), dtype=np.float32)
+    if nodes.ndim != 2 or nodes.shape[0] < 2 or nodes.shape[1] < 3:
+        return measurement
+    anchored = nodes.copy()
+    if np.all(np.isfinite(endpoint_nodes[0, :3])):
+        anchored[0, :3] = endpoint_nodes[0, :3]
+    if np.all(np.isfinite(endpoint_nodes[-1, :3])):
+        anchored[-1, :3] = endpoint_nodes[-1, :3]
+    residual = polyline_residual(getattr(measurement, "source_points", np.empty((0, 3), dtype=np.float32)), anchored)
+    return replace(measurement, points_xyz=np.ascontiguousarray(anchored, dtype=np.float32), residual_m=float(residual))
 
 
 def make_particle_filter_config(args):
@@ -584,6 +702,7 @@ def run_live(args):
                 stage_seconds["cloud"] += time.monotonic() - stage_start
 
                 detection = None
+                endpoint_mask = None
                 measurement = None
                 raw_measurement = None
                 tracking_diagnostics = {}
@@ -607,12 +726,19 @@ def run_live(args):
                     )
                     pidnet_mask_point_measurement = args.detector_backend == "pidnet"
                     extract_geometry = not (mask_only_detection or pidnet_mask_point_measurement)
-                    detection = cable_detector.detect(
-                        bgr,
-                        roi_bbox=roi_bbox,
-                        scale=args.detector_scale,
-                        extract_geometry=extract_geometry,
-                    )
+                    if args.detector_backend == "pidnet" and hasattr(cable_detector, "detect_with_channel_masks"):
+                        detection, endpoint_mask = cable_detector.detect_with_channel_masks(
+                            bgr,
+                            scale=args.detector_scale,
+                            extract_geometry=extract_geometry,
+                        )
+                    else:
+                        detection = cable_detector.detect(
+                            bgr,
+                            roi_bbox=roi_bbox,
+                            scale=args.detector_scale,
+                            extract_geometry=extract_geometry,
+                        )
                     if roi_bbox is not None and extract_geometry and len(detection.centerline_xy) < 2:
                         detection = cable_detector.detect(bgr, scale=args.detector_scale)
                     if detection is not None and (pidnet_mask_point_measurement or len(detection.centerline_xy) >= 2):
@@ -671,6 +797,17 @@ def run_live(args):
                             reference_gate_m=reference_gate,
                             reference_min_points=args.pf_min_measurement_points,
                         )
+                    endpoint_markers = detect_endpoint_markers(
+                        cable_detector,
+                        bgr,
+                        point_cloud,
+                        args,
+                        confidence_measure=confidence_measure,
+                        reference_nodes=last_filter_nodes,
+                        endpoint_mask=endpoint_mask,
+                    )
+                    measurement = attach_endpoint_markers_to_measurement(measurement, endpoint_markers)
+                    measurement = anchor_measurement_to_endpoint_markers(measurement)
                     raw_measurement = measurement
                     measurement, last_smoothed_measurement_nodes, smoothing_diagnostics = smooth_measurement_nodes(
                         measurement,
@@ -1113,6 +1250,8 @@ def cable_status(detection, measurement, estimate, filter_result, segment_count,
     if estimate is not None:
         residual = float(getattr(estimate, "residual_m", 0.0))
         source_count = 0 if measurement is None else len(getattr(measurement, "source_points", ()))
+        marker_count = int(getattr(measurement, "endpoint_marker_count", 0)) if measurement is not None else 0
+        marker_text = f" endpoints={marker_count}/2" if marker_count > 0 else ""
         mode = "measurement"
         if filter_result is not None:
             mode = "filtered" if filter_result.measurement_used else f"prediction lost={filter_result.lost_frames}"
@@ -1127,7 +1266,7 @@ def cable_status(detection, measurement, estimate, filter_result, segment_count,
         return (
             f"{prefix} | {segment_count} segments | {mode} | residual {residual:.4f}m | "
             f"source={source_count} mask components {detection.component_count} "
-            f"centerline {centerline_count} branches {detection.branch_count}{diag_text}"
+            f"centerline {centerline_count} branches {detection.branch_count}{marker_text}{diag_text}"
         )
     if measurement is None:
         return (
