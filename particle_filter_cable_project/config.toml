@@ -49,18 +49,13 @@ base_channels = 24
 
 [endpoint]
 # Endpoint anchor source:
-#   "neural" -> use the PIDNet endpoint/blue-tape output channel
-#   "blue"   -> use HSV blue tape thresholding
+#   "neural" -> use the PIDNet endpoint/tape output channel
 #   "normal" -> use inferred cable endpoints only
 #   "none"   -> disable endpoint anchors
 mode = "neural"
 
 [endpoint_markers]
 enabled = true
-h_min = 90
-h_max = 135
-s_min = 70
-v_min = 40
 min_area_px = 50
 min_points = 8
 open_kernel = 3

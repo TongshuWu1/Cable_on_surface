@@ -13,7 +13,6 @@ from cable_detection import (
     attach_endpoint_markers_to_measurement,
     cable_measurement_from_mask_points,
     cleanup_marker_mask,
-    detect_blue_endpoint_markers,
     endpoint_markers_from_mask,
     fit_cable_segments_from_zed_point_cloud,
     polyline_residual,
@@ -113,12 +112,8 @@ def parse_args():
     parser.add_argument("--neural-detector-device", default=config_value(config, "pidnet", "device", "cuda"), help="PyTorch device for PIDNet detector. Default: cuda.")
     parser.add_argument("--neural-detector-threshold", type=float, default=config_value(config, "pidnet", "threshold", 0.50), help="PIDNet probability threshold for the binary cable mask.")
     parser.add_argument("--neural-detector-base-channels", type=int, default=config_value(config, "pidnet", "base_channels", 24))
-    parser.add_argument("--endpoint-mode", choices=("neural", "blue", "normal", "none"), default=str(config_value(config, "endpoint", "mode", "neural")).lower(), help="Endpoint anchor source. neural uses the PIDNet endpoint channel; blue uses HSV blue tape; normal uses inferred cable endpoints; none disables endpoint anchors.")
+    parser.add_argument("--endpoint-mode", choices=("neural", "normal", "none"), default=str(config_value(config, "endpoint", "mode", "neural")).lower(), help="Endpoint anchor source. neural uses the PIDNet endpoint channel; normal uses inferred cable endpoints; none disables endpoint anchors.")
     parser.add_argument("--endpoint-markers", action=argparse.BooleanOptionalAction, default=config_value(config, "endpoint_markers", "enabled", True), help="Detect endpoint/tape markers and use them as measured cable endpoints.")
-    parser.add_argument("--endpoint-marker-h-min", type=int, default=config_value(config, "endpoint_markers", "h_min", 90))
-    parser.add_argument("--endpoint-marker-h-max", type=int, default=config_value(config, "endpoint_markers", "h_max", 135))
-    parser.add_argument("--endpoint-marker-s-min", type=int, default=config_value(config, "endpoint_markers", "s_min", 70))
-    parser.add_argument("--endpoint-marker-v-min", type=int, default=config_value(config, "endpoint_markers", "v_min", 40))
     parser.add_argument("--endpoint-marker-min-area", type=int, default=config_value(config, "endpoint_markers", "min_area_px", 50))
     parser.add_argument("--endpoint-marker-min-points", type=int, default=config_value(config, "endpoint_markers", "min_points", 8))
     parser.add_argument("--endpoint-marker-open-kernel", type=int, default=config_value(config, "endpoint_markers", "open_kernel", 3))
@@ -355,19 +350,15 @@ def parse_args():
     args.hsv_geometry_every = max(0, int(args.hsv_geometry_every))
     args.hsv_mask_points = max(2, int(args.hsv_mask_points))
     args.endpoint_mode = str(args.endpoint_mode).strip().lower()
-    if args.endpoint_mode not in ("neural", "blue", "normal", "none"):
-        raise ValueError('endpoint.mode must be one of "neural", "blue", "normal", or "none".')
-    args.endpoint_marker_h_min = int(np.clip(args.endpoint_marker_h_min, 0, 179))
-    args.endpoint_marker_h_max = int(np.clip(args.endpoint_marker_h_max, 0, 179))
-    args.endpoint_marker_s_min = int(np.clip(args.endpoint_marker_s_min, 0, 255))
-    args.endpoint_marker_v_min = int(np.clip(args.endpoint_marker_v_min, 0, 255))
+    if args.endpoint_mode not in ("neural", "normal", "none"):
+        raise ValueError('endpoint.mode must be one of "neural", "normal", or "none".')
     args.endpoint_marker_min_area = max(1, int(args.endpoint_marker_min_area))
     args.endpoint_marker_min_points = max(1, int(args.endpoint_marker_min_points))
     args.endpoint_marker_open_kernel = max(0, int(args.endpoint_marker_open_kernel))
     args.endpoint_marker_close_kernel = max(0, int(args.endpoint_marker_close_kernel))
     args.endpoint_marker_points = max(1, int(args.endpoint_marker_points))
     args.endpoint_marker_tape_length = max(0.0, float(args.endpoint_marker_tape_length))
-    if args.endpoint_mode in ("neural", "blue"):
+    if args.endpoint_mode == "neural":
         args.endpoint_markers = True
     else:
         args.endpoint_markers = False
@@ -494,27 +485,6 @@ def detect_endpoint_markers(
         return None
     if args.endpoint_mode == "normal":
         return None
-    if args.endpoint_mode == "blue":
-        return detect_blue_endpoint_markers(
-            bgr,
-            point_cloud,
-            depth_min=args.depth_min,
-            depth_max=args.depth_max,
-            confidence_map=confidence_measure,
-            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
-            reference_nodes=reference_nodes,
-            hue_min=args.endpoint_marker_h_min,
-            hue_max=args.endpoint_marker_h_max,
-            saturation_min=args.endpoint_marker_s_min,
-            value_min=args.endpoint_marker_v_min,
-            min_area_px=args.endpoint_marker_min_area,
-            min_points_per_marker=args.endpoint_marker_min_points,
-            open_kernel=args.endpoint_marker_open_kernel,
-            close_kernel=args.endpoint_marker_close_kernel,
-            max_points_per_marker=args.endpoint_marker_points,
-            tape_length_m=args.endpoint_marker_tape_length,
-            offset_to_tips=bool(args.endpoint_marker_offset_to_tips),
-        )
     if endpoint_mask is None:
         if not hasattr(cable_detector, "create_endpoint_mask"):
             return None
@@ -647,6 +617,7 @@ def run_live(args):
     latest_vertices = np.empty((0, 6), dtype=np.float32)
     latest_confidence_measure = None
     latest_detection = None
+    latest_endpoint_mask = None
     last_smoothed_measurement_nodes = None
     last_detection_hint_xy = None
     last_filter_nodes = None
@@ -743,6 +714,7 @@ def run_live(args):
                         detection = cable_detector.detect(bgr, scale=args.detector_scale)
                     if detection is not None and (pidnet_mask_point_measurement or len(detection.centerline_xy) >= 2):
                         latest_detection = detection
+                        latest_endpoint_mask = endpoint_mask
                         if len(detection.centerline_xy) >= 2:
                             last_detection_hint_xy = detection.centerline_xy
                     stage_seconds["detect"] += time.monotonic() - stage_start
@@ -848,6 +820,7 @@ def run_live(args):
                         last_filter_lost_frames = 0
                 elif cable_detector is not None:
                     detection = latest_detection
+                    endpoint_mask = latest_endpoint_mask
                     estimate = last_filter_estimate
                     filter_result = last_filter_result
 
@@ -883,6 +856,7 @@ def run_live(args):
                 debug_bgr = draw_cable_rgb_panel(
                     bgr,
                     detection=detection,
+                    endpoint_mask=endpoint_mask,
                     measurement=display_measurement,
                     estimate=display_estimate,
                     segment_count=args.cable_segments,
@@ -1304,6 +1278,7 @@ def format_tracking_diagnostics(diagnostics):
 def draw_cable_rgb_panel(
     bgr,
     detection=None,
+    endpoint_mask=None,
     measurement=None,
     estimate=None,
     segment_count=2,
@@ -1314,6 +1289,7 @@ def draw_cable_rgb_panel(
         return draw_cable_mask_view(
             bgr,
             detection=detection,
+            endpoint_mask=endpoint_mask,
             measurement=measurement,
             estimate=estimate,
             segment_count=segment_count,
@@ -1323,6 +1299,7 @@ def draw_cable_rgb_panel(
         return draw_cable_debug_overlay(
             bgr,
             detection=detection,
+            endpoint_mask=endpoint_mask,
             measurement=measurement,
             estimate=estimate,
             segment_count=segment_count,
@@ -1330,6 +1307,7 @@ def draw_cable_rgb_panel(
     return draw_cable_segmentation_view(
         bgr,
         detection=detection,
+        endpoint_mask=endpoint_mask,
         measurement=measurement,
         estimate=estimate,
         segment_count=segment_count,
@@ -1337,7 +1315,7 @@ def draw_cable_rgb_panel(
     )
 
 
-def draw_cable_debug_overlay(bgr, detection=None, measurement=None, estimate=None, segment_count=2):
+def draw_cable_debug_overlay(bgr, detection=None, endpoint_mask=None, measurement=None, estimate=None, segment_count=2):
     panel = np.asarray(bgr, dtype=np.uint8).copy()
     if detection is not None:
         if detection.mask is not None and np.any(detection.mask):
@@ -1356,6 +1334,8 @@ def draw_cable_debug_overlay(bgr, detection=None, measurement=None, estimate=Non
             pts = np.round(centerline).astype(np.int32).reshape(-1, 1, 2)
             cv2.polylines(panel, [pts], isClosed=False, color=(80, 255, 120), thickness=2, lineType=cv2.LINE_AA)
             draw_2d_segment_nodes(panel, centerline, segment_count + 1)
+    draw_endpoint_mask_overlay(panel, endpoint_mask)
+    draw_endpoint_marker_overlay(panel, measurement)
 
     if measurement is not None:
         measured_segments = max(0, len(measurement.points_xyz) - 1)
@@ -1374,6 +1354,7 @@ def draw_cable_debug_overlay(bgr, detection=None, measurement=None, estimate=Non
 def draw_cable_segmentation_view(
     bgr,
     detection=None,
+    endpoint_mask=None,
     measurement=None,
     estimate=None,
     segment_count=2,
@@ -1391,7 +1372,9 @@ def draw_cable_segmentation_view(
         contours, _hierarchy = cv2.findContours(detection.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(panel, contours, -1, (255, 255, 255), 1, cv2.LINE_AA)
 
+    draw_endpoint_mask_overlay(panel, endpoint_mask)
     draw_detection_geometry(panel, detection, segment_count)
+    draw_endpoint_marker_overlay(panel, measurement)
     draw_cable_status_text(panel, detection, measurement, estimate, segment_count, mode_text=detector_description)
     return panel
 
@@ -1399,6 +1382,7 @@ def draw_cable_segmentation_view(
 def draw_cable_mask_view(
     bgr,
     detection=None,
+    endpoint_mask=None,
     measurement=None,
     estimate=None,
     segment_count=2,
@@ -1408,12 +1392,47 @@ def draw_cable_mask_view(
     panel = np.full((shape[0], shape[1], 3), 18, dtype=np.uint8)
     if detection is not None and detection.mask is not None and np.any(detection.mask):
         panel[detection.mask > 0] = (255, 255, 255)
+    draw_endpoint_mask_overlay(panel, endpoint_mask, alpha=1.0)
     if detection is not None and detection.skeleton is not None and np.any(detection.skeleton):
         ys, xs = np.nonzero(detection.skeleton)
         panel[ys, xs] = (0, 180, 255)
     draw_detection_geometry(panel, detection, segment_count)
+    draw_endpoint_marker_overlay(panel, measurement)
     draw_cable_status_text(panel, detection, measurement, estimate, segment_count, mode_text=detector_description)
     return panel
+
+
+def draw_endpoint_mask_overlay(panel, endpoint_mask, alpha=0.75):
+    if endpoint_mask is None:
+        return
+    mask = np.asarray(endpoint_mask, dtype=np.uint8)
+    if mask.ndim != 2 or not np.any(mask):
+        return
+    if mask.shape[:2] != panel.shape[:2]:
+        mask = cv2.resize(mask, (panel.shape[1], panel.shape[0]), interpolation=cv2.INTER_NEAREST)
+    pixels = mask > 0
+    tint = np.zeros_like(panel)
+    tint[:, :, 0] = 255
+    tint[:, :, 2] = 255
+    panel[pixels] = cv2.addWeighted(panel[pixels], 1.0 - float(alpha), tint[pixels], float(alpha), 0.0)
+    contours, _hierarchy = cv2.findContours((pixels.astype(np.uint8) * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(panel, contours, -1, (255, 180, 255), 2, cv2.LINE_AA)
+
+
+def draw_endpoint_marker_overlay(panel, measurement):
+    if measurement is None:
+        return
+    centers = getattr(measurement, "endpoint_marker_centers_xy", None)
+    if centers is None:
+        return
+    centers = np.asarray(centers, dtype=np.float32).reshape(-1, 2)
+    for index, center in enumerate(centers):
+        if not np.all(np.isfinite(center)):
+            continue
+        point = tuple(np.round(center).astype(np.int32))
+        color = (255, 80, 255) if index == 0 else (255, 150, 255)
+        cv2.circle(panel, point, 9, color, -1, cv2.LINE_AA)
+        cv2.circle(panel, point, 12, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def draw_detection_geometry(panel, detection, segment_count):

@@ -523,53 +523,6 @@ def endpoint_markers_from_mask(
     )
 
 
-def detect_blue_endpoint_markers(
-    bgr,
-    point_cloud,
-    depth_min=0.05,
-    depth_max=None,
-    confidence_map=None,
-    max_confidence=None,
-    reference_nodes=None,
-    hue_min=90,
-    hue_max=135,
-    saturation_min=70,
-    value_min=40,
-    min_area_px=50,
-    min_points_per_marker=8,
-    open_kernel=3,
-    close_kernel=5,
-    max_points_per_marker=256,
-    tape_length_m=0.035,
-    offset_to_tips=True,
-):
-    bgr = np.asarray(bgr, dtype=np.uint8)
-    if bgr.ndim != 3 or bgr.shape[2] < 3:
-        return None
-    mask = blue_hsv_mask(
-        bgr,
-        hue_min=hue_min,
-        hue_max=hue_max,
-        saturation_min=saturation_min,
-        value_min=value_min,
-    )
-    mask = cleanup_marker_mask(mask, open_kernel=open_kernel, close_kernel=close_kernel)
-    return endpoint_markers_from_mask(
-        mask,
-        point_cloud,
-        depth_min=depth_min,
-        depth_max=depth_max,
-        confidence_map=confidence_map,
-        max_confidence=max_confidence,
-        reference_nodes=reference_nodes,
-        min_area_px=min_area_px,
-        min_points_per_marker=min_points_per_marker,
-        max_points_per_marker=max_points_per_marker,
-        tape_length_m=tape_length_m,
-        offset_to_tips=offset_to_tips,
-    )
-
-
 def attach_endpoint_markers_to_measurement(measurement, markers):
     if measurement is None or markers is None:
         return measurement
@@ -592,31 +545,6 @@ def cleanup_marker_mask(mask, open_kernel=3, close_kernel=5):
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
     return np.ascontiguousarray(mask, dtype=np.uint8)
-
-
-def blue_hsv_mask(bgr, hue_min=90, hue_max=135, saturation_min=70, value_min=40):
-    hsv = cv2.cvtColor(np.asarray(bgr, dtype=np.uint8), cv2.COLOR_BGR2HSV)
-    hue_min = int(np.clip(hue_min, 0, 179))
-    hue_max = int(np.clip(hue_max, 0, 179))
-    saturation_min = int(np.clip(saturation_min, 0, 255))
-    value_min = int(np.clip(value_min, 0, 255))
-    if hue_min <= hue_max:
-        return cv2.inRange(
-            hsv,
-            np.array([hue_min, saturation_min, value_min], dtype=np.uint8),
-            np.array([hue_max, 255, 255], dtype=np.uint8),
-        )
-    low = cv2.inRange(
-        hsv,
-        np.array([0, saturation_min, value_min], dtype=np.uint8),
-        np.array([hue_max, 255, 255], dtype=np.uint8),
-    )
-    high = cv2.inRange(
-        hsv,
-        np.array([hue_min, saturation_min, value_min], dtype=np.uint8),
-        np.array([179, 255, 255], dtype=np.uint8),
-    )
-    return cv2.bitwise_or(low, high)
 
 
 def order_marker_records(markers, reference_nodes=None):
