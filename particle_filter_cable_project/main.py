@@ -534,6 +534,36 @@ def anchor_measurement_to_endpoint_markers(measurement):
     return replace(measurement, points_xyz=np.ascontiguousarray(anchored, dtype=np.float32), residual_m=float(residual))
 
 
+def anchor_estimate_to_known_endpoints(estimate, endpoint_source):
+    if estimate is None or endpoint_source is None:
+        return estimate
+    endpoint_nodes = np.asarray(getattr(endpoint_source, "endpoint_nodes", None), dtype=np.float32)
+    if endpoint_nodes.ndim != 2 or endpoint_nodes.shape[0] < 2 or endpoint_nodes.shape[1] < 3:
+        return estimate
+    nodes = np.asarray(getattr(estimate, "points_xyz", None), dtype=np.float32)
+    if nodes.ndim != 2 or nodes.shape[0] < 2 or nodes.shape[1] < 3:
+        return estimate
+
+    anchored = nodes.copy()
+    if np.all(np.isfinite(endpoint_nodes[0, :3])):
+        anchored[0, :3] = endpoint_nodes[0, :3]
+    if np.all(np.isfinite(endpoint_nodes[-1, :3])):
+        anchored[-1, :3] = endpoint_nodes[-1, :3]
+
+    source_points = np.asarray(getattr(estimate, "source_points", np.empty((0, 3))), dtype=np.float32)
+    residual = polyline_residual(source_points, anchored) if len(source_points) else float(getattr(estimate, "residual_m", 0.0))
+    return replace(
+        estimate,
+        points_xyz=np.ascontiguousarray(anchored, dtype=np.float32),
+        residual_m=float(residual),
+        endpoint_nodes=np.ascontiguousarray(endpoint_nodes, dtype=np.float32),
+        endpoint_marker_centers_xyz=getattr(endpoint_source, "endpoint_marker_centers_xyz", None),
+        endpoint_marker_centers_xy=getattr(endpoint_source, "endpoint_marker_centers_xy", None),
+        endpoint_marker_mask=getattr(endpoint_source, "endpoint_marker_mask", None),
+        endpoint_marker_count=int(getattr(endpoint_source, "endpoint_marker_count", 0)),
+    )
+
+
 def make_particle_filter_config(args):
     return CableParticleFilterConfig(
         particle_count=int(args.pf_particles),
@@ -796,6 +826,9 @@ def run_live(args):
                         args,
                         last_filter_lost_frames,
                     )
+                    measurement = anchor_measurement_to_endpoint_markers(measurement)
+                    if measurement is not None:
+                        last_smoothed_measurement_nodes = measurement_nodes_array(measurement)
                     stage_seconds["fit"] += time.monotonic() - stage_start
                     now = time.monotonic()
                     filter_dt = 1.0 / max(float(args.fps), 1.0) if last_filter_time is None else now - last_filter_time
@@ -804,6 +837,7 @@ def run_live(args):
                         stage_start = time.monotonic()
                         filter_result = particle_filter.step(measurement, filter_dt)
                         estimate = filtered_cable_estimate(measurement, filter_result)
+                        estimate = anchor_estimate_to_known_endpoints(estimate, measurement)
                         stage_seconds["filter"] += time.monotonic() - stage_start
                     else:
                         estimate = measurement
