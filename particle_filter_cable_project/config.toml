@@ -62,7 +62,7 @@ open_kernel = 3
 close_kernel = 5
 max_points_per_marker = 256
 tape_length_m = 0.035
-offset_to_tips = true
+offset_to_tips = false
 
 [detector]
 # Options: "pidnet" for trained neural segmentation, "hsv" for HSV range or

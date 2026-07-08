@@ -457,7 +457,7 @@ def endpoint_markers_from_mask(
     min_points_per_marker=8,
     max_points_per_marker=256,
     tape_length_m=0.035,
-    offset_to_tips=True,
+    offset_to_tips=False,
 ):
     mask = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -565,7 +565,7 @@ def endpoint_nodes_from_marker_centers(
     centers_xyz,
     reference_nodes=None,
     tape_length_m=0.035,
-    offset_to_tips=True,
+    offset_to_tips=False,
 ):
     centers = valid_xyz(centers_xyz)
     if len(centers) == 0:
