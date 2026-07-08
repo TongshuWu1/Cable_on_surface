@@ -325,6 +325,9 @@ def parse_args():
         help="Minimum fraction of support points each expected visible segment should own.",
     )
     parser.add_argument("--pf-bend-penalty", type=float, default=config_value(config, "particle_filter", "bend_penalty_m", pf_defaults.bend_penalty_m))
+    parser.add_argument("--pf-coarse-score-points", type=int, default=config_value(config, "particle_filter", "coarse_score_points", pf_defaults.coarse_score_points))
+    parser.add_argument("--pf-coarse-score-full-fraction", type=float, default=config_value(config, "particle_filter", "coarse_score_full_fraction", pf_defaults.coarse_score_full_fraction))
+    parser.add_argument("--pf-coarse-score-min-particles", type=int, default=config_value(config, "particle_filter", "coarse_score_min_particles", pf_defaults.coarse_score_min_particles))
     parser.add_argument("--pf-top-particles", type=int, default=config_value(config, "particle_filter", "top_particles", pf_defaults.top_particle_count))
     parser.add_argument("--pf-global-random-ratio", type=float, default=config_value(config, "particle_filter", "global_random_particle_ratio", pf_defaults.global_random_particle_ratio))
     parser.add_argument("--pf-global-random-bounds-padding", type=float, default=config_value(config, "particle_filter", "global_random_bounds_padding_m", pf_defaults.global_random_bounds_padding_m))
@@ -381,6 +384,9 @@ def parse_args():
     args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
     args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
     args.pf_reference_ordering_gate = max(0.0, float(args.pf_reference_ordering_gate))
+    args.pf_coarse_score_points = max(0, int(args.pf_coarse_score_points))
+    args.pf_coarse_score_full_fraction = float(np.clip(args.pf_coarse_score_full_fraction, 0.0, 1.0))
+    args.pf_coarse_score_min_particles = max(1, int(args.pf_coarse_score_min_particles))
     args.pf_top_particles = max(1, int(args.pf_top_particles))
     args.pf_global_random_ratio = float(np.clip(args.pf_global_random_ratio, 0.0, 1.0))
     args.pf_global_random_bounds_padding = max(0.0, float(args.pf_global_random_bounds_padding))
@@ -601,6 +607,9 @@ def make_particle_filter_config(args):
         coverage_penalty_m=float(args.pf_coverage_penalty),
         coverage_min_fraction=float(args.pf_coverage_min_fraction),
         bend_penalty_m=float(args.pf_bend_penalty),
+        coarse_score_points=int(args.pf_coarse_score_points),
+        coarse_score_full_fraction=float(args.pf_coarse_score_full_fraction),
+        coarse_score_min_particles=int(args.pf_coarse_score_min_particles),
         top_particle_count=int(args.pf_top_particles),
         global_random_particle_ratio=float(args.pf_global_random_ratio),
         global_random_bounds_padding_m=float(args.pf_global_random_bounds_padding),
@@ -1342,6 +1351,16 @@ def cable_tracking_diagnostics(previous_filter_nodes, raw_measurement, measureme
         if filter_result is not None
         else np.nan
     )
+    diagnostics["coarse_score_points"] = (
+        int(getattr(filter_result, "coarse_score_point_count", 0))
+        if filter_result is not None
+        else 0
+    )
+    diagnostics["full_score_particles"] = (
+        int(getattr(filter_result, "full_score_particle_count", 0))
+        if filter_result is not None
+        else 0
+    )
     return diagnostics
 
 
@@ -1502,6 +1521,10 @@ def format_tracking_diagnostics(diagnostics):
     random_ratio = diagnostics.get("global_random_ratio", np.nan)
     if np.isfinite(random_ratio):
         parts.append(f"rand={random_ratio:.2f}")
+    coarse_points = int(diagnostics.get("coarse_score_points", 0) or 0)
+    full_particles = int(diagnostics.get("full_score_particles", 0) or 0)
+    if coarse_points > 0 and full_particles > 0:
+        parts.append(f"score={coarse_points}c/{full_particles}f")
     return "" if not parts else " | " + " ".join(parts)
 
 

@@ -46,6 +46,9 @@ class CableParticleFilterConfig:
     coverage_penalty_m: float = 0.025
     coverage_min_fraction: float = 0.05
     bend_penalty_m: float = 0.030
+    coarse_score_points: int = 192
+    coarse_score_full_fraction: float = 0.25
+    coarse_score_min_particles: int = 160
     map_estimate_effective_ratio: float = 0.35
     top_particle_count: int = 50
     global_random_particle_ratio: float = 0.10
@@ -75,6 +78,8 @@ class CableParticleFilterResult:
     visible_nodes: np.ndarray | None = None
     measurement_proposal_ratio: float = 0.0
     global_random_particle_ratio: float = 0.0
+    coarse_score_point_count: int = 0
+    full_score_particle_count: int = 0
 
 
 class CableParticleFilter:
@@ -101,6 +106,8 @@ class CableParticleFilter:
         self.last_measurement_point_count = 0
         self.last_measurement_proposal_ratio = 0.0
         self.last_global_random_particle_ratio = 0.0
+        self.last_coarse_score_point_count = 0
+        self.last_full_score_particle_count = 0
         self.last_ordered_measurement_nodes = None
         self.last_endpoint_nodes = None
         self.measurement_update_count = 0
@@ -254,17 +261,10 @@ class CableParticleFilter:
         if visible_segments is not None:
             visible_segments = np.asarray(visible_segments, dtype=bool).reshape(-1)
             expected_segments = np.flatnonzero(visible_segments)
-        scores = particle_distance_scores(
+        scores = self._score_particles(
             measurement_points,
-            self.particles,
             outlier_distance=outlier_distance,
-            score_keep_fraction=float(self.config.score_keep_fraction),
-            coverage_penalty_m=float(self.config.coverage_penalty_m),
-            coverage_min_fraction=float(self.config.coverage_min_fraction),
-            bend_penalty_m=float(getattr(self.config, "bend_penalty_m", 0.0)),
             expected_segments=expected_segments,
-            backend=str(getattr(self.config, "scoring_backend", "auto")),
-            chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
         )
 
         if not np.any(np.isfinite(scores)):
@@ -338,6 +338,8 @@ class CableParticleFilter:
             visible_nodes=self.last_visible_nodes.copy(),
             measurement_proposal_ratio=float(self.last_measurement_proposal_ratio),
             global_random_particle_ratio=float(self.last_global_random_particle_ratio),
+            coarse_score_point_count=int(self.last_coarse_score_point_count),
+            full_score_particle_count=int(self.last_full_score_particle_count),
         )
 
     def _estimate_nodes(self):
@@ -563,6 +565,55 @@ class CableParticleFilter:
 
         blend = (error_m - start_error) / (full_error - start_error)
         return stable_ratio + blend * (max_ratio - stable_ratio)
+
+    def _score_particles(self, measurement_points, outlier_distance, expected_segments=None):
+        self.last_coarse_score_point_count = 0
+        self.last_full_score_particle_count = 0
+        particle_count = len(self.particles)
+        point_count = len(measurement_points)
+        coarse_points = int(getattr(self.config, "coarse_score_points", 0))
+        full_fraction = float(np.clip(getattr(self.config, "coarse_score_full_fraction", 1.0), 0.0, 1.0))
+        min_full = max(1, int(getattr(self.config, "coarse_score_min_particles", 1)))
+        top_count = max(1, int(getattr(self.config, "top_particle_count", 50)))
+        full_count = int(np.ceil(full_fraction * particle_count))
+        full_count = int(np.clip(max(full_count, min_full, top_count * 3), 1, particle_count))
+        use_coarse = coarse_points > 0 and point_count > coarse_points and full_count < particle_count
+
+        common = dict(
+            outlier_distance=outlier_distance,
+            score_keep_fraction=float(self.config.score_keep_fraction),
+            coverage_penalty_m=float(self.config.coverage_penalty_m),
+            coverage_min_fraction=float(self.config.coverage_min_fraction),
+            bend_penalty_m=float(getattr(self.config, "bend_penalty_m", 0.0)),
+            expected_segments=expected_segments,
+            backend=str(getattr(self.config, "scoring_backend", "auto")),
+            chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
+        )
+        if not use_coarse:
+            self.last_full_score_particle_count = int(particle_count)
+            return particle_distance_scores(measurement_points, self.particles, **common)
+
+        coarse_measurement_points = sample_points(measurement_points, coarse_points)
+        coarse_scores = particle_distance_scores(coarse_measurement_points, self.particles, **common)
+        if not np.any(np.isfinite(coarse_scores)):
+            self.last_full_score_particle_count = int(particle_count)
+            return coarse_scores
+
+        finite_scores = np.where(
+            np.isfinite(coarse_scores),
+            coarse_scores,
+            np.nanmax(coarse_scores[np.isfinite(coarse_scores)]) + float(outlier_distance) ** 2,
+        )
+        full_indices = np.argsort(finite_scores)[:full_count]
+        scores = coarse_scores.copy()
+        scores[full_indices] = particle_distance_scores(
+            measurement_points,
+            self.particles[full_indices],
+            **common,
+        )
+        self.last_coarse_score_point_count = int(len(coarse_measurement_points))
+        self.last_full_score_particle_count = int(len(full_indices))
+        return scores
 
     def _measurement_endpoint_nodes(self, measurement):
         if measurement is None:
