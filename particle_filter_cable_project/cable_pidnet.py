@@ -116,10 +116,11 @@ class PIDNetSmallBinary(TorchModule):
     but is compact enough to train quickly for a single cable class.
     """
 
-    def __init__(self, base_channels=24):
+    def __init__(self, base_channels=24, output_channels=1):
         require_torch()
         super().__init__()
         c = int(base_channels)
+        output_channels = max(1, int(output_channels))
         self.stem = nn.Sequential(
             ConvBNAct(3, c, stride=2),
             ConvBNAct(c, c * 2, stride=2),
@@ -145,7 +146,7 @@ class PIDNetSmallBinary(TorchModule):
         self.seg_head = nn.Sequential(
             ConvBNAct(c * 5, c * 2, kernel_size=3),
             ResidualBlock(c * 2),
-            nn.Conv2d(c * 2, 1, kernel_size=1),
+            nn.Conv2d(c * 2, output_channels, kernel_size=1),
         )
 
     def forward(self, x):
@@ -178,8 +179,9 @@ class PidNetSegmenter:
         payload = torch.load(self.checkpoint_path, map_location=self.device)
         config = payload.get("config", {}) if isinstance(payload, dict) else {}
         base_channels = int(config.get("base_channels", base_channels))
-        self.model = PIDNetSmallBinary(base_channels=base_channels).to(self.device)
         state_dict = payload.get("model_state", payload) if isinstance(payload, dict) else payload
+        output_channels = int(config.get("output_channels", infer_output_channels_from_state_dict(state_dict)))
+        self.model = PIDNetSmallBinary(base_channels=base_channels, output_channels=output_channels).to(self.device)
         self.model.load_state_dict(state_dict)
         self.model.eval()
         self.mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
@@ -243,3 +245,11 @@ def resolve_device(device):
     if resolved.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested for PIDNet, but torch.cuda.is_available() is false.")
     return resolved
+
+
+def infer_output_channels_from_state_dict(state_dict):
+    if isinstance(state_dict, dict):
+        weight = state_dict.get("seg_head.2.weight")
+        if weight is not None and hasattr(weight, "shape") and len(weight.shape) >= 1:
+            return int(weight.shape[0])
+    return 1
