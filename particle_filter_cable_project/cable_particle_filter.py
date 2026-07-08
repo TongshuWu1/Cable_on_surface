@@ -1387,7 +1387,13 @@ def particle_distance_scores_torch(
             length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
 
             best_chunks = []
-            nearest_chunks = []
+            expected = expected_segment_indices(expected_segments, particles.shape[1] - 1)
+            need_coverage = float(coverage_penalty_m) > 0.0 and len(expected) > 0
+            coverage_counts = (
+                torch.zeros((particles_t.shape[0], particles_t.shape[1] - 1), dtype=torch.float32, device=device)
+                if need_coverage
+                else None
+            )
             chunk_points = max(1, int(chunk_points))
             for start_index in range(0, points_t.shape[0], chunk_points):
                 chunk = points_t[start_index : start_index + chunk_points]
@@ -1397,14 +1403,20 @@ def particle_distance_scores_torch(
                 projection = starts[:, :, None, :] + t[:, :, :, None] * segment[:, :, None, :]
                 delta = chunk[None, None, :, :] - projection
                 squared = torch.sum(delta * delta, dim=3)
-                best, nearest = torch.min(squared, dim=1)
+                if need_coverage:
+                    best, nearest = torch.min(squared, dim=1)
+                    coverage_counts.scatter_add_(
+                        1,
+                        nearest,
+                        torch.ones_like(nearest, dtype=torch.float32, device=device),
+                    )
+                else:
+                    best = torch.amin(squared, dim=1)
                 best_chunks.append(best)
-                nearest_chunks.append(nearest)
 
             if not best_chunks:
                 return np.full(len(particles), np.inf, dtype=np.float64)
             squared_distances = torch.cat(best_chunks, dim=1)
-            nearest_segments = torch.cat(nearest_chunks, dim=1)
 
             outlier_distance = float(outlier_distance)
             if np.isfinite(outlier_distance):
@@ -1417,12 +1429,11 @@ def particle_distance_scores_torch(
                 selected, _indices = torch.topk(squared_distances, keep_count, dim=1, largest=False)
                 scores = torch.mean(selected, dim=1)
 
-            expected = expected_segment_indices(expected_segments, particles.shape[1] - 1)
-            if float(coverage_penalty_m) > 0.0 and len(expected):
-                required = max(1, int(np.ceil(nearest_segments.shape[1] * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
-                missing = torch.zeros(nearest_segments.shape[0], dtype=torch.float32, device=device)
+            if need_coverage and coverage_counts is not None:
+                required = max(1, int(np.ceil(points_t.shape[0] * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
+                missing = torch.zeros(coverage_counts.shape[0], dtype=torch.float32, device=device)
                 for segment_index in expected:
-                    counts = torch.count_nonzero(nearest_segments == int(segment_index), dim=1)
+                    counts = coverage_counts[:, int(segment_index)]
                     missing = missing + (counts < required).to(torch.float32)
                 scores = scores + missing * float(coverage_penalty_m) * float(coverage_penalty_m)
 
