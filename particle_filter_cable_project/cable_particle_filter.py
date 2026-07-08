@@ -50,6 +50,8 @@ class CableParticleFilterConfig:
     top_particle_count: int = 50
     global_random_particle_ratio: float = 0.10
     global_random_bounds_padding_m: float = 0.10
+    endpoint_constraint_iterations: int = 16
+    endpoint_constraint_tolerance_m: float = 1e-4
     min_measurement_points: int = 12
     min_segment_points: int = 4
     occlusion_assignment_max_distance_m: float = 0.12
@@ -100,11 +102,15 @@ class CableParticleFilter:
         self.last_measurement_proposal_ratio = 0.0
         self.last_global_random_particle_ratio = 0.0
         self.last_ordered_measurement_nodes = None
+        self.last_endpoint_nodes = None
         self.measurement_update_count = 0
 
     def step(self, measurement, dt=1.0 / 30.0, count_lost=True):
         dt = float(np.clip(dt, 1e-3, 0.20))
         measurement_points = self._measurement_points(measurement)
+        endpoint_nodes = self._measurement_endpoint_nodes(measurement)
+        if endpoint_nodes is not None:
+            self.last_endpoint_nodes = endpoint_nodes
         if measurement_points is not None:
             self.last_measurement_point_count = int(len(measurement_points))
         elif count_lost:
@@ -174,6 +180,16 @@ class CableParticleFilter:
         if self.segment_length_m is None:
             self.segment_length_m = estimate_equal_segment_length(nodes, self.segment_count)
         nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
+        endpoint_nodes = self._measurement_endpoint_nodes(measurement)
+        if endpoint_nodes is not None:
+            self.last_endpoint_nodes = endpoint_nodes
+            nodes = constrain_chain_to_endpoints(
+                nodes,
+                endpoint_nodes,
+                self.segment_length_m,
+                iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
+                tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
+            )
         if nodes is None:
             return
         self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
@@ -195,6 +211,7 @@ class CableParticleFilter:
             passes=int(getattr(self.config, "direction_smooth_passes", 1)),
         )
         self.particles = build_chains(starts, particle_directions, self.segment_length_m)
+        self._constrain_particles_to_known_endpoints()
         self.weights = np.full(count, 1.0 / count, dtype=np.float64)
         self.initialized = True
         self.last_motion_noise_scale = 1.0
@@ -228,6 +245,7 @@ class CableParticleFilter:
             passes=int(getattr(self.config, "direction_smooth_passes", 1)),
         )
         self.particles = build_chains(starts, directions, self.segment_length_m)
+        self._constrain_particles_to_known_endpoints()
 
     def _weight(self, measurement_points, visible_segments=None, measurement_nodes=None):
         sigma = max(float(self.config.measurement_node_std_m), 1e-5)
@@ -301,6 +319,7 @@ class CableParticleFilter:
             passes=int(getattr(self.config, "direction_smooth_passes", 1)),
         )
         self.particles = build_chains(starts, directions, self.segment_length_m)
+        self._constrain_particles_to_known_endpoints()
 
     def _estimate(self, measurement_used, prediction_only):
         if self.particles is None or self.weights is None or self.segment_length_m is None:
@@ -336,7 +355,8 @@ class CableParticleFilter:
         start = np.average(starts, axis=0, weights=top_weights)
         directions = np.average(particle_directions(top_particles), axis=0, weights=top_weights)
         directions = normalize_vectors(directions)
-        return build_chain(start, directions, self.segment_length_m)
+        nodes = build_chain(start, directions, self.segment_length_m)
+        return self._constrain_nodes_to_known_endpoints(nodes)
 
     def _measurement_points(self, measurement):
         if measurement is None:
@@ -379,8 +399,10 @@ class CableParticleFilter:
         nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
         if nodes is None:
             return None
+        nodes = self._constrain_nodes_to_known_endpoints(nodes, self._measurement_endpoint_nodes(measurement))
         if self.initialized and self.particles is not None:
             nodes = align_polyline_orientation(self._estimate_nodes(), nodes)
+            nodes = self._constrain_nodes_to_known_endpoints(nodes, self._measurement_endpoint_nodes(measurement))
         self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
         return np.ascontiguousarray(nodes, dtype=np.float64)
 
@@ -462,6 +484,7 @@ class CableParticleFilter:
         )
         replace_indices = self.rng.choice(total_count, size=proposal_count, replace=False)
         self.particles[replace_indices] = proposals
+        self._constrain_particles_to_known_endpoints(indices=replace_indices)
 
         self.weights *= 1.0 - ratio
         self.weights[replace_indices] = ratio / proposal_count
@@ -500,6 +523,7 @@ class CableParticleFilter:
 
         replace_indices = self.rng.choice(total_count, size=random_count, replace=False)
         self.particles[replace_indices] = random_particles
+        self._constrain_particles_to_known_endpoints(indices=replace_indices)
         self.weights *= 1.0 - ratio
         self.weights[replace_indices] = ratio / random_count
         total = float(np.sum(self.weights))
@@ -539,6 +563,53 @@ class CableParticleFilter:
 
         blend = (error_m - start_error) / (full_error - start_error)
         return stable_ratio + blend * (max_ratio - stable_ratio)
+
+    def _measurement_endpoint_nodes(self, measurement):
+        if measurement is None:
+            return None
+        endpoint_nodes = valid_points(getattr(measurement, "endpoint_nodes", None))
+        if len(endpoint_nodes) < 2:
+            return None
+        endpoint_nodes = np.ascontiguousarray([endpoint_nodes[0], endpoint_nodes[-1]], dtype=np.float64)
+        if not np.all(np.isfinite(endpoint_nodes)):
+            return None
+        return endpoint_nodes
+
+    def _constrain_nodes_to_known_endpoints(self, nodes, endpoint_nodes=None):
+        endpoint_nodes = self.last_endpoint_nodes if endpoint_nodes is None else endpoint_nodes
+        if endpoint_nodes is None or self.segment_length_m is None:
+            return nodes
+        constrained = constrain_chain_to_endpoints(
+            nodes,
+            endpoint_nodes,
+            self.segment_length_m,
+            iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
+            tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
+        )
+        return constrained if constrained is not None else nodes
+
+    def _constrain_particles_to_known_endpoints(self, indices=None):
+        if self.particles is None or self.segment_length_m is None or self.last_endpoint_nodes is None:
+            return
+        if indices is None:
+            self.particles = constrain_chains_to_endpoints(
+                self.particles,
+                self.last_endpoint_nodes,
+                self.segment_length_m,
+                iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
+                tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
+            )
+            return
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if len(indices) == 0:
+            return
+        self.particles[indices] = constrain_chains_to_endpoints(
+            self.particles[indices],
+            self.last_endpoint_nodes,
+            self.segment_length_m,
+            iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
+            tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
+        )
 
     def _associate_visible_points(self, measurement_points, candidate_nodes=None):
         reference_nodes = self._estimate_nodes() if self.initialized else None
@@ -981,6 +1052,72 @@ def project_equal_length_chain(nodes, segment_length_m, node_count=None):
     nodes = fit_polyline_segments(nodes, segment_count=node_count - 1)
     directions = chain_directions(nodes)
     return build_chain(nodes[0], directions, float(segment_length_m))
+
+
+def constrain_chain_to_endpoints(nodes, endpoint_nodes, segment_length_m, iterations=16, tolerance_m=1e-4):
+    chain = valid_points(nodes)
+    if len(chain) < 2:
+        return None
+    constrained = constrain_chains_to_endpoints(
+        chain[None, :, :],
+        endpoint_nodes,
+        segment_length_m,
+        iterations=iterations,
+        tolerance_m=tolerance_m,
+    )
+    return np.ascontiguousarray(constrained[0], dtype=np.float32)
+
+
+def constrain_chains_to_endpoints(chains, endpoint_nodes, segment_length_m, iterations=16, tolerance_m=1e-4):
+    chains = np.asarray(chains, dtype=np.float64)
+    if chains.ndim != 3 or chains.shape[1] < 2 or chains.shape[2] < 3:
+        return np.empty((0, 0, 3), dtype=np.float64)
+    endpoints = valid_points(endpoint_nodes)
+    if len(endpoints) < 2:
+        return np.ascontiguousarray(chains[:, :, :3], dtype=np.float64)
+
+    start = endpoints[0, :3]
+    end = endpoints[-1, :3]
+    segment_length = float(segment_length_m)
+    if not np.isfinite(segment_length) or segment_length <= 0.0:
+        raise ValueError("Endpoint-constrained cable model requires a positive fixed segment length.")
+
+    segment_count = chains.shape[1] - 1
+    total_length = segment_count * segment_length
+    endpoint_distance = float(np.linalg.norm(end - start))
+    tolerance = max(0.0, float(tolerance_m))
+    if endpoint_distance > total_length + tolerance:
+        raise ValueError(
+            "Known cable endpoints are farther apart than the fixed cable length: "
+            f"distance={endpoint_distance:.4f}m total_length={total_length:.4f}m"
+        )
+
+    output = np.ascontiguousarray(chains[:, :, :3], dtype=np.float64).copy()
+    output[:, 0, :] = start
+    output[:, -1, :] = end
+
+    if endpoint_distance > total_length - tolerance:
+        direction = normalize_vectors((end - start)[None, :])[0]
+        arclength = np.arange(segment_count + 1, dtype=np.float64) * segment_length
+        straight = start[None, :] + arclength[:, None] * direction[None, :]
+        return np.repeat(straight[None, :, :], len(output), axis=0)
+
+    for _ in range(max(1, int(iterations))):
+        output[:, -1, :] = end
+        for index in range(segment_count - 1, -1, -1):
+            direction = normalize_vectors(output[:, index, :] - output[:, index + 1, :])
+            output[:, index, :] = output[:, index + 1, :] + segment_length * direction
+
+        output[:, 0, :] = start
+        for index in range(segment_count):
+            direction = normalize_vectors(output[:, index + 1, :] - output[:, index, :])
+            output[:, index + 1, :] = output[:, index, :] + segment_length * direction
+
+        residual = float(np.max(np.linalg.norm(output[:, -1, :] - end[None, :], axis=1)))
+        if residual <= tolerance:
+            break
+
+    return np.ascontiguousarray(output, dtype=np.float64)
 
 
 def build_chain(start, directions, segment_length_m):

@@ -326,6 +326,8 @@ def parse_args():
     parser.add_argument("--pf-top-particles", type=int, default=config_value(config, "particle_filter", "top_particles", pf_defaults.top_particle_count))
     parser.add_argument("--pf-global-random-ratio", type=float, default=config_value(config, "particle_filter", "global_random_particle_ratio", pf_defaults.global_random_particle_ratio))
     parser.add_argument("--pf-global-random-bounds-padding", type=float, default=config_value(config, "particle_filter", "global_random_bounds_padding_m", pf_defaults.global_random_bounds_padding_m))
+    parser.add_argument("--pf-endpoint-constraint-iterations", type=int, default=config_value(config, "particle_filter", "endpoint_constraint_iterations", pf_defaults.endpoint_constraint_iterations))
+    parser.add_argument("--pf-endpoint-constraint-tolerance", type=float, default=config_value(config, "particle_filter", "endpoint_constraint_tolerance_m", pf_defaults.endpoint_constraint_tolerance_m))
     parser.add_argument("--pf-map-estimate-effective-ratio", type=float, default=config_value(config, "particle_filter", "map_estimate_effective_ratio", pf_defaults.map_estimate_effective_ratio))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
     parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
@@ -380,6 +382,8 @@ def parse_args():
     args.pf_top_particles = max(1, int(args.pf_top_particles))
     args.pf_global_random_ratio = float(np.clip(args.pf_global_random_ratio, 0.0, 1.0))
     args.pf_global_random_bounds_padding = max(0.0, float(args.pf_global_random_bounds_padding))
+    args.pf_endpoint_constraint_iterations = max(1, int(args.pf_endpoint_constraint_iterations))
+    args.pf_endpoint_constraint_tolerance = max(0.0, float(args.pf_endpoint_constraint_tolerance))
     return args
 
 
@@ -598,6 +602,8 @@ def make_particle_filter_config(args):
         top_particle_count=int(args.pf_top_particles),
         global_random_particle_ratio=float(args.pf_global_random_ratio),
         global_random_bounds_padding_m=float(args.pf_global_random_bounds_padding),
+        endpoint_constraint_iterations=int(args.pf_endpoint_constraint_iterations),
+        endpoint_constraint_tolerance_m=float(args.pf_endpoint_constraint_tolerance),
         map_estimate_effective_ratio=float(args.pf_map_estimate_effective_ratio),
         min_measurement_points=int(args.pf_min_measurement_points),
         min_segment_points=int(args.pf_min_segment_points),

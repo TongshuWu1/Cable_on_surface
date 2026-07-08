@@ -273,6 +273,12 @@ top_particles = 50
 global_random_particle_ratio = 0.10
 global_random_bounds_padding_m = 0.10
 
+# Known endpoints define a constrained fixed-length chain. Internally each
+# particle is projected so node 0 and node N match the detected/drone endpoints
+# while every segment keeps the fixed cable length.
+endpoint_constraint_iterations = 16
+endpoint_constraint_tolerance_m = 0.0001
+
 # Legacy compatibility knob; current estimate uses top_particles above.
 map_estimate_effective_ratio = 0.35
 
