@@ -47,6 +47,9 @@ class CableParticleFilterConfig:
     coverage_min_fraction: float = 0.05
     bend_penalty_m: float = 0.030
     map_estimate_effective_ratio: float = 0.35
+    top_particle_count: int = 50
+    global_random_particle_ratio: float = 0.10
+    global_random_bounds_padding_m: float = 0.10
     min_measurement_points: int = 12
     min_segment_points: int = 4
     occlusion_assignment_max_distance_m: float = 0.12
@@ -69,6 +72,7 @@ class CableParticleFilterResult:
     visible_segments: np.ndarray | None = None
     visible_nodes: np.ndarray | None = None
     measurement_proposal_ratio: float = 0.0
+    global_random_particle_ratio: float = 0.0
 
 
 class CableParticleFilter:
@@ -94,6 +98,7 @@ class CableParticleFilter:
         self.last_visible_nodes = np.zeros(self.node_count, dtype=bool)
         self.last_measurement_point_count = 0
         self.last_measurement_proposal_ratio = 0.0
+        self.last_global_random_particle_ratio = 0.0
         self.last_ordered_measurement_nodes = None
         self.measurement_update_count = 0
 
@@ -125,6 +130,7 @@ class CableParticleFilter:
                     self.last_measurement_point_count = 0
                     return self._prediction_only_after_update_drop()
                 self.last_measurement_point_count = int(len(measurement_points))
+                self._inject_global_random_particles(measurement_points)
                 self._weight(
                     measurement_points,
                     visible_segments=visible_segments,
@@ -193,6 +199,7 @@ class CableParticleFilter:
         self.initialized = True
         self.last_motion_noise_scale = 1.0
         self.last_measurement_proposal_ratio = 0.0
+        self.last_global_random_particle_ratio = 0.0
         self.measurement_update_count = 1
         _points, _indices, visible_segments = self._associate_visible_points(measurement_points)
         self._set_visibility(visible_segments)
@@ -311,17 +318,23 @@ class CableParticleFilter:
             visible_segments=self.last_visible_segments.copy(),
             visible_nodes=self.last_visible_nodes.copy(),
             measurement_proposal_ratio=float(self.last_measurement_proposal_ratio),
+            global_random_particle_ratio=float(self.last_global_random_particle_ratio),
         )
 
     def _estimate_nodes(self):
-        map_ratio = float(getattr(self.config, "map_estimate_effective_ratio", 0.0))
-        if map_ratio > 0.0 and self.particles is not None and self.weights is not None and len(self.weights):
-            effective_ratio = self._effective_sample_size() / max(len(self.weights), 1)
-            if effective_ratio <= map_ratio:
-                return np.asarray(self.particles[int(np.argmax(self.weights))], dtype=np.float32)
-        starts = self.particles[:, 0, :]
-        start = np.average(starts, axis=0, weights=self.weights)
-        directions = np.average(particle_directions(self.particles), axis=0, weights=self.weights)
+        top_count = int(getattr(self.config, "top_particle_count", 50))
+        top_count = int(np.clip(top_count, 1, len(self.weights)))
+        top_indices = np.argsort(self.weights)[-top_count:]
+        top_weights = np.asarray(self.weights[top_indices], dtype=np.float64)
+        total = float(np.sum(top_weights))
+        if not np.isfinite(total) or total <= 1e-12:
+            top_weights = np.full(top_count, 1.0 / top_count, dtype=np.float64)
+        else:
+            top_weights = top_weights / total
+        top_particles = self.particles[top_indices]
+        starts = top_particles[:, 0, :]
+        start = np.average(starts, axis=0, weights=top_weights)
+        directions = np.average(particle_directions(top_particles), axis=0, weights=top_weights)
         directions = normalize_vectors(directions)
         return build_chain(start, directions, self.segment_length_m)
 
@@ -457,6 +470,44 @@ class CableParticleFilter:
             self.weights /= total
         else:
             self.weights.fill(1.0 / total_count)
+
+    def _inject_global_random_particles(self, measurement_points):
+        self.last_global_random_particle_ratio = 0.0
+        if self.particles is None or self.weights is None or self.segment_length_m is None:
+            return
+        ratio = float(np.clip(getattr(self.config, "global_random_particle_ratio", 0.0), 0.0, 1.0))
+        if ratio <= 0.0:
+            return
+        points = valid_points(measurement_points)
+        if len(points) < 2:
+            return
+
+        total_count = len(self.particles)
+        random_count = int(round(ratio * total_count))
+        random_count = int(np.clip(random_count, 1, total_count))
+        padding = max(0.0, float(getattr(self.config, "global_random_bounds_padding_m", 0.10)))
+        random_particles = sample_global_random_chains(
+            points,
+            random_count,
+            self.segment_count,
+            self.segment_length_m,
+            self.rng,
+            padding_m=padding,
+            direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
+        )
+        if len(random_particles) != random_count:
+            return
+
+        replace_indices = self.rng.choice(total_count, size=random_count, replace=False)
+        self.particles[replace_indices] = random_particles
+        self.weights *= 1.0 - ratio
+        self.weights[replace_indices] = ratio / random_count
+        total = float(np.sum(self.weights))
+        if np.isfinite(total) and total > 1e-12:
+            self.weights /= total
+        else:
+            self.weights.fill(1.0 / total_count)
+        self.last_global_random_particle_ratio = float(random_count) / max(float(total_count), 1.0)
 
     def _should_reset_to_measurement(self, measurement_nodes):
         threshold = float(getattr(self.config, "measurement_reset_error_m", 0.0))
@@ -978,6 +1029,40 @@ def sample_noisy_chains_around_nodes(
         passes=int(direction_smooth_passes),
     )
     return build_chains(starts, noisy_directions, float(segment_length_m))
+
+
+def sample_global_random_chains(
+    points_xyz,
+    count,
+    segment_count,
+    segment_length_m,
+    rng,
+    padding_m=0.10,
+    direction_smooth_passes=1,
+):
+    points = valid_points(points_xyz)
+    count = max(0, int(count))
+    segment_count = max(1, int(segment_count))
+    if count == 0 or len(points) < 2:
+        return np.empty((0, 0, 3), dtype=np.float64)
+
+    mins = np.min(points, axis=0) - float(padding_m)
+    maxs = np.max(points, axis=0) + float(padding_m)
+    span = maxs - mins
+    min_span = max(float(segment_length_m), 1e-3)
+    tiny = span < min_span
+    if np.any(tiny):
+        center = 0.5 * (mins + maxs)
+        mins[tiny] = center[tiny] - 0.5 * min_span
+        maxs[tiny] = center[tiny] + 0.5 * min_span
+
+    starts = rng.uniform(mins, maxs, size=(count, 3))
+    directions = normalize_vectors(rng.normal(0.0, 1.0, size=(count, segment_count, 3)))
+    directions = smooth_particle_directions(
+        directions,
+        passes=int(direction_smooth_passes),
+    )
+    return build_chains(starts, directions, float(segment_length_m))
 
 
 def chain_directions(nodes):

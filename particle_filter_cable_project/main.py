@@ -323,6 +323,9 @@ def parse_args():
         help="Minimum fraction of support points each expected visible segment should own.",
     )
     parser.add_argument("--pf-bend-penalty", type=float, default=config_value(config, "particle_filter", "bend_penalty_m", pf_defaults.bend_penalty_m))
+    parser.add_argument("--pf-top-particles", type=int, default=config_value(config, "particle_filter", "top_particles", pf_defaults.top_particle_count))
+    parser.add_argument("--pf-global-random-ratio", type=float, default=config_value(config, "particle_filter", "global_random_particle_ratio", pf_defaults.global_random_particle_ratio))
+    parser.add_argument("--pf-global-random-bounds-padding", type=float, default=config_value(config, "particle_filter", "global_random_bounds_padding_m", pf_defaults.global_random_bounds_padding_m))
     parser.add_argument("--pf-map-estimate-effective-ratio", type=float, default=config_value(config, "particle_filter", "map_estimate_effective_ratio", pf_defaults.map_estimate_effective_ratio))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
     parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
@@ -374,6 +377,9 @@ def parse_args():
     args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
     args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
     args.pf_reference_ordering_gate = max(0.0, float(args.pf_reference_ordering_gate))
+    args.pf_top_particles = max(1, int(args.pf_top_particles))
+    args.pf_global_random_ratio = float(np.clip(args.pf_global_random_ratio, 0.0, 1.0))
+    args.pf_global_random_bounds_padding = max(0.0, float(args.pf_global_random_bounds_padding))
     return args
 
 
@@ -559,6 +565,9 @@ def make_particle_filter_config(args):
         coverage_penalty_m=float(args.pf_coverage_penalty),
         coverage_min_fraction=float(args.pf_coverage_min_fraction),
         bend_penalty_m=float(args.pf_bend_penalty),
+        top_particle_count=int(args.pf_top_particles),
+        global_random_particle_ratio=float(args.pf_global_random_ratio),
+        global_random_bounds_padding_m=float(args.pf_global_random_bounds_padding),
         map_estimate_effective_ratio=float(args.pf_map_estimate_effective_ratio),
         min_measurement_points=int(args.pf_min_measurement_points),
         min_segment_points=int(args.pf_min_segment_points),
@@ -1115,6 +1124,11 @@ def cable_tracking_diagnostics(previous_filter_nodes, raw_measurement, measureme
         if filter_result is not None
         else np.nan
     )
+    diagnostics["global_random_ratio"] = (
+        float(getattr(filter_result, "global_random_particle_ratio", np.nan))
+        if filter_result is not None
+        else np.nan
+    )
     return diagnostics
 
 
@@ -1272,6 +1286,9 @@ def format_tracking_diagnostics(diagnostics):
     proposal_ratio = diagnostics.get("proposal_ratio", np.nan)
     if np.isfinite(proposal_ratio):
         parts.append(f"prop={proposal_ratio:.2f}")
+    random_ratio = diagnostics.get("global_random_ratio", np.nan)
+    if np.isfinite(random_ratio):
+        parts.append(f"rand={random_ratio:.2f}")
     return "" if not parts else " | " + " ".join(parts)
 
 

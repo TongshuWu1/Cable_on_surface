@@ -265,8 +265,15 @@ coverage_min_fraction = 0.05
 # centerline and raw support cloud now provide the shape constraint.
 bend_penalty_m = 0.0
 
-# When particle weights collapse, display the best actual particle instead of a
-# direction average that may not correspond to any valid chain hypothesis.
+# Display estimate is always the weighted average of the best particles.
+top_particles = 50
+
+# Keep a fixed exploration budget as globally random chain hypotheses within the
+# current measured support-cloud bounds.
+global_random_particle_ratio = 0.10
+global_random_bounds_padding_m = 0.10
+
+# Legacy compatibility knob; current estimate uses top_particles above.
 map_estimate_effective_ratio = 0.35
 
 # Minimum support required before a measurement update is trusted.
