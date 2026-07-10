@@ -59,6 +59,17 @@ OCCLUDED_COLOR = (1.00, 0.18, 0.20)
 CABLE_SAMPLE_COLOR = (1.00, 0.58, 0.08)
 START_NODE_COLOR = (0.00, 0.78, 1.00)
 END_NODE_COLOR = (1.00, 0.25, 0.92)
+ENDPOINT_GROUP_COLORS = (
+    (1.00, 0.00, 1.00),  # endpoints_1
+    (0.00, 0.86, 1.00),  # endpoints_2
+    (1.00, 0.25, 0.25),  # endpoints_3
+    (1.00, 0.86, 0.00),  # endpoints_4
+)
+
+
+def endpoint_group_color(index):
+    index = max(0, int(index))
+    return ENDPOINT_GROUP_COLORS[index % len(ENDPOINT_GROUP_COLORS)]
 
 POINT_VERTEX_SHADER = """
 #version 330 core
@@ -625,8 +636,9 @@ class ZedDepthGLViewer:
         multi = len(endpoint_runs) > 1
         for cable_index, (start_idx, end_idx) in enumerate(endpoint_runs, start=1):
             suffix = f" {cable_index}" if multi else ""
-            endpoints.append((start_idx, f"START{suffix}", START_NODE_COLOR, 1.0))
-            endpoints.append((end_idx, f"END{suffix}", END_NODE_COLOR, -1.0))
+            color = endpoint_group_color(cable_index - 1)
+            endpoints.append((start_idx, f"START{suffix}", color, 1.0))
+            endpoints.append((end_idx, f"END{suffix}", color, -1.0))
 
         glPointSize(22.0)
         glBegin(GL_POINTS)
@@ -933,9 +945,10 @@ class ZedDepthGLViewer:
     @staticmethod
     def _endpoint_role_map(endpoint_runs):
         roles = {}
-        for start_idx, end_idx in endpoint_runs:
-            roles[int(start_idx)] = "start"
-            roles[int(end_idx)] = "end"
+        for cable_index, (start_idx, end_idx) in enumerate(endpoint_runs):
+            color = endpoint_group_color(cable_index)
+            roles[int(start_idx)] = color
+            roles[int(end_idx)] = color
         return roles
 
     def _endpoint_label_position(self, point, direction):
@@ -1075,10 +1088,9 @@ class ZedDepthGLViewer:
 
     def _node_color(self, idx, endpoint_roles=None):
         role = {} if endpoint_roles is None else endpoint_roles
-        if role.get(int(idx)) == "start":
-            return START_NODE_COLOR
-        if role.get(int(idx)) == "end":
-            return END_NODE_COLOR
+        endpoint_color = role.get(int(idx))
+        if endpoint_color is not None:
+            return endpoint_color
         if self.cable_visible[idx]:
             return VISIBLE_COLOR
         if self.cable_extended_visible[idx]:

@@ -11,7 +11,13 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from cable_pidnet import IMAGENET_MEAN, IMAGENET_STD, PIDNetSmallBinary, require_torch, resolve_device
+from cable_pidnet import (
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    PIDNetSmallBinary,
+    require_torch,
+    resolve_device,
+)
 
 require_torch()
 
@@ -25,7 +31,7 @@ DEFAULT_IMAGE_SIZE = "1280x720"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a PIDNet-style binary cable segmentation model.")
+    parser = argparse.ArgumentParser(description="Train a PIDNet-style cable and endpoint segmentation model.")
     parser.add_argument("--dataset", type=Path, default=PROJECT_DIR / "datasets/two_cable_pidnet", help="Dataset root with images/ and masks/ folders.")
     parser.add_argument("--output", type=Path, default=PROJECT_DIR / "models/pidnet_two_cable_best.pt")
     parser.add_argument("--epochs", type=int, default=80)
@@ -37,13 +43,7 @@ def parse_args():
         help="Training image size. Use 1280x720 for full ZED HD720, or a single value like 512 for square training.",
     )
     parser.add_argument("--base-channels", type=int, default=24)
-    parser.add_argument("--cable-count", type=int, default=1, help="Number of separately labeled cable instances in the mask. Use 2 for two independent cables.")
-    parser.add_argument(
-        "--endpoint-labels",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Train one endpoint channel per cable. Mask labels are N+1..2N for endpoints.",
-    )
+    parser.add_argument("--cable-count", type=int, default=2, help="Number of cable endpoint groups. Body labels are merged into one generic cable target.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--val-split", type=float, default=0.15)
@@ -55,13 +55,12 @@ def parse_args():
     return parser.parse_args()
 
 
-class CableMaskDataset(Dataset):
-    def __init__(self, pairs, image_size=DEFAULT_IMAGE_SIZE, augment=False, cable_count=1, endpoint_labels=True):
+class GenericCableEndpointDataset(Dataset):
+    def __init__(self, pairs, image_size=DEFAULT_IMAGE_SIZE, augment=False, cable_count=2):
         self.pairs = list(pairs)
         self.image_size = parse_image_size(image_size)
         self.augment = bool(augment)
         self.cable_count = max(1, int(cable_count))
-        self.endpoint_labels = bool(endpoint_labels)
         self.mean = np.asarray(IMAGENET_MEAN, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.asarray(IMAGENET_STD, dtype=np.float32).reshape(1, 1, 3)
 
@@ -71,11 +70,9 @@ class CableMaskDataset(Dataset):
     def __getitem__(self, index):
         image_path, mask_path = self.pairs[index]
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        mask, multilabel = read_training_mask(mask_path, self.cable_count)
         if image is None:
             raise ValueError(f"Could not read image: {image_path}")
-        if mask is None:
-            raise ValueError(f"Could not read mask: {mask_path}")
         image, mask = resize_pair(image, mask, self.image_size)
 
         if self.augment:
@@ -83,13 +80,81 @@ class CableMaskDataset(Dataset):
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         image = (image - self.mean) / self.std
-        mask = instance_mask_channels(mask, self.cable_count, endpoint_labels=self.endpoint_labels)
-        boundary = mask_boundary(np.any(mask > 0.5, axis=0).astype(np.float32))
+        body = generic_body_mask(mask, self.cable_count, multilabel=multilabel).astype(np.float32)
+        endpoint_channels = generic_endpoint_masks(mask, self.cable_count, multilabel=multilabel)
+        mask_channels = np.stack([body, *endpoint_channels], axis=0)
+        boundary = mask_boundary(np.any(mask_channels > 0.5, axis=0).astype(np.float32))
 
         image = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
-        mask = torch.from_numpy(np.ascontiguousarray(mask))
+        mask_channels = torch.from_numpy(np.ascontiguousarray(mask_channels))
         boundary = torch.from_numpy(boundary[None, :, :])
-        return image, mask, boundary
+        return image, mask_channels, boundary
+
+
+def endpoint_label_value(cable_index, cable_count):
+    return max(1, int(cable_count)) + int(cable_index)
+
+
+def max_label_value(cable_count):
+    return 2 * max(1, int(cable_count))
+
+
+def label_bit(label):
+    label = int(label)
+    if label <= 0:
+        return np.uint16(0)
+    return np.uint16(1 << (label - 1))
+
+
+def layered_mask_path_from_mask_path(mask_path):
+    mask_path = Path(mask_path)
+    parts = list(mask_path.parts)
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index] == "masks":
+            parts[index] = "masks_layers"
+            return Path(*parts).with_suffix(".npz")
+    return mask_path.with_suffix(".npz")
+
+
+def read_training_mask(mask_path, cable_count):
+    layer_path = layered_mask_path_from_mask_path(mask_path)
+    if layer_path.exists():
+        payload = np.load(str(layer_path))
+        if "mask" not in payload:
+            raise ValueError(f"Layered mask file missing 'mask' array: {layer_path}")
+        mask = np.asarray(payload["mask"], dtype=np.uint16)
+        valid_bits = np.uint16((1 << max_label_value(cable_count)) - 1)
+        return np.ascontiguousarray(mask & valid_bits, dtype=np.uint16), True
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise ValueError(f"Could not read mask: {mask_path}")
+    return np.asarray(mask, dtype=np.uint8), False
+
+
+def label_pixels(mask, label, cable_count, multilabel=False):
+    if bool(multilabel):
+        return (np.asarray(mask, dtype=np.uint16) & label_bit(label)) != 0
+    return np.asarray(mask) == int(label)
+
+
+def generic_body_mask(mask, cable_count, multilabel=False):
+    cable_count = max(1, int(cable_count))
+    labels = np.asarray(mask)
+    body = np.zeros(labels.shape[:2], dtype=bool)
+    for label in range(1, cable_count + 1):
+        body |= label_pixels(labels, label, cable_count, multilabel=multilabel)
+    if not bool(multilabel) and not np.any(body) and np.any(labels > 127):
+        body = labels > 127
+    return body
+
+
+def generic_endpoint_masks(mask, cable_count, multilabel=False):
+    cable_count = max(1, int(cable_count))
+    labels = np.asarray(mask)
+    endpoints = []
+    for cable_index in range(1, cable_count + 1):
+        endpoints.append(label_pixels(labels, endpoint_label_value(cable_index, cable_count), cable_count, multilabel=multilabel).astype(np.float32))
+    return endpoints
 
 
 def find_dataset_splits(dataset_root, val_split, seed):
@@ -203,31 +268,6 @@ def augment_pair(image, mask):
     return image, mask
 
 
-def instance_mask_channels(mask, cable_count, endpoint_labels=True):
-    cable_count = max(1, int(cable_count))
-    output_channels = cable_count * (2 if bool(endpoint_labels) else 1)
-    mask = np.asarray(mask, dtype=np.uint8)
-    channels = np.zeros((output_channels, mask.shape[0], mask.shape[1]), dtype=np.float32)
-    if cable_count == 1:
-        body = mask == 1
-        if not np.any(body) and np.any(mask > 127):
-            body = mask > 127
-        channels[0] = body.astype(np.float32)
-        if bool(endpoint_labels) and output_channels > 1:
-            channels[1] = (mask == 2).astype(np.float32)
-        return channels
-
-    for label in range(1, cable_count + 1):
-        channels[label - 1] = (mask == label).astype(np.float32)
-        if bool(endpoint_labels):
-            channels[cable_count + label - 1] = (mask == cable_count + label).astype(np.float32)
-
-    if not np.any(channels) and np.any(mask > 127):
-        # Legacy binary masks are still useful as cable 1 examples.
-        channels[0] = (mask > 127).astype(np.float32)
-    return channels
-
-
 def mask_boundary(mask):
     mask_u8 = (mask > 0.5).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -297,24 +337,33 @@ def train(args):
         val_pairs = train_pairs[:]
 
     cable_count = max(1, int(args.cable_count))
-    endpoint_labels = bool(args.endpoint_labels)
-    output_channels = cable_count * (2 if endpoint_labels else 1)
+    output_channels = 1 + cable_count
+    input_channels = 3
+    input_mode = "rgb"
+    label_mode = "cable_with_separate_endpoints"
+    train_dataset = GenericCableEndpointDataset(train_pairs, args.imgsz, augment=True, cable_count=cable_count)
+    val_dataset = GenericCableEndpointDataset(val_pairs, args.imgsz, augment=False, cable_count=cable_count)
+
     train_loader = DataLoader(
-        CableMaskDataset(train_pairs, args.imgsz, augment=True, cable_count=cable_count, endpoint_labels=endpoint_labels),
+        train_dataset,
         batch_size=int(args.batch_size),
         shuffle=True,
         num_workers=int(args.num_workers),
         pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
-        CableMaskDataset(val_pairs, args.imgsz, augment=False, cable_count=cable_count, endpoint_labels=endpoint_labels),
+        val_dataset,
         batch_size=int(args.batch_size),
         shuffle=False,
         num_workers=int(args.num_workers),
         pin_memory=device.type == "cuda",
     )
 
-    model = PIDNetSmallBinary(base_channels=int(args.base_channels), output_channels=output_channels).to(device)
+    model = PIDNetSmallBinary(
+        base_channels=int(args.base_channels),
+        output_channels=output_channels,
+        input_channels=input_channels,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     use_amp = bool(args.amp) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -323,9 +372,11 @@ def train(args):
 
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else str(device)
     print(
-        f"Training on {len(train_pairs)} images, validating on {len(val_pairs)} images, "
+        f"Training on {len(train_pairs)} images/{len(train_dataset)} samples, "
+        f"validating on {len(val_pairs)} images/{len(val_dataset)} samples, "
         f"imgsz={image_size_text(args.imgsz)}, cables={cable_count}, "
-        f"outputs={output_channels}, endpoint_labels={endpoint_labels}, device={device_name}, amp={use_amp}"
+        f"target=cable+separate_endpoints, input={input_mode}, inputs={input_channels}, outputs={output_channels}, "
+        f"device={device_name}, amp={use_amp}"
     )
     for epoch in range(1, int(args.epochs) + 1):
         start = time.time()
@@ -358,17 +409,17 @@ def train(args):
                     "config": {
                         "model": "pidnet_small_binary",
                         "base_channels": int(args.base_channels),
+                        "input_channels": int(input_channels),
+                        "input_mode": str(input_mode),
                         "output_channels": int(output_channels),
-                        "label_mode": (
-                            "instances_with_endpoints"
-                            if endpoint_labels
-                            else ("instances" if cable_count > 1 else "binary")
-                        ),
+                        "label_mode": str(label_mode),
                         "cable_count": int(cable_count),
-                        "endpoint_channels": bool(endpoint_labels),
+                        "endpoint_channels": True,
+                        "endpoint_channel_count": int(cable_count),
                         "imgsz": image_size_text(args.imgsz),
                     },
                     "training": {
+                        "target": "cable+separate_endpoints",
                         "epochs": int(args.epochs),
                         "batch_size": int(args.batch_size),
                         "lr": float(args.lr),

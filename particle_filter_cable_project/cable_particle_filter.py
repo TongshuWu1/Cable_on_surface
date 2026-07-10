@@ -49,6 +49,11 @@ class CableParticleFilterConfig:
     measurement_proposal_full_error_m: float = 0.060
     measurement_proposal_node_std_m: float = 0.012
     measurement_proposal_direction_std: float = 0.025
+    ransac_inlier_selection_enabled: bool = True
+    ransac_hypotheses: int = 32
+    ransac_subset_points: int = 2
+    ransac_inlier_distance_m: float = 0.025
+    ransac_min_points: int = 24
     score_keep_fraction: float = 0.80
     coverage_penalty_m: float = 0.025
     coverage_min_fraction: float = 0.05
@@ -85,6 +90,10 @@ class CableParticleFilterResult:
     visible_nodes: np.ndarray | None = None
     measurement_proposal_ratio: float = 0.0
     global_random_particle_ratio: float = 0.0
+    ransac_inlier_ratio: float = 0.0
+    ransac_inlier_count: int = 0
+    ransac_error_m: float = np.nan
+    ransac_hypothesis_count: int = 0
     coarse_score_point_count: int = 0
     full_score_particle_count: int = 0
     mean_node_speed_mps: float = 0.0
@@ -116,6 +125,10 @@ class CableParticleFilter:
         self.last_measurement_point_count = 0
         self.last_measurement_proposal_ratio = 0.0
         self.last_global_random_particle_ratio = 0.0
+        self.last_ransac_inlier_ratio = 0.0
+        self.last_ransac_inlier_count = 0
+        self.last_ransac_error_m = np.nan
+        self.last_ransac_hypothesis_count = 0
         self.last_coarse_score_point_count = 0
         self.last_full_score_particle_count = 0
         self.last_ordered_measurement_nodes = None
@@ -127,7 +140,13 @@ class CableParticleFilter:
 
     def step(self, measurement, dt=1.0 / 30.0, count_lost=True):
         self._reset_stage_seconds()
-        stage_start = time.perf_counter()
+        self.last_measurement_proposal_ratio = 0.0
+        self.last_global_random_particle_ratio = 0.0
+        self.last_ransac_inlier_ratio = 0.0
+        self.last_ransac_inlier_count = 0
+        self.last_ransac_error_m = np.nan
+        self.last_ransac_hypothesis_count = 0
+        prepare_start = time.perf_counter()
         dt = float(np.clip(dt, 1e-3, 0.20))
         measurement_points = self._measurement_points(measurement)
         endpoint_nodes = self._measurement_endpoint_nodes(measurement)
@@ -137,7 +156,15 @@ class CableParticleFilter:
             self.last_measurement_point_count = int(len(measurement_points))
         elif count_lost:
             self.last_measurement_point_count = 0
-        self._record_stage("prepare", stage_start)
+        self._record_stage("prepare", prepare_start)
+        if measurement_points is not None:
+            stage_start = time.perf_counter()
+            measurement_points = self._select_ransac_inlier_points(measurement_points)
+            self._record_stage("ransac", stage_start)
+            if measurement_points is not None:
+                self.last_measurement_point_count = int(len(measurement_points))
+            elif count_lost:
+                self.last_measurement_point_count = 0
 
         if measurement_points is not None:
             if not self.initialized:
@@ -410,6 +437,10 @@ class CableParticleFilter:
             visible_nodes=self.last_visible_nodes.copy(),
             measurement_proposal_ratio=float(self.last_measurement_proposal_ratio),
             global_random_particle_ratio=float(self.last_global_random_particle_ratio),
+            ransac_inlier_ratio=float(self.last_ransac_inlier_ratio),
+            ransac_inlier_count=int(self.last_ransac_inlier_count),
+            ransac_error_m=float(self.last_ransac_error_m),
+            ransac_hypothesis_count=int(self.last_ransac_hypothesis_count),
             coarse_score_point_count=int(self.last_coarse_score_point_count),
             full_score_particle_count=int(self.last_full_score_particle_count),
             mean_node_speed_mps=float(self._weighted_node_speed()),
@@ -438,18 +469,34 @@ class CableParticleFilter:
         if measurement is None:
             return None
 
+        endpoint_nodes = self._measurement_endpoint_nodes(measurement)
         source_points = getattr(measurement, "source_points", None)
         if source_points is not None:
             points = valid_points(source_points)
+            points = self._filter_points_to_known_endpoint_reach(points, endpoint_nodes)
             if len(points) >= int(self.config.min_measurement_points):
                 return sample_points(points, int(self.config.measurement_max_points))
+            if endpoint_nodes is not None:
+                return None
 
         points = valid_points(getattr(measurement, "points_xyz", measurement))
+        points = self._filter_points_to_known_endpoint_reach(points, endpoint_nodes)
         if len(points) >= int(self.config.min_measurement_points):
             return sample_points(points, int(self.config.measurement_max_points))
         return None
 
     def _initial_nodes(self, measurement, measurement_points):
+        endpoint_nodes = self._measurement_endpoint_nodes(measurement)
+        if endpoint_nodes is not None and self.segment_length_m is not None:
+            nodes = self._fit_measurement_point_chain(
+                measurement_points,
+                reference_nodes=None,
+                force_endpoint=True,
+            )
+            if nodes is None:
+                return None
+            return self._constrain_nodes_to_known_endpoints(nodes, endpoint_nodes)
+
         candidate = getattr(measurement, "points_xyz", None)
         nodes = fit_polyline_segments(candidate, segment_count=self.segment_count) if candidate is not None else None
         if nodes is None:
@@ -476,7 +523,6 @@ class CableParticleFilter:
                 nodes = self._fit_measurement_point_chain(
                     measurement_points,
                     reference_nodes=reference_nodes,
-                    allow_endpoint_fallback=self.lost_frames > 0 or force_endpoint,
                     force_endpoint=force_endpoint,
                 )
             self.measurement_update_count += 1
@@ -508,10 +554,14 @@ class CableParticleFilter:
         self,
         measurement_points,
         reference_nodes=None,
-        allow_endpoint_fallback=True,
         force_endpoint=False,
     ):
-        if bool(force_endpoint):
+        use_reference = (
+            bool(getattr(self.config, "reference_ordering", True))
+            and reference_nodes is not None
+            and not bool(force_endpoint)
+        )
+        if not use_reference:
             nodes = fit_unordered_point_cloud_chain(
                 measurement_points,
                 segment_count=self.segment_count,
@@ -521,34 +571,15 @@ class CableParticleFilter:
             )
             if nodes is not None:
                 return nodes
+            return None
 
-        if bool(getattr(self.config, "reference_ordering", True)) and reference_nodes is not None:
-            nodes = fit_reference_ordered_point_cloud_chain(
-                measurement_points,
-                reference_nodes=reference_nodes,
-                segment_count=self.segment_count,
-                gate_m=float(getattr(self.config, "reference_ordering_gate_m", 0.08)),
-                min_points=int(getattr(self.config, "min_measurement_points", 12)),
-            )
-            if nodes is not None:
-                return nodes
-            if not bool(allow_endpoint_fallback):
-                return None
-
-        nodes = fit_unordered_point_cloud_chain(
+        return fit_reference_ordered_point_cloud_chain(
             measurement_points,
+            reference_nodes=reference_nodes,
             segment_count=self.segment_count,
-            endpoint_ordering=bool(getattr(self.config, "endpoint_ordering", True)),
-            max_points=int(getattr(self.config, "ordering_max_points", 768)),
-            knn=int(getattr(self.config, "ordering_knn", 10)),
+            gate_m=float(getattr(self.config, "reference_ordering_gate_m", 0.08)),
+            min_points=int(getattr(self.config, "min_measurement_points", 12)),
         )
-        if nodes is not None:
-            return nodes
-        if reference_nodes is not None:
-            cached = valid_points(self.last_ordered_measurement_nodes)
-            if len(cached) == self.node_count:
-                return cached.copy()
-        return None
 
     def _should_refresh_endpoint_ordering(self):
         interval = int(getattr(self.config, "endpoint_refresh_interval", 0))
@@ -595,6 +626,66 @@ class CableParticleFilter:
             self.weights /= total
         else:
             self.weights.fill(1.0 / total_count)
+
+    def _select_ransac_inlier_points(self, measurement_points):
+        self.last_ransac_inlier_ratio = 0.0
+        self.last_ransac_inlier_count = 0
+        self.last_ransac_error_m = np.nan
+        self.last_ransac_hypothesis_count = 0
+        if not bool(getattr(self.config, "ransac_inlier_selection_enabled", True)):
+            return measurement_points
+        if self.segment_length_m is None or self.last_endpoint_nodes is None:
+            return None
+
+        points = valid_points(measurement_points)
+        min_points = max(2, int(getattr(self.config, "ransac_min_points", 24)))
+        if len(points) < min_points:
+            return None
+
+        hypothesis_count = max(0, int(getattr(self.config, "ransac_hypotheses", 0)))
+        if hypothesis_count <= 0:
+            return points
+        hypotheses = sample_endpoint_ransac_chains(
+            points,
+            self.last_endpoint_nodes,
+            hypothesis_count,
+            self.segment_count,
+            self.segment_length_m,
+            self.rng,
+            subset_points=int(getattr(self.config, "ransac_subset_points", 2)),
+            endpoint_constraint_iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
+            endpoint_constraint_tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
+        )
+        self.last_ransac_hypothesis_count = int(len(hypotheses))
+        if len(hypotheses) == 0:
+            return None
+
+        inlier_distance = max(
+            float(getattr(self.config, "ransac_inlier_distance_m", 0.025)),
+            float(getattr(self.config, "measurement_node_std_m", 0.010)),
+        )
+        inlier_counts, inlier_sums = ransac_inlier_stats(
+            points,
+            hypotheses,
+            inlier_distance,
+            backend=str(getattr(self.config, "scoring_backend", "auto")),
+            chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
+        )
+        if len(inlier_counts) != len(hypotheses) or len(inlier_sums) != len(hypotheses):
+            return None
+        valid = inlier_counts >= min_points
+        if not np.any(valid):
+            return None
+
+        best_count = int(np.max(inlier_counts[valid]))
+        best_candidates = np.flatnonzero(valid & (inlier_counts == best_count))
+        best_index = int(best_candidates[np.argmin(inlier_sums[best_candidates])])
+        keep = points_near_polyline_mask(points, hypotheses[best_index], inlier_distance)
+        selected = np.ascontiguousarray(points[keep], dtype=np.float64)
+        self.last_ransac_inlier_count = int(len(selected))
+        self.last_ransac_inlier_ratio = float(len(selected)) / max(float(len(points)), 1.0)
+        self.last_ransac_error_m = float(np.sqrt(inlier_sums[best_index] / max(float(len(selected)), 1.0)))
+        return selected
 
     def _inject_global_random_particles(self, measurement_points):
         self.last_global_random_particle_ratio = 0.0
@@ -833,6 +924,27 @@ class CableParticleFilter:
             return None
         return endpoint_nodes
 
+    def _filter_points_to_known_endpoint_reach(self, points, endpoint_nodes):
+        points = valid_points(points)
+        if len(points) == 0 or endpoint_nodes is None or self.segment_length_m is None:
+            return points
+        endpoints = valid_points(endpoint_nodes)
+        if len(endpoints) < 2:
+            return points
+        total_length = float(self.segment_count) * float(self.segment_length_m)
+        if not np.isfinite(total_length) or total_length <= 0.0:
+            return points
+        start = endpoints[0, :3]
+        end = endpoints[-1, :3]
+        margin = max(
+            float(getattr(self.config, "outlier_distance_m", 0.08)),
+            0.75 * float(self.segment_length_m),
+            0.02,
+        )
+        reachable = np.linalg.norm(points - start[None, :], axis=1) + np.linalg.norm(points - end[None, :], axis=1)
+        keep = reachable <= total_length + margin
+        return np.ascontiguousarray(points[keep], dtype=np.float64)
+
     def _constrain_nodes_to_known_endpoints(self, nodes, endpoint_nodes=None):
         endpoint_nodes = self.last_endpoint_nodes if endpoint_nodes is None else endpoint_nodes
         if endpoint_nodes is None or self.segment_length_m is None:
@@ -844,7 +956,9 @@ class CableParticleFilter:
             iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
             tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
         )
-        return constrained if constrained is not None else nodes
+        if constrained is None:
+            raise ValueError("Endpoint-constrained cable projection failed for the current node chain.")
+        return constrained
 
     def _constrain_particles_to_known_endpoints(self, indices=None):
         if self.particles is None or self.segment_length_m is None or self.last_endpoint_nodes is None:
@@ -969,6 +1083,15 @@ def associate_points_to_reference(
         min_points=int(min_segment_points),
     )
     return measurement_points, segment_indices, visible_segments
+
+
+def points_near_polyline_mask(points, nodes, distance_m):
+    points = valid_points(points)
+    nodes = valid_points(nodes)
+    if len(points) == 0 or len(nodes) < 2:
+        return np.zeros(len(points), dtype=bool)
+    _segments, distances = assign_points_to_nearest_segments(points, nodes)
+    return np.asarray(distances <= float(distance_m), dtype=bool)
 
 
 def filtered_cable_estimate(measurement, result):
@@ -1315,6 +1438,46 @@ def project_equal_length_chain(nodes, segment_length_m, node_count=None):
     return build_chain(nodes[0], directions, float(segment_length_m))
 
 
+def endpoint_seed_chain(endpoint_nodes, segment_count, segment_length_m):
+    endpoints = valid_points(endpoint_nodes)
+    segment_count = max(1, int(segment_count))
+    segment_length = float(segment_length_m)
+    if len(endpoints) < 2 or not np.isfinite(segment_length) or segment_length <= 0.0:
+        return None
+    start = endpoints[0, :3]
+    end = endpoints[-1, :3]
+    chord = end - start
+    chord_length = float(np.linalg.norm(chord))
+    direction = np.array([1.0, 0.0, 0.0], dtype=np.float64) if chord_length <= 1e-9 else chord / chord_length
+
+    total_length = segment_count * segment_length
+    t = np.linspace(0.0, 1.0, segment_count + 1, dtype=np.float64)
+    nodes = start[None, :] + t[:, None] * chord[None, :]
+    slack = max(0.0, total_length - chord_length)
+    if slack > 1e-6:
+        reference_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        perpendicular = np.cross(direction, reference_axis)
+        if float(np.linalg.norm(perpendicular)) <= 1e-9:
+            perpendicular = np.cross(direction, np.array([0.0, 1.0, 0.0], dtype=np.float64))
+        perpendicular = normalize_vectors(perpendicular[None, :])[0]
+        half_length = 0.5 * total_length
+        half_chord = 0.5 * chord_length
+        amplitude = 0.5 * np.sqrt(max(0.0, half_length * half_length - half_chord * half_chord))
+        amplitude = max(amplitude, 0.25 * slack)
+        nodes = nodes + np.sin(np.pi * t)[:, None] * amplitude * perpendicular[None, :]
+
+    projected = project_equal_length_chain(nodes, segment_length, node_count=segment_count + 1)
+    if projected is None:
+        projected = nodes
+    return constrain_chain_to_endpoints(
+        projected,
+        endpoints,
+        segment_length,
+        iterations=16,
+        tolerance_m=1e-4,
+    )
+
+
 def constrain_chain_to_endpoints(nodes, endpoint_nodes, segment_length_m, iterations=16, tolerance_m=1e-4):
     chain = valid_points(nodes)
     if len(chain) < 2:
@@ -1348,7 +1511,10 @@ def constrain_chains_to_endpoints(chains, endpoint_nodes, segment_length_m, iter
     endpoint_distance = float(np.linalg.norm(end - start))
     tolerance = max(0.0, float(tolerance_m))
     if endpoint_distance > total_length + tolerance:
-        return np.ascontiguousarray(chains[:, :, :3], dtype=np.float64)
+        raise ValueError(
+            "Known cable endpoints are farther apart than the fixed cable length: "
+            f"distance={endpoint_distance:.4f}m total_length={total_length:.4f}m"
+        )
 
     output = np.ascontiguousarray(chains[:, :, :3], dtype=np.float64).copy()
     output[:, 0, :] = start
@@ -1424,6 +1590,68 @@ def sample_noisy_chains_around_nodes(
         passes=int(direction_smooth_passes),
     )
     return build_chains(starts, noisy_directions, float(segment_length_m))
+
+
+def sample_endpoint_ransac_chains(
+    points_xyz,
+    endpoint_nodes,
+    count,
+    segment_count,
+    segment_length_m,
+    rng,
+    subset_points=2,
+    endpoint_constraint_iterations=16,
+    endpoint_constraint_tolerance_m=1e-4,
+):
+    points = valid_points(points_xyz)
+    endpoints = valid_points(endpoint_nodes)
+    count = max(0, int(count))
+    segment_count = max(1, int(segment_count))
+    subset_points = max(1, int(subset_points))
+    segment_length = float(segment_length_m)
+    if count == 0 or len(points) == 0 or len(endpoints) < 2 or not np.isfinite(segment_length) or segment_length <= 0.0:
+        return np.empty((0, 0, 3), dtype=np.float64)
+
+    start = endpoints[0, :3]
+    end = endpoints[-1, :3]
+    chord = end - start
+    chord_norm = float(np.linalg.norm(chord))
+    if not np.isfinite(chord_norm) or chord_norm <= 1e-9:
+        return np.empty((0, 0, 3), dtype=np.float64)
+    if chord_norm > segment_count * segment_length + max(0.0, float(endpoint_constraint_tolerance_m)):
+        return np.empty((0, 0, 3), dtype=np.float64)
+    direction = chord / chord_norm
+
+    hypotheses = []
+    for _index in range(count):
+        sample_count = min(subset_points, len(points))
+        sample_indices = rng.choice(len(points), size=sample_count, replace=False)
+        anchors = points[sample_indices, :3]
+        projection = np.dot(anchors - start[None, :], direction)
+        anchors = anchors[np.argsort(projection)]
+        polyline = np.vstack([start[None, :], anchors, end[None, :]])
+        nodes = fit_polyline_segments(polyline, segment_count=segment_count)
+        if nodes is None:
+            continue
+        nodes = project_equal_length_chain(nodes, segment_length, node_count=segment_count + 1)
+        if nodes is None:
+            continue
+        nodes = constrain_chain_to_endpoints(
+            nodes,
+            endpoints,
+            segment_length,
+            iterations=int(endpoint_constraint_iterations),
+            tolerance_m=float(endpoint_constraint_tolerance_m),
+        )
+        if nodes is None:
+            continue
+        nodes = np.asarray(nodes, dtype=np.float64)
+        if nodes.shape == (segment_count + 1, 3) and np.all(np.isfinite(nodes)):
+            hypotheses.append(nodes)
+
+    if not hypotheses:
+        return np.empty((0, 0, 3), dtype=np.float64)
+    return np.ascontiguousarray(np.stack(hypotheses, axis=0), dtype=np.float64)
 
 
 def sample_global_random_chains(
@@ -1658,6 +1886,96 @@ def particle_distance_scores_torch(
             except Exception:
                 pass
         return None
+
+
+def ransac_inlier_stats(points, hypotheses, inlier_distance, backend="auto", chunk_points=512):
+    points = valid_points(points)
+    hypotheses = valid_particles(hypotheses)
+    if len(points) == 0 or len(hypotheses) == 0 or hypotheses.shape[1] < 2:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+
+    torch_stats = ransac_inlier_stats_torch(
+        points,
+        hypotheses,
+        inlier_distance,
+        backend=backend,
+        chunk_points=chunk_points,
+    )
+    if torch_stats is not None:
+        return torch_stats
+
+    squared = point_to_particle_segment_squared_distances(points, hypotheses[:, :-1, :], hypotheses[:, 1:, :])
+    if squared.size == 0:
+        return np.zeros(len(hypotheses), dtype=np.int64), np.full(len(hypotheses), np.inf, dtype=np.float64)
+    point_squared = np.min(squared, axis=1)
+    threshold_sq = float(inlier_distance) * float(inlier_distance)
+    inliers = point_squared <= threshold_sq
+    counts = np.count_nonzero(inliers, axis=1).astype(np.int64, copy=False)
+    sums = np.sum(np.where(inliers, point_squared, 0.0), axis=1).astype(np.float64, copy=False)
+    return counts, sums
+
+
+def ransac_inlier_stats_torch(points, hypotheses, inlier_distance, backend="auto", chunk_points=512):
+    device = torch_scoring_device(backend)
+    if device is None:
+        return None
+    try:
+        with torch.inference_mode():
+            points_t = torch.as_tensor(points[:, :3], dtype=torch.float32, device=device)
+            hypotheses_t = torch.as_tensor(hypotheses[:, :, :3], dtype=torch.float32, device=device)
+            counts_t, sums_t = ransac_inlier_stats_torch_tensor(
+                points_t,
+                hypotheses_t,
+                inlier_distance,
+                chunk_points=chunk_points,
+            )
+            return (
+                counts_t.detach().cpu().numpy().astype(np.int64, copy=False),
+                sums_t.detach().cpu().numpy().astype(np.float64, copy=False),
+            )
+    except RuntimeError:
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        return None
+
+
+def ransac_inlier_stats_torch_tensor(points_t, hypotheses_t, inlier_distance, chunk_points=512):
+    if torch is None:
+        raise RuntimeError("Torch RANSAC scoring requested but torch is not available.")
+    if points_t.ndim != 2 or points_t.shape[1] < 3 or hypotheses_t.ndim != 3 or hypotheses_t.shape[1] < 2:
+        count = int(hypotheses_t.shape[0]) if hypotheses_t.ndim >= 1 else 0
+        return (
+            torch.zeros(count, dtype=torch.int64, device=hypotheses_t.device),
+            torch.full((count,), torch.inf, dtype=torch.float32, device=hypotheses_t.device),
+        )
+
+    points_t = points_t[:, :3]
+    hypotheses_t = hypotheses_t[:, :, :3]
+    starts = hypotheses_t[:, :-1, :]
+    ends = hypotheses_t[:, 1:, :]
+    segment = ends - starts
+    length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
+    threshold_sq = float(inlier_distance) * float(inlier_distance)
+    counts = torch.zeros(int(hypotheses_t.shape[0]), dtype=torch.int64, device=hypotheses_t.device)
+    sums = torch.zeros(int(hypotheses_t.shape[0]), dtype=torch.float32, device=hypotheses_t.device)
+
+    chunk_points = max(1, int(chunk_points))
+    for start_index in range(0, int(points_t.shape[0]), chunk_points):
+        chunk = points_t[start_index : start_index + chunk_points]
+        point_delta = chunk[None, None, :, :] - starts[:, :, None, :]
+        t = torch.sum(point_delta * segment[:, :, None, :], dim=3) / length_sq[:, :, None]
+        t = torch.clamp(t, 0.0, 1.0)
+        projection = starts[:, :, None, :] + t[:, :, :, None] * segment[:, :, None, :]
+        delta = chunk[None, None, :, :] - projection
+        squared = torch.sum(delta * delta, dim=3)
+        best = torch.amin(squared, dim=1)
+        inliers = best <= threshold_sq
+        counts += torch.count_nonzero(inliers, dim=1)
+        sums += torch.sum(torch.where(inliers, best, torch.zeros_like(best)), dim=1)
+    return counts, sums
 
 
 def particle_distance_scores_torch_tensor(

@@ -31,53 +31,37 @@ fill = true
 rgb_width = 620
 cloud_width = 1180
 height = 900
-point_size = 2.0
+point_size = 1.5
 
 # Options: "segmentation", "tracking", "mask".
 rgb_view = "segmentation"
 
 [pidnet]
 # Relative paths are resolved from this config file.
+# One RGB checkpoint predicts: generic cable body plus separated endpoint masks.
+# For two cables this is cable, endpoints_1, endpoints_2. Cable-body identity is
+# handled by endpoint pairing and the particle filters, not by separate cable classes.
 checkpoint = "models/pidnet_two_cable_best.pt"
 device = "cuda"
 threshold = 0.25
 base_channels = 24
 amp = true
 channels_last = true
-instance_channels = "auto"
-
-[endpoint]
-# Endpoint anchor source:
-#   "neural" -> use learned PIDNet endpoint channels
-#   "normal" -> use inferred cable endpoints only
-#   "none"   -> disable endpoint anchors
-mode = "neural"
 
 [endpoint_markers]
-enabled = true
 min_area_px = 50
 min_points = 8
 open_kernel = 3
 close_kernel = 5
 max_points_per_marker = 256
 max_count = 4
-tape_length_m = 0.035
+tape_lengths_m = [0.03, 0.03]
 offset_to_tips = false
 
 [detector]
-# Options: "pidnet" for trained neural segmentation, "hsv" for HSV range or
-# Gaussian color segmentation. Switch this to compare detector speed and quality.
-backend = "pidnet"
-
 # The current checkpoint was trained at full ZED HD720. Full-scale inference
 # keeps the live mask close to the labeled data; reduce this only for speed.
 scale = 1.0
-
-# Use the previous 2D cable path to crop the next detector pass. A full-frame
-# pass runs every full_frame_every frames so the cable can be reacquired.
-roi = true
-roi_padding_px = 96
-full_frame_every = 12
 
 # Run RGB segmentation + 3D measurement every N frames. Skipped frames use the
 # particle filter prediction and do not count as lost tracking. 2 gives a 30 Hz
@@ -90,45 +74,12 @@ min_area_px = 80
 open_kernel = 7
 close_kernel = 1
 
-# Used by HSV/legacy centerline geometry frames. The default PIDNet path scores
-# masked ZED cable points directly and does not require skeleton extraction.
-skeleton_prune_px = 10
-skeleton_prune_passes = 2
-centerline_smooth_window = 9
-
-[hsv]
-# Pure HSV baseline detector. Modes: "range" or "gaussian". OpenCV uses H in
-# [0, 179], not degrees, and S/V in [0, 255]. If h_min > h_max, the hue range
-# wraps around zero for red cables.
-mode = "gaussian"
-h_min = 42
-h_max = 56
-s_min = 58
-s_max = 137
-v_min = 93
-v_max = 170
-
-# Fast HSV path: after initialization, skip skeleton/centerline extraction and
-# lift sampled mask pixels directly into the particle filter. Geometry is still
-# refreshed every geometry_every frames and during reacquisition.
-fast_mask_only = true
-geometry_every = 12
-mask_points = 512
-
-# Gaussian HSV model uses features [sin(H), cos(H), S, V], where S/V are scaled
-# to 0..1. Tune these from labeled masks with tools/tune_hsv_from_masks.py.
-gaussian_threshold = 0.0
-gaussian_positive_mean = [0.984872, -0.122578, 0.387804, 0.521765]
-gaussian_positive_std = [0.033578, 0.117712, 0.091709, 0.060365]
-gaussian_negative_mean = [-0.081639, 0.422335, 0.022732, 0.583794]
-gaussian_negative_std = [0.71042, 0.557233, 0.042556, 0.089174]
-
 [point_cloud]
 # Visual point-cloud sampling. Larger stride and lower max_points make the
 # display faster without changing particle-filter scoring.
-stride = 4
-max_points = 100000
-cloud_update_every = 2
+stride = 5
+max_points = 30000
+cloud_update_every = 3
 
 # Retrieve the ZED confidence map every N frames. Use 0 to disable confidence
 # filtering, or increase to 2-3 if confidence retrieval becomes expensive.
@@ -136,35 +87,19 @@ confidence_update_every = 2
 
 [cable]
 # Number of separate cables to reconstruct. With instance PIDNet masks, each
-# cable gets its own PF and endpoint-color markers are assigned by track state.
+# cable gets its own PF and endpoint anchors from its endpoint channel.
 count = 2
 
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
 segments = 12
 
-# Physical cable length in meters for this experiment.
-length_m = 0.52
-length_scale = 1.0
-
-# Fixed segment length in meters. 0 estimates the length once from the first
-# valid 3D measurement and then keeps it fixed.
-segment_length_m = 0.0
+# Physical cable lengths in meters, one value per cable.
+lengths_m = [0.52, 0.52]
 
 # Maximum raw support points drawn in the 3D viewer.
-max_visual_points = 8000
+max_visual_points = 6000
 
 [measurement]
-# Used by HSV/legacy centerline lifting.
-node_search_px = 2
-
-# Maximum ordered 2D centerline pixels lifted into 3D before fitting on the
-# HSV/legacy centerline path.
-centerline_points = 48
-
-# Reject a local ZED lookup window when local depth is too spread out. This
-# removes edge/background depth. Use 0 to disable.
-local_depth_spread_m = 0.06
-
 # Smooth fitted 3D measurement nodes before proposal injection. The PIDNet path
 # now builds an ordered 3D centerline from the orange cloud, so this stays off
 # and the particle filter handles temporal smoothing.
@@ -172,17 +107,9 @@ smoothing = false
 smoothing_alpha = 0.30
 smoothing_gate_m = 0.040
 
-# For PIDNet masks, send raw orange 3D support points into the PF. The PF fits
-# an ordered helper chain only periodically, which is faster than doing it in
-# the measurement stage every frame.
-mask_centerline = false
-mask_centerline_reference_gate_m = 0.15
-mask_centerline_max_residual_m = 0.08
-
-# Before fitting, keep lifted 3D points near the previous filtered cable on the
-# HSV/centerline paths. The PIDNet mask-point path bypasses this gate so a bad
-# particle-filter estimate cannot suppress a good neural mask cloud.
-prediction_gate_m = 0.12
+# Before fitting helper chains, keep support points near the previous filtered
+# cable until reacquisition is needed.
+prediction_gate_m = 0.05
 
 # After this many prediction-only frames, prediction gating is disabled so the
 # tracker can reacquire from the full RGB segmentation.
@@ -201,16 +128,16 @@ initial_node_std_m = 0.05
 initial_direction_std = 0.20
 
 # Per-frame process noise on cable vertices, in meters.
-process_node_std_m = 0.02
-process_direction_std = 0.040
+process_node_std_m = 0.005
+process_direction_std = 0.012
 
 # Constant-velocity prediction. Each particle stores one 3D velocity per cable
 # node. Prediction moves nodes by v*dt, then reapplies fixed segment length and
 # endpoint constraints.
 velocity = true
-velocity_damping = 0.85
-velocity_measurement_blend = 0.40
-velocity_process_std_mps = 0.01
+velocity_damping = 0.65
+velocity_measurement_blend = 0.10
+velocity_process_std_mps = 0.004
 max_node_speed_mps = 1.0
 
 # Direction smoothing is off because the ordered orange-cloud centerline is now
@@ -219,7 +146,7 @@ direction_smooth_passes = 0
 
 # Measurement likelihood width, in meters. The ordered measured centerline lets
 # the PF trust current cable geometry more directly.
-measurement_node_std_m = 0.010
+measurement_node_std_m = 0.025
 
 # Maximum masked ZED cable points used to score particles by point-to-segment
 # distance. This is the main particle-score cost knob.
@@ -269,12 +196,22 @@ measurement_reset_error_m = 0.25
 # is already close to the filtered estimate, only stable_ratio particles are
 # regenerated. Because the PIDNet mask cloud is the trusted measurement, the
 # maximum ratio is intentionally high enough to recover from bad particles.
-measurement_proposal_ratio = 0.35
-measurement_proposal_stable_ratio = 0.08
-measurement_proposal_start_error_m = 0.015
-measurement_proposal_full_error_m = 0.060
-measurement_proposal_node_std_m = 0.012
-measurement_proposal_direction_std = 0.025
+measurement_proposal_ratio = 0.06
+measurement_proposal_stable_ratio = 0.00
+measurement_proposal_start_error_m = 0.025
+measurement_proposal_full_error_m = 0.090
+measurement_proposal_node_std_m = 0.008
+measurement_proposal_direction_std = 0.015
+
+# RANSAC-style inlier selection. Each update generates endpoint-constrained
+# fixed-length cable hypotheses from random support-point subsets, chooses the
+# hypothesis with the largest inlier set and lowest inlier RMS error, then gives
+# only that inlier subset to the PF.
+ransac_inlier_selection = true
+ransac_hypotheses = 16
+ransac_subset_points = 2
+ransac_inlier_distance_m = 0.018
+ransac_min_points = 24
 
 # Robust scoring keeps this fraction of the lowest point-to-segment distances,
 # so a few bad depth points do not dominate the weight.
@@ -290,7 +227,7 @@ coverage_min_fraction = 0.05
 bend_penalty_m = 0.0
 
 # Display estimate is always the weighted average of the best particles.
-top_particles = 20
+top_particles = 80
 
 # Keep a fixed exploration budget as globally random chain hypotheses within the
 # current measured support-cloud bounds.
@@ -315,7 +252,7 @@ occlusion_gate_m = 0.12
 outlier_distance_m = 0.08
 
 # Resample when effective sample size drops below this fraction of particles.
-resample_effective_ratio = 0.50
+resample_effective_ratio = 0.35
 
 # After this many frames without trusted measurements, reset on the next valid
 # measurement. Motion noise ramps up until max_motion_noise_scale.
