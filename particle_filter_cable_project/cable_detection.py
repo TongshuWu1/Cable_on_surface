@@ -458,6 +458,7 @@ def endpoint_markers_from_mask(
     max_points_per_marker=256,
     tape_length_m=0.035,
     offset_to_tips=False,
+    max_markers=2,
 ):
     mask = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -500,7 +501,9 @@ def endpoint_markers_from_mask(
         return None
 
     markers.sort(key=lambda item: (item["point_count"], item["area"]), reverse=True)
-    markers = order_marker_records(markers[:2], reference_nodes)
+    max_markers = max(1, int(max_markers))
+    markers = markers[:max_markers]
+    markers = order_marker_records(markers, reference_nodes)
     for marker in markers:
         cleaned[labels == marker["label"]] = 255
 

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import heapq
+import time
 
 import numpy as np
 
@@ -23,6 +24,11 @@ class CableParticleFilterConfig:
     initial_direction_std: float = 0.10
     process_node_std_m: float = 0.006
     process_direction_std: float = 0.020
+    velocity_enabled: bool = True
+    velocity_damping: float = 0.85
+    velocity_measurement_blend: float = 0.30
+    velocity_process_std_mps: float = 0.03
+    max_node_speed_mps: float = 1.0
     direction_smooth_passes: int = 1
     measurement_node_std_m: float = 0.030
     measurement_max_points: int = 1024
@@ -34,6 +40,7 @@ class CableParticleFilterConfig:
     endpoint_refresh_interval: int = 0
     reference_ordering: bool = True
     reference_ordering_gate_m: float = 0.08
+    measurement_fit_interval: int = 1
     endpoint_penalty_weight: float = 1.0
     measurement_reset_error_m: float = 0.25
     measurement_proposal_ratio: float = 0.30
@@ -49,9 +56,9 @@ class CableParticleFilterConfig:
     coarse_score_points: int = 192
     coarse_score_full_fraction: float = 0.25
     coarse_score_min_particles: int = 160
-    map_estimate_effective_ratio: float = 0.35
     top_particle_count: int = 50
     global_random_particle_ratio: float = 0.10
+    global_random_effective_ratio: float = 0.35
     global_random_bounds_padding_m: float = 0.10
     endpoint_constraint_iterations: int = 16
     endpoint_constraint_tolerance_m: float = 1e-4
@@ -80,14 +87,16 @@ class CableParticleFilterResult:
     global_random_particle_ratio: float = 0.0
     coarse_score_point_count: int = 0
     full_score_particle_count: int = 0
+    mean_node_speed_mps: float = 0.0
+    stage_seconds: dict | None = None
 
 
 class CableParticleFilter:
     """Particle filter over connected fixed-length cable segments.
 
-    A particle is stored as connected nodes, but prediction only moves the chain
-    start and segment directions. Segment roll is not represented, and every
-    segment is projected back to one shared fixed length.
+    A particle is stored as connected nodes plus one 3D velocity per node.
+    Segment roll is not represented, and every segment is projected back to one
+    shared fixed length.
     """
 
     def __init__(self, node_count, config=None, seed=17):
@@ -96,6 +105,7 @@ class CableParticleFilter:
         self.config = config if config is not None else CableParticleFilterConfig()
         self.rng = np.random.default_rng(seed)
         self.particles = None
+        self.node_velocities = None
         self.weights = None
         self.initialized = False
         self.lost_frames = 0
@@ -110,9 +120,14 @@ class CableParticleFilter:
         self.last_full_score_particle_count = 0
         self.last_ordered_measurement_nodes = None
         self.last_endpoint_nodes = None
+        self.last_measurement_node_velocity = None
+        self.last_measurement_nodes_from_prediction = False
+        self.last_stage_seconds = {}
         self.measurement_update_count = 0
 
     def step(self, measurement, dt=1.0 / 30.0, count_lost=True):
+        self._reset_stage_seconds()
+        stage_start = time.perf_counter()
         dt = float(np.clip(dt, 1e-3, 0.20))
         measurement_points = self._measurement_points(measurement)
         endpoint_nodes = self._measurement_endpoint_nodes(measurement)
@@ -122,36 +137,61 @@ class CableParticleFilter:
             self.last_measurement_point_count = int(len(measurement_points))
         elif count_lost:
             self.last_measurement_point_count = 0
+        self._record_stage("prepare", stage_start)
 
         if measurement_points is not None:
             if not self.initialized:
+                stage_start = time.perf_counter()
                 self._initialize(measurement, measurement_points)
+                self._record_stage("initialize", stage_start)
             else:
+                stage_start = time.perf_counter()
                 self._predict(dt, noise_scale=1.0)
+                self._record_stage("predict", stage_start)
+                stage_start = time.perf_counter()
+                previous_measurement_nodes = valid_points(self.last_ordered_measurement_nodes)
                 measurement_nodes = self._measurement_nodes(measurement, measurement_points)
-                if self._should_reset_to_measurement(measurement_nodes):
+                self._record_stage("measurement", stage_start)
+                if not self.last_measurement_nodes_from_prediction and self._should_reset_to_measurement(measurement_nodes):
                     self.initialized = False
+                    stage_start = time.perf_counter()
                     self._initialize(measurement, measurement_points)
+                    self._record_stage("initialize", stage_start)
                     self.lost_frames = 0
                     return self._estimate(measurement_used=True, prediction_only=False)
+                stage_start = time.perf_counter()
+                self._update_velocities_from_measurement(previous_measurement_nodes, measurement_nodes, dt)
+                self._record_stage("velocity", stage_start)
+                stage_start = time.perf_counter()
                 self._inject_measurement_proposals(measurement_nodes)
+                self._record_stage("proposal", stage_start)
+                stage_start = time.perf_counter()
                 measurement_points, _segment_indices, visible_segments = self._associate_visible_points(
                     measurement_points,
                     candidate_nodes=measurement_nodes,
                 )
+                self._record_stage("associate", stage_start)
                 if measurement_points is None:
                     self.last_measurement_point_count = 0
                     return self._prediction_only_after_update_drop()
                 self.last_measurement_point_count = int(len(measurement_points))
+                stage_start = time.perf_counter()
                 self._inject_global_random_particles(measurement_points)
+                self._record_stage("random", stage_start)
                 self._weight(
                     measurement_points,
                     visible_segments=visible_segments,
                     measurement_nodes=measurement_nodes,
                 )
+                stage_start = time.perf_counter()
                 self._set_visibility(visible_segments)
                 result = self._estimate(measurement_used=True, prediction_only=False)
+                self._record_stage("estimate", stage_start)
+                stage_start = time.perf_counter()
                 self._maybe_resample(noise_scale=self.last_motion_noise_scale)
+                self._record_stage("resample", stage_start)
+                if result is not None:
+                    result.stage_seconds = dict(self.last_stage_seconds)
                 self.lost_frames = 0
                 return result
 
@@ -172,11 +212,19 @@ class CableParticleFilter:
             1.0 + 0.25 * self.lost_frames,
             float(self.config.max_motion_noise_scale),
         )
+        stage_start = time.perf_counter()
         self._predict(dt, self.last_motion_noise_scale)
+        self._record_stage("predict", stage_start)
         if count_lost:
             self._set_visibility(np.zeros(self.segment_count, dtype=bool))
+        stage_start = time.perf_counter()
         result = self._estimate(measurement_used=False, prediction_only=True)
-        self._maybe_resample(force=self.lost_frames > 1, noise_scale=self.last_motion_noise_scale)
+        self._record_stage("estimate", stage_start)
+        stage_start = time.perf_counter()
+        self._maybe_resample(force=self.lost_frames > 1 and not self._velocity_enabled(), noise_scale=self.last_motion_noise_scale)
+        self._record_stage("resample", stage_start)
+        if result is not None:
+            result.stage_seconds = dict(self.last_stage_seconds)
         return result
 
     def _initialize(self, measurement, measurement_points):
@@ -219,11 +267,13 @@ class CableParticleFilter:
         )
         self.particles = build_chains(starts, particle_directions, self.segment_length_m)
         self._constrain_particles_to_known_endpoints()
+        self._reset_velocities(count)
         self.weights = np.full(count, 1.0 / count, dtype=np.float64)
         self.initialized = True
         self.last_motion_noise_scale = 1.0
         self.last_measurement_proposal_ratio = 0.0
         self.last_global_random_particle_ratio = 0.0
+        self.last_measurement_node_velocity = None
         self.measurement_update_count = 1
         _points, _indices, visible_segments = self._associate_visible_points(measurement_points)
         self._set_visibility(visible_segments)
@@ -233,20 +283,35 @@ class CableParticleFilter:
             return
         noise_scale = float(np.clip(noise_scale, 0.25, self.config.max_motion_noise_scale))
         self.last_motion_noise_scale = noise_scale
-        starts = self.particles[:, 0, :] + self.rng.normal(
-            0.0,
-            float(self.config.process_node_std_m) * noise_scale,
-            (len(self.particles), 3),
-        )
-        directions = particle_directions(self.particles)
-        directions = normalize_vectors(
-            directions
-            + self.rng.normal(
+
+        if bool(getattr(self.config, "velocity_enabled", True)):
+            self._ensure_velocity_array()
+            damping = float(np.clip(getattr(self.config, "velocity_damping", 0.85), 0.0, 1.0))
+            self.node_velocities *= damping
+            self.node_velocities += self.rng.normal(
                 0.0,
-                float(self.config.process_direction_std) * noise_scale,
-                directions.shape,
+                float(getattr(self.config, "velocity_process_std_mps", 0.03)) * noise_scale,
+                self.node_velocities.shape,
             )
-        )
+            self._clip_velocities()
+            predicted = self.particles + self.node_velocities * float(dt)
+            starts = predicted[:, 0, :]
+            directions = particle_directions(predicted)
+        else:
+            starts = self.particles[:, 0, :] + self.rng.normal(
+                0.0,
+                float(self.config.process_node_std_m) * noise_scale,
+                (len(self.particles), 3),
+            )
+            directions = particle_directions(self.particles)
+            directions = normalize_vectors(
+                directions
+                + self.rng.normal(
+                    0.0,
+                    float(self.config.process_direction_std) * noise_scale,
+                    directions.shape,
+                )
+            )
         directions = smooth_particle_directions(
             directions,
             passes=int(getattr(self.config, "direction_smooth_passes", 1)),
@@ -261,15 +326,18 @@ class CableParticleFilter:
         if visible_segments is not None:
             visible_segments = np.asarray(visible_segments, dtype=bool).reshape(-1)
             expected_segments = np.flatnonzero(visible_segments)
+        stage_start = time.perf_counter()
         scores = self._score_particles(
             measurement_points,
             outlier_distance=outlier_distance,
             expected_segments=expected_segments,
         )
+        self._record_stage("score", stage_start)
 
         if not np.any(np.isfinite(scores)):
             return
 
+        stage_start = time.perf_counter()
         endpoint_weight = float(getattr(self.config, "endpoint_penalty_weight", 0.0))
         if endpoint_weight > 0.0 and measurement_nodes is not None:
             scores = scores + endpoint_order_penalty(self.particles, measurement_nodes, weight=endpoint_weight)
@@ -284,6 +352,7 @@ class CableParticleFilter:
             self.weights.fill(1.0 / len(self.weights))
             return
         self.weights = weighted / total
+        self._record_stage("weight", stage_start)
 
     def _maybe_resample(self, force=False, noise_scale=1.0):
         if self.weights is None or self.particles is None:
@@ -295,6 +364,8 @@ class CableParticleFilter:
 
         indices = self._systematic_resample()
         self.particles = self.particles[indices].copy()
+        if self.node_velocities is not None:
+            self.node_velocities = self.node_velocities[indices].copy()
         self.weights.fill(1.0 / len(self.weights))
         self._roughen(noise_scale=float(noise_scale))
 
@@ -320,6 +391,7 @@ class CableParticleFilter:
         )
         self.particles = build_chains(starts, directions, self.segment_length_m)
         self._constrain_particles_to_known_endpoints()
+        self._roughen_velocities(noise_scale=float(noise_scale))
 
     def _estimate(self, measurement_used, prediction_only):
         if self.particles is None or self.weights is None or self.segment_length_m is None:
@@ -340,6 +412,8 @@ class CableParticleFilter:
             global_random_particle_ratio=float(self.last_global_random_particle_ratio),
             coarse_score_point_count=int(self.last_coarse_score_point_count),
             full_score_particle_count=int(self.last_full_score_particle_count),
+            mean_node_speed_mps=float(self._weighted_node_speed()),
+            stage_seconds=dict(self.last_stage_seconds),
         )
 
     def _estimate_nodes(self):
@@ -383,18 +457,28 @@ class CableParticleFilter:
         return nodes
 
     def _measurement_nodes(self, measurement, measurement_points):
+        self.last_measurement_nodes_from_prediction = False
         candidate = valid_points(getattr(measurement, "points_xyz", None))
         if len(candidate) >= 2:
             nodes = fit_polyline_segments(candidate, segment_count=self.segment_count)
         else:
             reference_nodes = self._estimate_nodes() if self.initialized and self.particles is not None else None
             force_endpoint = self._should_refresh_endpoint_ordering()
-            nodes = self._fit_measurement_point_chain(
-                measurement_points,
-                reference_nodes=reference_nodes,
-                allow_endpoint_fallback=self.lost_frames > 0 or force_endpoint,
-                force_endpoint=force_endpoint,
-            )
+            if not self._should_fit_measurement_nodes(force_endpoint):
+                nodes = reference_nodes
+                if nodes is not None:
+                    self.measurement_update_count += 1
+                    self.last_measurement_nodes_from_prediction = True
+                    nodes = np.ascontiguousarray(nodes, dtype=np.float64)
+                    self.last_ordered_measurement_nodes = nodes
+                    return nodes
+            else:
+                nodes = self._fit_measurement_point_chain(
+                    measurement_points,
+                    reference_nodes=reference_nodes,
+                    allow_endpoint_fallback=self.lost_frames > 0 or force_endpoint,
+                    force_endpoint=force_endpoint,
+                )
             self.measurement_update_count += 1
         if nodes is None or self.segment_length_m is None:
             return None
@@ -407,6 +491,18 @@ class CableParticleFilter:
             nodes = self._constrain_nodes_to_known_endpoints(nodes, self._measurement_endpoint_nodes(measurement))
         self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
         return np.ascontiguousarray(nodes, dtype=np.float64)
+
+    def _should_fit_measurement_nodes(self, force_endpoint=False):
+        if bool(force_endpoint) or not self.initialized or self.particles is None:
+            return True
+        if self.lost_frames > 0:
+            return True
+        interval = max(1, int(getattr(self.config, "measurement_fit_interval", 1)))
+        if interval <= 1:
+            return True
+        if self.last_ordered_measurement_nodes is None:
+            return True
+        return int(self.measurement_update_count) % interval == 0
 
     def _fit_measurement_point_chain(
         self,
@@ -466,6 +562,9 @@ class CableParticleFilter:
         if measurement_nodes is None or self.particles is None or self.weights is None or self.segment_length_m is None:
             self.last_measurement_proposal_ratio = 0.0
             return
+        if self.last_measurement_nodes_from_prediction:
+            self.last_measurement_proposal_ratio = 0.0
+            return
 
         ratio = self._adaptive_measurement_proposal_ratio(measurement_nodes)
         self.last_measurement_proposal_ratio = float(ratio)
@@ -487,6 +586,7 @@ class CableParticleFilter:
         replace_indices = self.rng.choice(total_count, size=proposal_count, replace=False)
         self.particles[replace_indices] = proposals
         self._constrain_particles_to_known_endpoints(indices=replace_indices)
+        self._assign_measurement_velocity(replace_indices)
 
         self.weights *= 1.0 - ratio
         self.weights[replace_indices] = ratio / proposal_count
@@ -508,6 +608,12 @@ class CableParticleFilter:
             return
 
         total_count = len(self.particles)
+        effective_ratio_threshold = float(np.clip(getattr(self.config, "global_random_effective_ratio", 0.0), 0.0, 1.0))
+        if self.lost_frames <= 0 and effective_ratio_threshold > 0.0:
+            effective_ratio = self._effective_sample_size() / max(float(total_count), 1.0)
+            if effective_ratio >= effective_ratio_threshold:
+                return
+
         random_count = int(round(ratio * total_count))
         random_count = int(np.clip(random_count, 1, total_count))
         padding = max(0.0, float(getattr(self.config, "global_random_bounds_padding_m", 0.10)))
@@ -526,6 +632,7 @@ class CableParticleFilter:
         replace_indices = self.rng.choice(total_count, size=random_count, replace=False)
         self.particles[replace_indices] = random_particles
         self._constrain_particles_to_known_endpoints(indices=replace_indices)
+        self._zero_velocities(replace_indices)
         self.weights *= 1.0 - ratio
         self.weights[replace_indices] = ratio / random_count
         total = float(np.sum(self.weights))
@@ -534,6 +641,106 @@ class CableParticleFilter:
         else:
             self.weights.fill(1.0 / total_count)
         self.last_global_random_particle_ratio = float(random_count) / max(float(total_count), 1.0)
+
+    def _velocity_enabled(self):
+        return bool(getattr(self.config, "velocity_enabled", True))
+
+    def _reset_stage_seconds(self):
+        self.last_stage_seconds = {}
+
+    def _record_stage(self, name, start_time):
+        elapsed = max(0.0, time.perf_counter() - float(start_time))
+        self.last_stage_seconds[str(name)] = self.last_stage_seconds.get(str(name), 0.0) + elapsed
+
+    def _reset_velocities(self, count):
+        if not self._velocity_enabled():
+            self.node_velocities = None
+            return
+        count = max(0, int(count))
+        self.node_velocities = np.zeros((count, self.node_count, 3), dtype=np.float64)
+
+    def _ensure_velocity_array(self):
+        if not self._velocity_enabled() or self.particles is None:
+            return False
+        count = len(self.particles)
+        shape = (count, self.node_count, 3)
+        if self.node_velocities is None or self.node_velocities.shape != shape:
+            self.node_velocities = np.zeros(shape, dtype=np.float64)
+        return True
+
+    def _update_velocities_from_measurement(self, previous_nodes, measurement_nodes, dt):
+        if not self._ensure_velocity_array():
+            return
+        if self.last_measurement_nodes_from_prediction:
+            return
+        node_velocity = measurement_node_velocity(previous_nodes, measurement_nodes, dt)
+        if node_velocity is None:
+            return
+        blend = float(np.clip(getattr(self.config, "velocity_measurement_blend", 0.30), 0.0, 1.0))
+        self.node_velocities = (1.0 - blend) * self.node_velocities + blend * node_velocity[None, :, :]
+        self.last_measurement_node_velocity = np.ascontiguousarray(node_velocity, dtype=np.float64)
+        self._clip_velocities()
+
+    def _assign_measurement_velocity(self, indices):
+        if not self._ensure_velocity_array():
+            return
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if len(indices) == 0:
+            return
+        if self.last_measurement_node_velocity is None:
+            self._zero_velocities(indices)
+            return
+        self.node_velocities[indices] = self.last_measurement_node_velocity[None, :, :] + self.rng.normal(
+            0.0,
+            0.5 * float(getattr(self.config, "velocity_process_std_mps", 0.03)),
+            (len(indices), self.node_count, 3),
+        )
+        self._clip_velocities(indices=indices)
+
+    def _zero_velocities(self, indices=None):
+        if not self._ensure_velocity_array():
+            return
+        if indices is None:
+            self.node_velocities.fill(0.0)
+            return
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if len(indices) == 0:
+            return
+        self.node_velocities[indices] = 0.0
+
+    def _roughen_velocities(self, noise_scale=1.0):
+        if not self._ensure_velocity_array():
+            return
+        noise_scale = float(np.clip(noise_scale, 0.25, self.config.max_motion_noise_scale))
+        self.node_velocities += self.rng.normal(
+            0.0,
+            0.5 * float(getattr(self.config, "velocity_process_std_mps", 0.03)) * noise_scale,
+            self.node_velocities.shape,
+        )
+        self._clip_velocities()
+
+    def _clip_velocities(self, indices=None):
+        if self.node_velocities is None:
+            return
+        if indices is None:
+            self.node_velocities = clip_vector_norms(
+                self.node_velocities,
+                float(getattr(self.config, "max_node_speed_mps", 1.0)),
+            )
+            return
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if len(indices) == 0:
+            return
+        self.node_velocities[indices] = clip_vector_norms(
+            self.node_velocities[indices],
+            float(getattr(self.config, "max_node_speed_mps", 1.0)),
+        )
+
+    def _weighted_node_speed(self):
+        if self.node_velocities is None or self.weights is None:
+            return 0.0
+        speeds = np.mean(np.linalg.norm(self.node_velocities, axis=2), axis=1)
+        return weighted_mean_or_zero(speeds, self.weights)
 
     def _should_reset_to_measurement(self, measurement_nodes):
         threshold = float(getattr(self.config, "measurement_reset_error_m", 0.0))
@@ -663,7 +870,10 @@ class CableParticleFilter:
         )
 
     def _associate_visible_points(self, measurement_points, candidate_nodes=None):
-        reference_nodes = self._estimate_nodes() if self.initialized else None
+        if self.last_measurement_nodes_from_prediction and candidate_nodes is not None:
+            reference_nodes = valid_points(candidate_nodes)
+        else:
+            reference_nodes = self._estimate_nodes() if self.initialized else None
         if reference_nodes is None:
             visible_segments = np.ones(self.segment_count, dtype=bool)
             return measurement_points, None, visible_segments
@@ -708,7 +918,7 @@ class CableParticleFilter:
             self.initialized = False
             return None
         result = self._estimate(measurement_used=False, prediction_only=True)
-        self._maybe_resample(force=self.lost_frames > 1, noise_scale=self.last_motion_noise_scale)
+        self._maybe_resample(force=self.lost_frames > 1 and not self._velocity_enabled(), noise_scale=self.last_motion_noise_scale)
         return result
 
     def _systematic_resample(self):
@@ -1138,10 +1348,7 @@ def constrain_chains_to_endpoints(chains, endpoint_nodes, segment_length_m, iter
     endpoint_distance = float(np.linalg.norm(end - start))
     tolerance = max(0.0, float(tolerance_m))
     if endpoint_distance > total_length + tolerance:
-        raise ValueError(
-            "Known cable endpoints are farther apart than the fixed cable length: "
-            f"distance={endpoint_distance:.4f}m total_length={total_length:.4f}m"
-        )
+        return np.ascontiguousarray(chains[:, :, :3], dtype=np.float64)
 
     output = np.ascontiguousarray(chains[:, :, :3], dtype=np.float64).copy()
     output[:, 0, :] = start
@@ -1432,68 +1639,17 @@ def particle_distance_scores_torch(
         with torch.inference_mode():
             points_t = torch.as_tensor(points[:, :3], dtype=torch.float32, device=device)
             particles_t = torch.as_tensor(particles[:, :, :3], dtype=torch.float32, device=device)
-            starts = particles_t[:, :-1, :]
-            ends = particles_t[:, 1:, :]
-            segment = ends - starts
-            length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
-
-            best_chunks = []
-            expected = expected_segment_indices(expected_segments, particles.shape[1] - 1)
-            need_coverage = float(coverage_penalty_m) > 0.0 and len(expected) > 0
-            coverage_counts = (
-                torch.zeros((particles_t.shape[0], particles_t.shape[1] - 1), dtype=torch.float32, device=device)
-                if need_coverage
-                else None
+            scores = particle_distance_scores_torch_tensor(
+                points_t,
+                particles_t,
+                outlier_distance=outlier_distance,
+                score_keep_fraction=score_keep_fraction,
+                coverage_penalty_m=coverage_penalty_m,
+                coverage_min_fraction=coverage_min_fraction,
+                bend_penalty_m=bend_penalty_m,
+                expected_segments=expected_segments,
+                chunk_points=chunk_points,
             )
-            chunk_points = max(1, int(chunk_points))
-            for start_index in range(0, points_t.shape[0], chunk_points):
-                chunk = points_t[start_index : start_index + chunk_points]
-                point_delta = chunk[None, None, :, :] - starts[:, :, None, :]
-                t = torch.sum(point_delta * segment[:, :, None, :], dim=3) / length_sq[:, :, None]
-                t = torch.clamp(t, 0.0, 1.0)
-                projection = starts[:, :, None, :] + t[:, :, :, None] * segment[:, :, None, :]
-                delta = chunk[None, None, :, :] - projection
-                squared = torch.sum(delta * delta, dim=3)
-                if need_coverage:
-                    best, nearest = torch.min(squared, dim=1)
-                    coverage_counts.scatter_add_(
-                        1,
-                        nearest,
-                        torch.ones_like(nearest, dtype=torch.float32, device=device),
-                    )
-                else:
-                    best = torch.amin(squared, dim=1)
-                best_chunks.append(best)
-
-            if not best_chunks:
-                return np.full(len(particles), np.inf, dtype=np.float64)
-            squared_distances = torch.cat(best_chunks, dim=1)
-
-            outlier_distance = float(outlier_distance)
-            if np.isfinite(outlier_distance):
-                squared_distances = torch.clamp(squared_distances, max=outlier_distance * outlier_distance)
-            keep_fraction = float(np.clip(score_keep_fraction, 1e-6, 1.0))
-            keep_count = max(1, int(np.ceil(squared_distances.shape[1] * keep_fraction)))
-            if keep_count >= squared_distances.shape[1]:
-                scores = torch.mean(squared_distances, dim=1)
-            else:
-                selected, _indices = torch.topk(squared_distances, keep_count, dim=1, largest=False)
-                scores = torch.mean(selected, dim=1)
-
-            if need_coverage and coverage_counts is not None:
-                required = max(1, int(np.ceil(points_t.shape[0] * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
-                missing = torch.zeros(coverage_counts.shape[0], dtype=torch.float32, device=device)
-                for segment_index in expected:
-                    counts = coverage_counts[:, int(segment_index)]
-                    missing = missing + (counts < required).to(torch.float32)
-                scores = scores + missing * float(coverage_penalty_m) * float(coverage_penalty_m)
-
-            if float(bend_penalty_m) > 0.0 and particles_t.shape[1] > 2:
-                directions = segment / torch.sqrt(length_sq[:, :, None])
-                dots = torch.sum(directions[:, :-1, :] * directions[:, 1:, :], dim=2).clamp(-1.0, 1.0)
-                bend = torch.mean(torch.clamp(1.0 - dots, min=0.0), dim=1)
-                scores = scores + bend * float(bend_penalty_m) * float(bend_penalty_m)
-
             return scores.detach().cpu().numpy().astype(np.float64, copy=False)
     except RuntimeError:
         if torch is not None and torch.cuda.is_available():
@@ -1502,6 +1658,89 @@ def particle_distance_scores_torch(
             except Exception:
                 pass
         return None
+
+
+def particle_distance_scores_torch_tensor(
+    points_t,
+    particles_t,
+    outlier_distance=np.inf,
+    score_keep_fraction=1.0,
+    coverage_penalty_m=0.0,
+    coverage_min_fraction=0.05,
+    bend_penalty_m=0.0,
+    expected_segments=None,
+    chunk_points=512,
+):
+    if torch is None:
+        raise RuntimeError("Torch scoring requested but torch is not available.")
+    if points_t.ndim != 2 or points_t.shape[1] < 3 or particles_t.ndim != 3 or particles_t.shape[1] < 2:
+        return torch.full((int(particles_t.shape[0]),), torch.inf, dtype=torch.float32, device=particles_t.device)
+
+    points_t = points_t[:, :3]
+    particles_t = particles_t[:, :, :3]
+    starts = particles_t[:, :-1, :]
+    ends = particles_t[:, 1:, :]
+    segment = ends - starts
+    length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
+
+    best_chunks = []
+    expected = expected_segment_indices(expected_segments, int(particles_t.shape[1]) - 1)
+    need_coverage = float(coverage_penalty_m) > 0.0 and len(expected) > 0
+    coverage_counts = (
+        torch.zeros((particles_t.shape[0], particles_t.shape[1] - 1), dtype=torch.float32, device=particles_t.device)
+        if need_coverage
+        else None
+    )
+    chunk_points = max(1, int(chunk_points))
+    for start_index in range(0, int(points_t.shape[0]), chunk_points):
+        chunk = points_t[start_index : start_index + chunk_points]
+        point_delta = chunk[None, None, :, :] - starts[:, :, None, :]
+        t = torch.sum(point_delta * segment[:, :, None, :], dim=3) / length_sq[:, :, None]
+        t = torch.clamp(t, 0.0, 1.0)
+        projection = starts[:, :, None, :] + t[:, :, :, None] * segment[:, :, None, :]
+        delta = chunk[None, None, :, :] - projection
+        squared = torch.sum(delta * delta, dim=3)
+        if need_coverage:
+            best, nearest = torch.min(squared, dim=1)
+            coverage_counts.scatter_add_(
+                1,
+                nearest,
+                torch.ones_like(nearest, dtype=torch.float32, device=particles_t.device),
+            )
+        else:
+            best = torch.amin(squared, dim=1)
+        best_chunks.append(best)
+
+    if not best_chunks:
+        return torch.full((int(particles_t.shape[0]),), torch.inf, dtype=torch.float32, device=particles_t.device)
+    squared_distances = torch.cat(best_chunks, dim=1)
+
+    outlier_distance = float(outlier_distance)
+    if np.isfinite(outlier_distance):
+        squared_distances = torch.clamp(squared_distances, max=outlier_distance * outlier_distance)
+    keep_fraction = float(np.clip(score_keep_fraction, 1e-6, 1.0))
+    keep_count = max(1, int(np.ceil(int(squared_distances.shape[1]) * keep_fraction)))
+    if keep_count >= int(squared_distances.shape[1]):
+        scores = torch.mean(squared_distances, dim=1)
+    else:
+        selected, _indices = torch.topk(squared_distances, keep_count, dim=1, largest=False)
+        scores = torch.mean(selected, dim=1)
+
+    if need_coverage and coverage_counts is not None:
+        required = max(1, int(np.ceil(int(points_t.shape[0]) * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
+        missing = torch.zeros(coverage_counts.shape[0], dtype=torch.float32, device=particles_t.device)
+        for segment_index in expected:
+            counts = coverage_counts[:, int(segment_index)]
+            missing = missing + (counts < required).to(torch.float32)
+        scores = scores + missing * float(coverage_penalty_m) * float(coverage_penalty_m)
+
+    if float(bend_penalty_m) > 0.0 and particles_t.shape[1] > 2:
+        directions = segment / torch.sqrt(length_sq[:, :, None])
+        dots = torch.sum(directions[:, :-1, :] * directions[:, 1:, :], dim=2).clamp(-1.0, 1.0)
+        bend = torch.mean(torch.clamp(1.0 - dots, min=0.0), dim=1)
+        scores = scores + bend * float(bend_penalty_m) * float(bend_penalty_m)
+
+    return scores
 
 
 def torch_scoring_device(backend):
@@ -1674,6 +1913,38 @@ def mean_node_distance(reference_nodes, candidate_nodes):
     if len(distances) == 0:
         return np.inf
     return float(np.mean(distances))
+
+
+def measurement_node_velocity(previous_nodes, current_nodes, dt):
+    previous = valid_points(previous_nodes)
+    current = valid_points(current_nodes)
+    if previous.shape != current.shape or len(previous) == 0:
+        return None
+    current = align_polyline_orientation(previous, current)
+    return np.ascontiguousarray((current - previous) / max(float(dt), 1e-3), dtype=np.float64)
+
+
+def clip_vector_norms(vectors, max_norm):
+    vectors = np.asarray(vectors, dtype=np.float64)
+    max_norm = float(max_norm)
+    if max_norm <= 0.0:
+        return np.ascontiguousarray(vectors, dtype=np.float64)
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    scale = np.ones_like(norms)
+    too_fast = norms[..., 0] > max_norm
+    scale[too_fast] = max_norm / np.maximum(norms[too_fast], 1e-12)
+    return np.ascontiguousarray(vectors * scale, dtype=np.float64)
+
+
+def weighted_mean_or_zero(values, weights):
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if values.shape != weights.shape or len(values) == 0:
+        return 0.0
+    total = float(np.sum(weights))
+    if not np.isfinite(total) or total <= 1e-12:
+        return 0.0
+    return float(np.sum(values * weights) / total)
 
 
 def segment_lengths(nodes):

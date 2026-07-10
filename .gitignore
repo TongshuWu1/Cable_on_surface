@@ -8,3 +8,13 @@ __pycache__/
 .ruff_cache/
 
 *.log
+
+# Experiment-local training artifacts. Keep branch-specific datasets and
+# checkpoints out of Git so object/cable and two-cable runs do not contaminate
+# each other.
+particle_filter_cable_project/datasets/two_cable_pidnet/
+particle_filter_cable_project/datasets/object_cable_pidnet/
+particle_filter_cable_project/models/pidnet_two_cable_best.pt
+particle_filter_cable_project/models/pidnet_object_cable_best.pt
+particle_filter_cable_project/pidnet_two_cable_training_params.json
+particle_filter_cable_project/pidnet_object_cable_training_params.json

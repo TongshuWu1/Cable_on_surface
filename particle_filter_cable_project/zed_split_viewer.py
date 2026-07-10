@@ -573,7 +573,8 @@ class ZedDepthGLViewer:
             glEnd()
 
         if self._has_cable_node_state():
-            start_idx, end_idx = self._valid_endpoint_indices()
+            endpoint_runs = self._valid_endpoint_runs()
+            endpoint_roles = self._endpoint_role_map(endpoint_runs)
             glLineWidth(8.0)
             glBegin(GL_LINES)
             for idx in range(len(self.cable_nodes) - 1):
@@ -594,11 +595,11 @@ class ZedDepthGLViewer:
             glBegin(GL_POINTS)
             for idx, point in enumerate(self.cable_nodes):
                 if self.cable_valid[idx] and np.all(np.isfinite(point)):
-                    glColor3f(*self._node_color(idx, start_idx, end_idx))
+                    glColor3f(*self._node_color(idx, endpoint_roles))
                     glVertex3f(float(point[0]), float(point[1]), float(point[2]))
             glEnd()
 
-            self._draw_endpoint_markers(start_idx, end_idx)
+            self._draw_endpoint_markers(endpoint_runs)
 
         glEnable(GL_DEPTH_TEST)
 
@@ -616,14 +617,16 @@ class ZedDepthGLViewer:
             glVertex3f(float(point[0]), float(point[1]), float(point[2]))
         glEnd()
 
-    def _draw_endpoint_markers(self, start_idx, end_idx):
-        if start_idx is None or end_idx is None:
+    def _draw_endpoint_markers(self, endpoint_runs):
+        if not endpoint_runs:
             return
 
-        endpoints = [
-            (start_idx, "START", START_NODE_COLOR, 1.0),
-            (end_idx, "END", END_NODE_COLOR, -1.0),
-        ]
+        endpoints = []
+        multi = len(endpoint_runs) > 1
+        for cable_index, (start_idx, end_idx) in enumerate(endpoint_runs, start=1):
+            suffix = f" {cable_index}" if multi else ""
+            endpoints.append((start_idx, f"START{suffix}", START_NODE_COLOR, 1.0))
+            endpoints.append((end_idx, f"END{suffix}", END_NODE_COLOR, -1.0))
 
         glPointSize(22.0)
         glBegin(GL_POINTS)
@@ -902,16 +905,38 @@ class ZedDepthGLViewer:
         return f"({point[0]:+.3f},{point[1]:+.3f},{point[2]:+.3f})"
 
     def _valid_endpoint_indices(self):
-        if not self._has_cable_node_state():
+        runs = self._valid_endpoint_runs()
+        if not runs:
             return None, None
+        return int(runs[0][0]), int(runs[-1][1])
+
+    def _valid_endpoint_runs(self):
+        if not self._has_cable_node_state():
+            return []
 
         finite = np.all(np.isfinite(self.cable_nodes), axis=1)
         usable = self.cable_valid & finite
-        indices = np.flatnonzero(usable)
-        if len(indices) == 0:
-            return None, None
+        runs = []
+        start = None
+        for index, is_usable in enumerate(usable):
+            if is_usable and start is None:
+                start = int(index)
+            elif not is_usable and start is not None:
+                end = int(index - 1)
+                if end >= start:
+                    runs.append((start, end))
+                start = None
+        if start is not None:
+            runs.append((start, len(usable) - 1))
+        return runs
 
-        return int(indices[0]), int(indices[-1])
+    @staticmethod
+    def _endpoint_role_map(endpoint_runs):
+        roles = {}
+        for start_idx, end_idx in endpoint_runs:
+            roles[int(start_idx)] = "start"
+            roles[int(end_idx)] = "end"
+        return roles
 
     def _endpoint_label_position(self, point, direction):
         point = np.asarray(point, dtype=np.float32).reshape(3)
@@ -1048,10 +1073,11 @@ class ZedDepthGLViewer:
             and len(self.cable_extended_visible) == count
         )
 
-    def _node_color(self, idx, start_idx=None, end_idx=None):
-        if start_idx is not None and int(idx) == int(start_idx):
+    def _node_color(self, idx, endpoint_roles=None):
+        role = {} if endpoint_roles is None else endpoint_roles
+        if role.get(int(idx)) == "start":
             return START_NODE_COLOR
-        if end_idx is not None and int(idx) == int(end_idx):
+        if role.get(int(idx)) == "end":
             return END_NODE_COLOR
         if self.cable_visible[idx]:
             return VISIBLE_COLOR

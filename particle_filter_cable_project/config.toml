@@ -36,20 +36,19 @@ point_size = 2.0
 # Options: "segmentation", "tracking", "mask".
 rgb_view = "segmentation"
 
-# Display-only persistence. This prevents the 3D cable overlay/support points
-# from blinking when measurement frames are skipped for speed or briefly invalid.
-hold_frames = 8
-
 [pidnet]
 # Relative paths are resolved from this config file.
-checkpoint = "models/pidnet_cable_best.pt"
+checkpoint = "models/pidnet_two_cable_best.pt"
 device = "cuda"
 threshold = 0.25
 base_channels = 24
+amp = true
+channels_last = true
+instance_channels = "auto"
 
 [endpoint]
 # Endpoint anchor source:
-#   "neural" -> use the PIDNet endpoint/tape output channel
+#   "neural" -> use learned PIDNet endpoint channels
 #   "normal" -> use inferred cable endpoints only
 #   "none"   -> disable endpoint anchors
 mode = "neural"
@@ -61,6 +60,7 @@ min_points = 8
 open_kernel = 3
 close_kernel = 5
 max_points_per_marker = 256
+max_count = 4
 tape_length_m = 0.035
 offset_to_tips = false
 
@@ -135,11 +135,15 @@ cloud_update_every = 2
 confidence_update_every = 2
 
 [cable]
+# Number of separate cables to reconstruct. With instance PIDNet masks, each
+# cable gets its own PF and endpoint-color markers are assigned by track state.
+count = 2
+
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
 segments = 12
 
-# Physical cable length in meters. Measured real cable is 56 cm.
-length_m = 0.56
+# Physical cable length in meters for this experiment.
+length_m = 0.52
 length_scale = 1.0
 
 # Fixed segment length in meters. 0 estimates the length once from the first
@@ -168,10 +172,10 @@ smoothing = false
 smoothing_alpha = 0.30
 smoothing_gate_m = 0.040
 
-# For PIDNet masks, first collapse the orange 3D support cloud into an ordered
-# measured centerline. The PF then tracks this measured shape instead of
-# discovering the shape from unordered points alone.
-mask_centerline = true
+# For PIDNet masks, send raw orange 3D support points into the PF. The PF fits
+# an ordered helper chain only periodically, which is faster than doing it in
+# the measurement stage every frame.
+mask_centerline = false
 mask_centerline_reference_gate_m = 0.15
 mask_centerline_max_residual_m = 0.08
 
@@ -193,12 +197,21 @@ enabled = true
 particles = 500
 
 # Initial spread when the first valid cable measurement initializes particles.
-initial_node_std_m = 0.025
-initial_direction_std = 0.10
+initial_node_std_m = 0.05
+initial_direction_std = 0.20
 
 # Per-frame process noise on cable vertices, in meters.
-process_node_std_m = 0.006
-process_direction_std = 0.020
+process_node_std_m = 0.02
+process_direction_std = 0.040
+
+# Constant-velocity prediction. Each particle stores one 3D velocity per cable
+# node. Prediction moves nodes by v*dt, then reapplies fixed segment length and
+# endpoint constraints.
+velocity = true
+velocity_damping = 0.85
+velocity_measurement_blend = 0.40
+velocity_process_std_mps = 0.01
+max_node_speed_mps = 1.0
 
 # Direction smoothing is off because the ordered orange-cloud centerline is now
 # the main shape measurement. Re-enable only if the green chain becomes noisy.
@@ -206,15 +219,21 @@ direction_smooth_passes = 0
 
 # Measurement likelihood width, in meters. The ordered measured centerline lets
 # the PF trust current cable geometry more directly.
-measurement_node_std_m = 0.020
+measurement_node_std_m = 0.010
 
 # Maximum masked ZED cable points used to score particles by point-to-segment
 # distance. This is the main particle-score cost knob.
-measurement_points = 1024
+measurement_points = 500
 
 # Particle scoring uses tensor parallelism on CUDA when available.
 scoring_backend = "auto"
 score_chunk_points = 512
+
+# Fast scoring first ranks particles on a small point subset, then fully scores
+# only the best hypotheses. The status line reports this as score=128c/80f.
+coarse_score_points = 128
+coarse_score_full_fraction = 0.15
+coarse_score_min_particles = 80
 
 # During PF initialization/reacquisition, order the masked 3D cloud by
 # estimating cable endpoints on a k-nearest-neighbor graph. The raw unordered
@@ -233,6 +252,11 @@ endpoint_refresh_interval = 0
 reference_ordering = true
 reference_ordering_gate_m = 0.08
 
+# Fit the ordered helper chain every N healthy PF updates. Skipped frames still
+# score the raw mask support points, but avoid proposal/velocity work based on a
+# newly fitted centerline.
+measurement_fit_interval = 3
+
 # Keep the particle start/end close to the current measured endpoints. This is
 # the main guard against segment-order flips in a good unordered point cloud.
 endpoint_penalty_weight = 1.0
@@ -245,8 +269,8 @@ measurement_reset_error_m = 0.25
 # is already close to the filtered estimate, only stable_ratio particles are
 # regenerated. Because the PIDNet mask cloud is the trusted measurement, the
 # maximum ratio is intentionally high enough to recover from bad particles.
-measurement_proposal_ratio = 0.45
-measurement_proposal_stable_ratio = 0.12
+measurement_proposal_ratio = 0.35
+measurement_proposal_stable_ratio = 0.08
 measurement_proposal_start_error_m = 0.015
 measurement_proposal_full_error_m = 0.060
 measurement_proposal_node_std_m = 0.012
@@ -266,21 +290,19 @@ coverage_min_fraction = 0.05
 bend_penalty_m = 0.0
 
 # Display estimate is always the weighted average of the best particles.
-top_particles = 50
+top_particles = 20
 
 # Keep a fixed exploration budget as globally random chain hypotheses within the
 # current measured support-cloud bounds.
-global_random_particle_ratio = 0.10
+global_random_particle_ratio = 0.03
+global_random_effective_ratio = 0.35
 global_random_bounds_padding_m = 0.10
 
 # Known endpoints define a constrained fixed-length chain. Internally each
 # particle is projected so node 0 and node N match the detected/drone endpoints
 # while every segment keeps the fixed cable length.
-endpoint_constraint_iterations = 16
+endpoint_constraint_iterations = 4
 endpoint_constraint_tolerance_m = 0.0001
-
-# Legacy compatibility knob; current estimate uses top_particles above.
-map_estimate_effective_ratio = 0.35
 
 # Minimum support required before a measurement update is trusted.
 min_measurement_points = 12

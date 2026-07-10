@@ -2,6 +2,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 import time
 import tomllib
 import traceback
@@ -11,10 +12,14 @@ import numpy as np
 import pyzed.sl as sl
 
 from cable_detection import (
+    CableDetection2D,
+    CableEstimate3D,
+    EndpointMarker3D,
     HsvCableDetector,
     attach_endpoint_markers_to_measurement,
     cable_measurement_from_mask_points,
     cleanup_marker_mask,
+    endpoint_nodes_from_marker_centers,
     endpoint_markers_from_mask,
     fit_cable_segments_from_zed_point_cloud,
     polyline_residual,
@@ -103,7 +108,6 @@ def parse_args():
     parser.add_argument("--rgb-width", type=int, default=config_value(config, "viewer", "rgb_width", 620))
     parser.add_argument("--cloud-width", type=int, default=config_value(config, "viewer", "cloud_width", 1180))
     parser.add_argument("--height", type=int, default=config_value(config, "viewer", "height", 900))
-    parser.add_argument("--viewer-hold-frames", type=int, default=config_value(config, "viewer", "hold_frames", 8), help="Keep the last drawn cable overlay for this many frames when a measurement frame is skipped or briefly invalid.")
     parser.add_argument(
         "--rgb-view",
         choices=("segmentation", "tracking", "mask"),
@@ -114,13 +118,22 @@ def parse_args():
     parser.add_argument("--neural-detector-device", default=config_value(config, "pidnet", "device", "cuda"), help="PyTorch device for PIDNet detector. Default: cuda.")
     parser.add_argument("--neural-detector-threshold", type=float, default=config_value(config, "pidnet", "threshold", 0.50), help="PIDNet probability threshold for the binary cable mask.")
     parser.add_argument("--neural-detector-base-channels", type=int, default=config_value(config, "pidnet", "base_channels", 24))
-    parser.add_argument("--endpoint-mode", choices=("neural", "normal", "none"), default=str(config_value(config, "endpoint", "mode", "neural")).lower(), help="Endpoint anchor source. neural uses the PIDNet endpoint channel; normal uses inferred cable endpoints; none disables endpoint anchors.")
+    parser.add_argument("--neural-detector-amp", action=argparse.BooleanOptionalAction, default=config_value(config, "pidnet", "amp", True), help="Use CUDA automatic mixed precision for PIDNet inference.")
+    parser.add_argument("--neural-detector-channels-last", action=argparse.BooleanOptionalAction, default=config_value(config, "pidnet", "channels_last", True), help="Use channels-last CUDA tensors for PIDNet inference.")
+    parser.add_argument(
+        "--pidnet-instance-channels",
+        choices=("auto", "on", "off"),
+        default=str(config_value(config, "pidnet", "instance_channels", "auto")).lower(),
+        help="Use one PIDNet output channel per cable when the checkpoint was trained with instance labels.",
+    )
+    parser.add_argument("--endpoint-mode", choices=("neural", "normal", "none"), default=str(config_value(config, "endpoint", "mode", "neural")).lower(), help="Endpoint anchor source. neural uses PIDNet endpoint channels; normal uses inferred cable endpoints; none disables endpoint anchors.")
     parser.add_argument("--endpoint-markers", action=argparse.BooleanOptionalAction, default=config_value(config, "endpoint_markers", "enabled", True), help="Detect endpoint/tape markers and use them as measured cable endpoints.")
     parser.add_argument("--endpoint-marker-min-area", type=int, default=config_value(config, "endpoint_markers", "min_area_px", 50))
     parser.add_argument("--endpoint-marker-min-points", type=int, default=config_value(config, "endpoint_markers", "min_points", 8))
     parser.add_argument("--endpoint-marker-open-kernel", type=int, default=config_value(config, "endpoint_markers", "open_kernel", 3))
     parser.add_argument("--endpoint-marker-close-kernel", type=int, default=config_value(config, "endpoint_markers", "close_kernel", 5))
     parser.add_argument("--endpoint-marker-points", type=int, default=config_value(config, "endpoint_markers", "max_points_per_marker", 256))
+    parser.add_argument("--endpoint-marker-max-count", type=int, default=config_value(config, "endpoint_markers", "max_count", 2))
     parser.add_argument("--endpoint-marker-tape-length", type=float, default=config_value(config, "endpoint_markers", "tape_length_m", 0.035))
     parser.add_argument("--endpoint-marker-offset-to-tips", action=argparse.BooleanOptionalAction, default=config_value(config, "endpoint_markers", "offset_to_tips", False))
     parser.add_argument("--detector-min-area", type=int, default=config_value(config, "detector", "min_area_px", 80))
@@ -145,6 +158,7 @@ def parse_args():
     parser.add_argument("--hsv-gaussian-negative-mean", type=float, nargs=4, default=config_value(config, "hsv", "gaussian_negative_mean", None))
     parser.add_argument("--hsv-gaussian-negative-std", type=float, nargs=4, default=config_value(config, "hsv", "gaussian_negative_std", None))
     parser.add_argument("--cable-segments", type=int, default=config_value(config, "cable", "segments", 2))
+    parser.add_argument("--cable-count", type=int, default=config_value(config, "cable", "count", 1), help="Number of separate cables to reconstruct.")
     parser.add_argument("--cable-length", type=float, default=config_value(config, "cable", "length_m", 0.0), help="Physical cable length in meters. Used to derive segment_length_m when segment_length_m is 0.")
     parser.add_argument("--cable-length-scale", type=float, default=config_value(config, "cable", "length_scale", 1.0), help="Scale factor applied to cable-length before deriving segment length.")
     parser.add_argument("--cable-max-points", type=int, default=config_value(config, "cable", "max_visual_points", 1000))
@@ -202,6 +216,11 @@ def parse_args():
     parser.add_argument("--pf-initial-direction-std", type=float, default=config_value(config, "particle_filter", "initial_direction_std", pf_defaults.initial_direction_std))
     parser.add_argument("--pf-process-std", type=float, default=config_value(config, "particle_filter", "process_node_std_m", pf_defaults.process_node_std_m))
     parser.add_argument("--pf-process-direction-std", type=float, default=config_value(config, "particle_filter", "process_direction_std", pf_defaults.process_direction_std))
+    parser.add_argument("--pf-velocity", action=argparse.BooleanOptionalAction, default=config_value(config, "particle_filter", "velocity", pf_defaults.velocity_enabled))
+    parser.add_argument("--pf-velocity-damping", type=float, default=config_value(config, "particle_filter", "velocity_damping", pf_defaults.velocity_damping))
+    parser.add_argument("--pf-velocity-measurement-blend", type=float, default=config_value(config, "particle_filter", "velocity_measurement_blend", pf_defaults.velocity_measurement_blend))
+    parser.add_argument("--pf-velocity-process-std", type=float, default=config_value(config, "particle_filter", "velocity_process_std_mps", pf_defaults.velocity_process_std_mps))
+    parser.add_argument("--pf-max-node-speed", type=float, default=config_value(config, "particle_filter", "max_node_speed_mps", pf_defaults.max_node_speed_mps))
     parser.add_argument("--pf-direction-smooth-passes", type=int, default=config_value(config, "particle_filter", "direction_smooth_passes", pf_defaults.direction_smooth_passes))
     parser.add_argument("--pf-measurement-std", type=float, default=config_value(config, "particle_filter", "measurement_node_std_m", pf_defaults.measurement_node_std_m))
     parser.add_argument(
@@ -257,6 +276,12 @@ def parse_args():
         type=float,
         default=config_value(config, "particle_filter", "reference_ordering_gate_m", pf_defaults.reference_ordering_gate_m),
         help="Max distance from the current chain for points used to build the ordered measurement fit.",
+    )
+    parser.add_argument(
+        "--pf-measurement-fit-interval",
+        type=int,
+        default=config_value(config, "particle_filter", "measurement_fit_interval", pf_defaults.measurement_fit_interval),
+        help="Fit an ordered measurement chain every N healthy PF updates. Skipped updates still score raw mask points.",
     )
     parser.add_argument(
         "--pf-endpoint-penalty-weight",
@@ -330,10 +355,10 @@ def parse_args():
     parser.add_argument("--pf-coarse-score-min-particles", type=int, default=config_value(config, "particle_filter", "coarse_score_min_particles", pf_defaults.coarse_score_min_particles))
     parser.add_argument("--pf-top-particles", type=int, default=config_value(config, "particle_filter", "top_particles", pf_defaults.top_particle_count))
     parser.add_argument("--pf-global-random-ratio", type=float, default=config_value(config, "particle_filter", "global_random_particle_ratio", pf_defaults.global_random_particle_ratio))
+    parser.add_argument("--pf-global-random-effective-ratio", type=float, default=config_value(config, "particle_filter", "global_random_effective_ratio", pf_defaults.global_random_effective_ratio))
     parser.add_argument("--pf-global-random-bounds-padding", type=float, default=config_value(config, "particle_filter", "global_random_bounds_padding_m", pf_defaults.global_random_bounds_padding_m))
     parser.add_argument("--pf-endpoint-constraint-iterations", type=int, default=config_value(config, "particle_filter", "endpoint_constraint_iterations", pf_defaults.endpoint_constraint_iterations))
     parser.add_argument("--pf-endpoint-constraint-tolerance", type=float, default=config_value(config, "particle_filter", "endpoint_constraint_tolerance_m", pf_defaults.endpoint_constraint_tolerance_m))
-    parser.add_argument("--pf-map-estimate-effective-ratio", type=float, default=config_value(config, "particle_filter", "map_estimate_effective_ratio", pf_defaults.map_estimate_effective_ratio))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
     parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
     parser.add_argument("--pf-occlusion-gate", type=float, default=config_value(config, "particle_filter", "occlusion_gate_m", pf_defaults.occlusion_assignment_max_distance_m))
@@ -345,6 +370,7 @@ def parse_args():
     if args.input_svo_file and args.ip_address:
         raise ValueError("Specify only one input source: --input-svo-file or --ip-address.")
     args.cable_segments = max(1, int(args.cable_segments))
+    args.cable_count = max(1, int(args.cable_count))
     args.cable_length = max(0.0, float(args.cable_length))
     args.cable_length_scale = max(0.0, float(args.cable_length_scale))
     args.cloud_update_every = max(1, int(args.cloud_update_every))
@@ -356,7 +382,6 @@ def parse_args():
     args.detector_skeleton_prune_px = max(0, int(args.detector_skeleton_prune_px))
     args.detector_skeleton_prune_passes = max(0, int(args.detector_skeleton_prune_passes))
     args.detector_centerline_smooth_window = max(1, int(args.detector_centerline_smooth_window))
-    args.viewer_hold_frames = max(0, int(args.viewer_hold_frames))
     args.hsv_geometry_every = max(0, int(args.hsv_geometry_every))
     args.hsv_mask_points = max(2, int(args.hsv_mask_points))
     args.endpoint_mode = str(args.endpoint_mode).strip().lower()
@@ -367,7 +392,13 @@ def parse_args():
     args.endpoint_marker_open_kernel = max(0, int(args.endpoint_marker_open_kernel))
     args.endpoint_marker_close_kernel = max(0, int(args.endpoint_marker_close_kernel))
     args.endpoint_marker_points = max(1, int(args.endpoint_marker_points))
+    args.endpoint_marker_max_count = max(1, int(args.endpoint_marker_max_count))
+    if args.cable_count > 1:
+        args.endpoint_marker_max_count = max(args.endpoint_marker_max_count, 2 * args.cable_count)
     args.endpoint_marker_tape_length = max(0.0, float(args.endpoint_marker_tape_length))
+    args.pidnet_instance_channels = str(args.pidnet_instance_channels).strip().lower()
+    if args.pidnet_instance_channels not in ("auto", "on", "off"):
+        raise ValueError('pidnet.instance_channels must be "auto", "on", or "off".')
     if args.endpoint_mode == "neural":
         args.endpoint_markers = True
     else:
@@ -382,13 +413,19 @@ def parse_args():
     if args.cable_segment_length <= 0.0 and args.cable_length > 0.0:
         args.cable_segment_length = args.cable_length * args.cable_length_scale / max(args.cable_segments, 1)
     args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
+    args.pf_velocity_damping = float(np.clip(args.pf_velocity_damping, 0.0, 1.0))
+    args.pf_velocity_measurement_blend = float(np.clip(args.pf_velocity_measurement_blend, 0.0, 1.0))
+    args.pf_velocity_process_std = max(0.0, float(args.pf_velocity_process_std))
+    args.pf_max_node_speed = max(0.0, float(args.pf_max_node_speed))
     args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
     args.pf_reference_ordering_gate = max(0.0, float(args.pf_reference_ordering_gate))
+    args.pf_measurement_fit_interval = max(1, int(args.pf_measurement_fit_interval))
     args.pf_coarse_score_points = max(0, int(args.pf_coarse_score_points))
     args.pf_coarse_score_full_fraction = float(np.clip(args.pf_coarse_score_full_fraction, 0.0, 1.0))
     args.pf_coarse_score_min_particles = max(1, int(args.pf_coarse_score_min_particles))
     args.pf_top_particles = max(1, int(args.pf_top_particles))
     args.pf_global_random_ratio = float(np.clip(args.pf_global_random_ratio, 0.0, 1.0))
+    args.pf_global_random_effective_ratio = float(np.clip(args.pf_global_random_effective_ratio, 0.0, 1.0))
     args.pf_global_random_bounds_padding = max(0.0, float(args.pf_global_random_bounds_padding))
     args.pf_endpoint_constraint_iterations = max(1, int(args.pf_endpoint_constraint_iterations))
     args.pf_endpoint_constraint_tolerance = max(0.0, float(args.pf_endpoint_constraint_tolerance))
@@ -470,12 +507,39 @@ def load_cable_detector(args):
             skeleton_prune_px=int(args.detector_skeleton_prune_px),
             skeleton_prune_passes=int(args.detector_skeleton_prune_passes),
             centerline_smooth_window=int(args.detector_centerline_smooth_window),
+            amp=bool(args.neural_detector_amp),
+            channels_last=bool(args.neural_detector_channels_last),
         )
-        print(f"Loaded PIDNet cable detector: {checkpoint_path} on {args.neural_detector_device}")
+        print(
+            f"Loaded PIDNet cable detector: {checkpoint_path} on {args.neural_detector_device} "
+            f"(amp={bool(args.neural_detector_amp)} channels_last={bool(args.neural_detector_channels_last)} "
+            f"outputs={getattr(detector, 'output_channels', '?')} labels={getattr(detector, 'label_mode', 'binary')})"
+        )
     except Exception as exc:
         print(f"Could not load cable detector: {exc}")
         return None
     return detector
+
+
+def should_use_pidnet_instance_channels(args, detector, cable_count):
+    mode = str(getattr(args, "pidnet_instance_channels", "auto")).strip().lower()
+    if mode == "off" or int(cable_count) <= 1:
+        return False
+    force = mode == "on"
+    available = bool(
+        hasattr(detector, "can_use_instance_channels")
+        and detector.can_use_instance_channels(int(cable_count), force=force)
+    )
+    if mode == "on" and not available:
+        raise RuntimeError(
+            "PIDNet instance channels were forced on, but the checkpoint is not marked "
+            f"as an instance-labeled model for {int(cable_count)} cables and does not have enough output channels."
+        )
+    return available
+
+
+def force_pidnet_instance_channels(args):
+    return str(getattr(args, "pidnet_instance_channels", "auto")).strip().lower() == "on"
 
 
 def detector_description(args):
@@ -498,6 +562,7 @@ def detect_endpoint_markers(
     confidence_measure=None,
     reference_nodes=None,
     endpoint_mask=None,
+    max_markers=None,
 ):
     if not bool(args.endpoint_markers) or args.endpoint_mode == "none":
         return None
@@ -506,7 +571,19 @@ def detect_endpoint_markers(
     if endpoint_mask is None:
         if not hasattr(cable_detector, "create_endpoint_mask"):
             return None
-        endpoint_mask = cable_detector.create_endpoint_mask(bgr)
+        endpoint_channel = (
+            cable_detector.endpoint_channel_for_cable_count(
+                args.cable_count,
+                force_instances=force_pidnet_instance_channels(args),
+            )
+            if hasattr(cable_detector, "endpoint_channel_for_cable_count")
+            else None
+        )
+        endpoint_mask = cable_detector.create_endpoint_mask(
+            bgr,
+            threshold=args.neural_detector_threshold,
+            channel=endpoint_channel,
+        )
     endpoint_mask = cleanup_marker_mask(
         endpoint_mask,
         open_kernel=args.endpoint_marker_open_kernel,
@@ -525,6 +602,7 @@ def detect_endpoint_markers(
         max_points_per_marker=args.endpoint_marker_points,
         tape_length_m=args.endpoint_marker_tape_length,
         offset_to_tips=bool(args.endpoint_marker_offset_to_tips),
+        max_markers=args.endpoint_marker_max_count if max_markers is None else max(1, int(max_markers)),
     )
 
 
@@ -536,6 +614,8 @@ def anchor_measurement_to_endpoint_markers(measurement):
         return measurement
     nodes = np.asarray(getattr(measurement, "points_xyz", None), dtype=np.float32)
     if nodes.ndim != 2 or nodes.shape[0] < 2 or nodes.shape[1] < 3:
+        return measurement
+    if not endpoint_pair_reachable_for_nodes(endpoint_nodes, nodes):
         return measurement
     anchored = nodes.copy()
     if np.all(np.isfinite(endpoint_nodes[0, :3])):
@@ -554,6 +634,8 @@ def anchor_estimate_to_known_endpoints(estimate, endpoint_source):
         return estimate
     nodes = np.asarray(getattr(estimate, "points_xyz", None), dtype=np.float32)
     if nodes.ndim != 2 or nodes.shape[0] < 2 or nodes.shape[1] < 3:
+        return estimate
+    if not endpoint_pair_reachable_for_nodes(endpoint_nodes, nodes):
         return estimate
 
     anchored = nodes.copy()
@@ -576,6 +658,34 @@ def anchor_estimate_to_known_endpoints(estimate, endpoint_source):
     )
 
 
+def endpoint_pair_reachable_for_nodes(endpoint_nodes, nodes, tolerance_m=0.005):
+    endpoints = np.asarray(endpoint_nodes, dtype=np.float32)
+    nodes = np.asarray(nodes, dtype=np.float32)
+    if endpoints.ndim != 2 or endpoints.shape[0] < 2 or endpoints.shape[1] < 3:
+        return False
+    if nodes.ndim != 2 or nodes.shape[0] < 2 or nodes.shape[1] < 3:
+        return False
+    start = endpoints[0, :3]
+    end = endpoints[-1, :3]
+    if not (np.all(np.isfinite(start)) and np.all(np.isfinite(end))):
+        return False
+    finite_nodes = nodes[:, :3]
+    finite = np.all(np.isfinite(finite_nodes), axis=1)
+    if int(np.count_nonzero(finite)) < 2:
+        return False
+    endpoint_distance = float(np.linalg.norm(end - start))
+    total_length = 0.0
+    previous = None
+    for point, is_finite in zip(finite_nodes, finite):
+        if not is_finite:
+            previous = None
+            continue
+        if previous is not None:
+            total_length += float(np.linalg.norm(point - previous))
+        previous = point
+    return bool(endpoint_distance <= total_length + max(0.0, float(tolerance_m)))
+
+
 def make_particle_filter_config(args):
     return CableParticleFilterConfig(
         particle_count=int(args.pf_particles),
@@ -584,6 +694,11 @@ def make_particle_filter_config(args):
         initial_direction_std=float(args.pf_initial_direction_std),
         process_node_std_m=float(args.pf_process_std),
         process_direction_std=float(args.pf_process_direction_std),
+        velocity_enabled=bool(args.pf_velocity),
+        velocity_damping=float(args.pf_velocity_damping),
+        velocity_measurement_blend=float(args.pf_velocity_measurement_blend),
+        velocity_process_std_mps=float(args.pf_velocity_process_std),
+        max_node_speed_mps=float(args.pf_max_node_speed),
         direction_smooth_passes=int(args.pf_direction_smooth_passes),
         measurement_node_std_m=float(args.pf_measurement_std),
         measurement_max_points=int(args.pf_measurement_points),
@@ -595,6 +710,7 @@ def make_particle_filter_config(args):
         endpoint_refresh_interval=int(args.pf_endpoint_refresh_interval),
         reference_ordering=bool(args.pf_reference_ordering),
         reference_ordering_gate_m=float(args.pf_reference_ordering_gate),
+        measurement_fit_interval=int(args.pf_measurement_fit_interval),
         endpoint_penalty_weight=float(args.pf_endpoint_penalty_weight),
         measurement_reset_error_m=float(args.pf_measurement_reset_error),
         measurement_proposal_ratio=float(args.pf_measurement_proposal_ratio),
@@ -612,10 +728,10 @@ def make_particle_filter_config(args):
         coarse_score_min_particles=int(args.pf_coarse_score_min_particles),
         top_particle_count=int(args.pf_top_particles),
         global_random_particle_ratio=float(args.pf_global_random_ratio),
+        global_random_effective_ratio=float(args.pf_global_random_effective_ratio),
         global_random_bounds_padding_m=float(args.pf_global_random_bounds_padding),
         endpoint_constraint_iterations=int(args.pf_endpoint_constraint_iterations),
         endpoint_constraint_tolerance_m=float(args.pf_endpoint_constraint_tolerance),
-        map_estimate_effective_ratio=float(args.pf_map_estimate_effective_ratio),
         min_measurement_points=int(args.pf_min_measurement_points),
         min_segment_points=int(args.pf_min_segment_points),
         occlusion_assignment_max_distance_m=float(args.pf_occlusion_gate),
@@ -644,26 +760,36 @@ class AsyncTrackingFrame:
 class AsyncTrackingResult:
     frame_index: int
     frame_timestamp_s: float
-    submitted_at_s: float
-    completed_at_s: float
     detection: object | None
     endpoint_mask: np.ndarray | None
     measurement: object | None
-    raw_measurement: object | None
     estimate: object | None
     filter_result: object | None
     tracking_diagnostics: dict
     worker_stage_seconds: dict
     worker_seconds: float
-    last_filter_nodes: np.ndarray | None
     last_filter_lost_frames: int
 
 
+@dataclass
+class CableComponentCandidate:
+    detection: CableDetection2D
+    marker_indices: tuple[int, int]
+    endpoint_centers_xyz: np.ndarray
+    center_xy: np.ndarray
+    area_px: int
+
+
 class AsyncTrackingWorker:
-    def __init__(self, args, cable_detector, particle_filter):
+    def __init__(self, args, cable_detector, particle_filters):
         self.args = args
         self.cable_detector = cable_detector
-        self.particle_filter = particle_filter
+        if particle_filters is None:
+            particle_filters = []
+        elif isinstance(particle_filters, CableParticleFilter):
+            particle_filters = [particle_filters]
+        self.particle_filters = list(particle_filters)
+        self.particle_filter = self.particle_filters[0] if self.particle_filters else None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cable-tracking")
         self.future = None
         self.submitted = 0
@@ -671,11 +797,12 @@ class AsyncTrackingWorker:
         self.dropped = 0
         self.busy_frames = 0
         self.last_smoothed_measurement_nodes = None
+        self.last_smoothed_measurement_nodes_by_cable = [None for _ in range(max(1, int(args.cable_count)))]
         self.last_detection_hint_xy = None
         self.last_filter_nodes = None
-        self.last_filter_estimate = None
-        self.last_filter_result = None
+        self.last_filter_nodes_by_cable = [None for _ in range(max(1, int(args.cable_count)))]
         self.last_filter_lost_frames = 0
+        self.last_filter_lost_frames_by_cable = [0 for _ in range(max(1, int(args.cable_count)))]
         self.last_filter_time = None
 
     def is_busy(self):
@@ -688,7 +815,7 @@ class AsyncTrackingWorker:
         if self.is_busy():
             self.dropped += 1
             return False
-        self.future = self.executor.submit(self._process_frame, frame, time.monotonic())
+        self.future = self.executor.submit(self._process_frame, frame)
         self.submitted += 1
         return True
 
@@ -708,7 +835,7 @@ class AsyncTrackingWorker:
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
 
-    def _process_frame(self, frame, submitted_at_s):
+    def _process_frame(self, frame):
         worker_start = time.monotonic()
         stage_seconds = {
             "detect": 0.0,
@@ -722,6 +849,8 @@ class AsyncTrackingWorker:
         estimate = None
         filter_result = None
         smoothing_diagnostics = {}
+        instance_detections = None
+        instance_endpoint_masks = None
         args = self.args
 
         stage_start = time.monotonic()
@@ -741,11 +870,22 @@ class AsyncTrackingWorker:
         )
         pidnet_mask_point_measurement = args.detector_backend == "pidnet"
         extract_geometry = not (mask_only_detection or pidnet_mask_point_measurement)
-        if args.detector_backend == "pidnet" and hasattr(self.cable_detector, "detect_with_channel_masks"):
+        use_instance_masks = should_use_pidnet_instance_channels(args, self.cable_detector, args.cable_count)
+        if use_instance_masks and hasattr(self.cable_detector, "detect_instance_channel_masks"):
+            instance_detections, detection, endpoint_mask, instance_endpoint_masks = self.cable_detector.detect_instance_channel_masks(
+                frame.bgr,
+                cable_count=args.cable_count,
+                scale=args.detector_scale,
+                extract_geometry=extract_geometry,
+                include_endpoint_mask=bool(args.endpoint_markers),
+                force=force_pidnet_instance_channels(args),
+            )
+        elif args.detector_backend == "pidnet" and hasattr(self.cable_detector, "detect_with_channel_masks"):
             detection, endpoint_mask = self.cable_detector.detect_with_channel_masks(
                 frame.bgr,
                 scale=args.detector_scale,
                 extract_geometry=extract_geometry,
+                include_endpoint_mask=bool(args.endpoint_markers),
             )
         else:
             detection = self.cable_detector.detect(
@@ -760,6 +900,19 @@ class AsyncTrackingWorker:
             if len(detection.centerline_xy) >= 2:
                 self.last_detection_hint_xy = detection.centerline_xy
         stage_seconds["detect"] += time.monotonic() - stage_start
+
+        if int(args.cable_count) > 1:
+            return self._process_frame_multi(
+                frame,
+                detection,
+                endpoint_mask,
+                stage_seconds,
+                worker_start,
+                pidnet_mask_point_measurement=pidnet_mask_point_measurement,
+                mask_only_detection=mask_only_detection,
+                instance_detections=instance_detections,
+                instance_endpoint_masks=instance_endpoint_masks,
+            )
 
         stage_start = time.monotonic()
         if detection is not None:
@@ -819,7 +972,7 @@ class AsyncTrackingWorker:
                 frame.point_cloud,
                 args,
                 confidence_measure=frame.confidence_measure,
-                reference_nodes=self.last_filter_nodes,
+                reference_nodes=None,
                 endpoint_mask=endpoint_mask,
             )
             measurement = attach_endpoint_markers_to_measurement(measurement, endpoint_markers)
@@ -861,35 +1014,727 @@ class AsyncTrackingWorker:
         )
         if estimate is not None:
             self.last_filter_nodes = np.asarray(estimate.points_xyz, dtype=np.float32)
-            self.last_filter_estimate = estimate
-            self.last_filter_result = filter_result
         elif self.particle_filter is None:
             self.last_filter_nodes = None
-            self.last_filter_estimate = None
-            self.last_filter_result = None
         if filter_result is not None:
             self.last_filter_lost_frames = int(filter_result.lost_frames)
         elif estimate is not None:
             self.last_filter_lost_frames = 0
 
-        completed_at_s = time.monotonic()
+        worker_done = time.monotonic()
         return AsyncTrackingResult(
             frame_index=int(frame.frame_index),
             frame_timestamp_s=float(frame.timestamp_s),
-            submitted_at_s=float(submitted_at_s),
-            completed_at_s=float(completed_at_s),
             detection=detection,
             endpoint_mask=endpoint_mask,
             measurement=measurement,
-            raw_measurement=raw_measurement,
             estimate=estimate,
             filter_result=filter_result,
             tracking_diagnostics=tracking_diagnostics,
             worker_stage_seconds=stage_seconds,
-            worker_seconds=float(completed_at_s - worker_start),
-            last_filter_nodes=None if self.last_filter_nodes is None else np.asarray(self.last_filter_nodes, dtype=np.float32),
+            worker_seconds=float(worker_done - worker_start),
             last_filter_lost_frames=int(self.last_filter_lost_frames),
         )
+
+    def _process_frame_multi(
+        self,
+        frame,
+        detection,
+        endpoint_mask,
+        stage_seconds,
+        worker_start,
+        pidnet_mask_point_measurement,
+        mask_only_detection,
+        instance_detections=None,
+        instance_endpoint_masks=None,
+    ):
+        args = self.args
+        cable_count = max(1, int(args.cable_count))
+        instance_detections = list(instance_detections or [])
+        instance_endpoint_masks = list(instance_endpoint_masks or [])
+        using_instance_detections = len(instance_detections) >= cable_count
+        using_instance_endpoint_masks = (
+            len(instance_endpoint_masks) >= cable_count
+            and any(mask is not None for mask in instance_endpoint_masks[:cable_count])
+        )
+        measurements = [None for _ in range(cable_count)]
+        raw_measurements = [None for _ in range(cable_count)]
+        estimates = [None for _ in range(cable_count)]
+        filter_results = [None for _ in range(cable_count)]
+        diagnostics = [{} for _ in range(cable_count)]
+
+        stage_start = time.monotonic()
+        endpoint_markers = None
+        candidates = []
+        assignments = [None for _ in range(cable_count)]
+        if detection is not None and not (using_instance_detections and using_instance_endpoint_masks):
+            endpoint_markers = detect_endpoint_markers(
+                self.cable_detector,
+                frame.bgr,
+                frame.point_cloud,
+                args,
+                confidence_measure=frame.confidence_measure,
+                reference_nodes=self.last_filter_nodes,
+                endpoint_mask=endpoint_mask,
+            )
+        if detection is not None and not using_instance_detections:
+            candidates = cable_component_candidates(
+                detection,
+                endpoint_markers,
+                max_count=cable_count,
+            )
+            assignments = assign_candidates_to_trackers(
+                candidates,
+                self.last_filter_nodes_by_cable,
+                cable_count,
+            )
+
+        for cable_index in range(cable_count):
+            candidate = assignments[cable_index]
+            instance_detection = instance_detections[cable_index] if cable_index < len(instance_detections) else None
+            previous_nodes = self.last_filter_nodes_by_cable[cable_index]
+            lost_frames = self.last_filter_lost_frames_by_cable[cable_index]
+            reference_nodes = measurement_reference_nodes(
+                previous_nodes,
+                lost_frames,
+                reacquire_after=args.measurement_gate_reacquire_after,
+            )
+            reference_gate = measurement_reference_gate(
+                args.measurement_prediction_gate,
+                lost_frames,
+            )
+            if instance_detection is not None:
+                measurement = self._measurement_from_detection(
+                    frame,
+                    instance_detection,
+                    reference_nodes,
+                    reference_gate,
+                    pidnet_mask_point_measurement,
+                    mask_only_detection,
+                    force_reference_gate=False,
+                )
+                cable_endpoint_mask = instance_endpoint_masks[cable_index] if cable_index < len(instance_endpoint_masks) else None
+                if cable_endpoint_mask is not None:
+                    candidate_markers = detect_endpoint_markers(
+                        self.cable_detector,
+                        frame.bgr,
+                        frame.point_cloud,
+                        args,
+                        confidence_measure=frame.confidence_measure,
+                        reference_nodes=reference_nodes,
+                        endpoint_mask=cable_endpoint_mask,
+                        max_markers=2,
+                    )
+                else:
+                    candidate_markers = endpoint_markers_for_detection(
+                        endpoint_markers,
+                        instance_detection,
+                        reference_nodes,
+                        args,
+                    )
+            elif candidate is not None:
+                measurement = self._measurement_from_candidate(
+                    frame,
+                    candidate,
+                    reference_nodes,
+                    reference_gate,
+                    pidnet_mask_point_measurement,
+                    mask_only_detection,
+                )
+                candidate_markers = endpoint_markers_for_candidate(
+                    endpoint_markers,
+                    candidate,
+                    reference_nodes,
+                    args,
+                )
+            else:
+                measurement = (
+                    self._measurement_from_detection(
+                        frame,
+                        detection,
+                        reference_nodes,
+                        reference_gate,
+                        pidnet_mask_point_measurement,
+                        mask_only_detection,
+                        force_reference_gate=True,
+                    )
+                    if reference_nodes is not None
+                    else None
+                )
+                candidate_markers = endpoint_markers_for_reference(
+                    endpoint_markers,
+                    reference_nodes,
+                    args,
+                )
+            measurement = attach_endpoint_markers_to_measurement(measurement, candidate_markers)
+            measurement = anchor_measurement_to_endpoint_markers(measurement)
+            raw_measurements[cable_index] = measurement
+            measurement, self.last_smoothed_measurement_nodes_by_cable[cable_index], smooth_diag = smooth_measurement_nodes(
+                measurement,
+                self.last_smoothed_measurement_nodes_by_cable[cable_index],
+                args,
+                lost_frames,
+            )
+            measurement = anchor_measurement_to_endpoint_markers(measurement)
+            if measurement is not None:
+                self.last_smoothed_measurement_nodes_by_cable[cable_index] = measurement_nodes_array(measurement)
+            measurements[cable_index] = measurement
+            diagnostics[cable_index] = smooth_diag
+        stage_seconds["fit"] += time.monotonic() - stage_start
+
+        stage_start = time.monotonic()
+        filter_dt = (
+            1.0 / max(float(args.fps), 1.0)
+            if self.last_filter_time is None
+            else max(1e-3, float(frame.timestamp_s - self.last_filter_time))
+        )
+        self.last_filter_time = frame.timestamp_s
+
+        for cable_index in range(cable_count):
+            measurement = measurements[cable_index]
+            particle_filter = self.particle_filters[cable_index] if cable_index < len(self.particle_filters) else None
+            if particle_filter is not None:
+                filter_result = particle_filter.step(measurement, filter_dt)
+                estimate = filtered_cable_estimate(measurement, filter_result)
+                estimate = anchor_estimate_to_known_endpoints(estimate, measurement)
+            else:
+                filter_result = None
+                estimate = measurement
+            filter_results[cable_index] = filter_result
+            estimates[cable_index] = estimate
+
+            diagnostics[cable_index] = cable_tracking_diagnostics(
+                self.last_filter_nodes_by_cable[cable_index],
+                raw_measurements[cable_index],
+                measurement,
+                estimate,
+                filter_result,
+                diagnostics[cable_index],
+            )
+            if estimate is not None:
+                self.last_filter_nodes_by_cable[cable_index] = np.asarray(estimate.points_xyz, dtype=np.float32)
+            elif particle_filter is None:
+                self.last_filter_nodes_by_cable[cable_index] = None
+            if filter_result is not None:
+                self.last_filter_lost_frames_by_cable[cable_index] = int(filter_result.lost_frames)
+            elif estimate is not None:
+                self.last_filter_lost_frames_by_cable[cable_index] = 0
+
+        stage_seconds["filter"] += time.monotonic() - stage_start
+
+        measurement = combine_cable_estimates(measurements, method="multi-cable measurement")
+        raw_measurement = combine_cable_estimates(raw_measurements, method="multi-cable raw measurement")
+        estimate = combine_cable_estimates(estimates, method="multi-cable estimate")
+        filter_result = combine_filter_results(filter_results)
+        tracking_diagnostics = combine_tracking_diagnostics(
+            diagnostics,
+            candidate_count=(cable_count if using_instance_detections else len(candidates)),
+            cable_count=cable_count,
+        )
+        tracking_diagnostics["association"] = "pidnet_instances" if using_instance_detections else "components"
+
+        self.last_filter_nodes = None if estimate is None else np.asarray(estimate.points_xyz, dtype=np.float32)
+        self.last_filter_lost_frames = max(self.last_filter_lost_frames_by_cable) if self.last_filter_lost_frames_by_cable else 0
+        self.last_smoothed_measurement_nodes = None if measurement is None else measurement_nodes_array(measurement)
+
+        worker_done = time.monotonic()
+        return AsyncTrackingResult(
+            frame_index=int(frame.frame_index),
+            frame_timestamp_s=float(frame.timestamp_s),
+            detection=detection,
+            endpoint_mask=endpoint_mask,
+            measurement=measurement,
+            estimate=estimate,
+            filter_result=filter_result,
+            tracking_diagnostics=tracking_diagnostics,
+            worker_stage_seconds=stage_seconds,
+            worker_seconds=float(worker_done - worker_start),
+            last_filter_lost_frames=int(self.last_filter_lost_frames),
+        )
+
+    def _measurement_from_candidate(
+        self,
+        frame,
+        candidate,
+        reference_nodes,
+        reference_gate,
+        pidnet_mask_point_measurement,
+        mask_only_detection,
+    ):
+        force_reference_gate = int(self.args.cable_count) > 1 and reference_nodes is not None
+        return self._measurement_from_detection(
+            frame,
+            candidate.detection,
+            reference_nodes,
+            reference_gate,
+            pidnet_mask_point_measurement,
+            mask_only_detection,
+            force_reference_gate=force_reference_gate,
+        )
+
+    def _measurement_from_detection(
+        self,
+        frame,
+        detection,
+        reference_nodes,
+        reference_gate,
+        pidnet_mask_point_measurement,
+        mask_only_detection,
+        force_reference_gate=False,
+    ):
+        args = self.args
+        if detection is None:
+            return None
+        if pidnet_mask_point_measurement and bool(args.measurement_mask_centerline):
+            return mask_cloud_centerline_measurement(
+                frame.point_cloud,
+                detection,
+                args,
+                reference_nodes=reference_nodes,
+                confidence_measure=frame.confidence_measure,
+            )
+        if mask_only_detection or pidnet_mask_point_measurement:
+            use_reference_gate = bool(force_reference_gate) or not bool(pidnet_mask_point_measurement)
+            support_reference_nodes = reference_nodes if use_reference_gate else None
+            support_reference_gate = reference_gate if use_reference_gate else 0.0
+            return cable_measurement_from_mask_points(
+                frame.point_cloud,
+                detection,
+                segment_count=args.cable_segments,
+                depth_min=args.depth_min,
+                depth_max=args.depth_max,
+                confidence_map=frame.confidence_measure,
+                max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+                max_points=args.hsv_mask_points if mask_only_detection else args.pf_measurement_points,
+                reference_nodes=support_reference_nodes,
+                reference_gate_m=support_reference_gate,
+                reference_min_points=args.pf_min_measurement_points,
+            )
+        return fit_cable_segments_from_zed_point_cloud(
+            frame.point_cloud,
+            detection,
+            segment_count=args.cable_segments,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            confidence_map=frame.confidence_measure,
+            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
+            node_search_px=args.node_search_px,
+            source_point_mode="centerline",
+            max_centerline_points=args.measurement_centerline_points,
+            max_local_depth_std_m=args.measurement_local_depth_spread,
+            reference_nodes=reference_nodes,
+            reference_gate_m=reference_gate,
+            reference_min_points=args.pf_min_measurement_points,
+        )
+
+
+def cable_component_candidates(detection, endpoint_markers, max_count=2, marker_search_px=36):
+    if detection is None or endpoint_markers is None:
+        return []
+    mask = getattr(detection, "mask", None)
+    centers_xy = np.asarray(getattr(endpoint_markers, "centers_xy", np.empty((0, 2))), dtype=np.float32)
+    centers_xyz = np.asarray(getattr(endpoint_markers, "centers_xyz", np.empty((0, 3))), dtype=np.float32)
+    if mask is None or len(centers_xy) < 2 or len(centers_xyz) < 2:
+        return []
+
+    mask = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8)
+    if mask.ndim != 2 or not np.any(mask):
+        return []
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return []
+
+    markers_by_label = {}
+    for marker_index, center_xy in enumerate(centers_xy):
+        label = component_label_near_xy(labels, center_xy, radius_px=marker_search_px)
+        if label <= 0:
+            continue
+        markers_by_label.setdefault(int(label), []).append(int(marker_index))
+
+    candidates = []
+    for label, marker_indices in markers_by_label.items():
+        if len(marker_indices) < 2:
+            continue
+        pairs = choose_endpoint_marker_pairs(marker_indices, centers_xyz, centers_xy, max_pairs=max_count)
+        component_mask = (labels == int(label)).astype(np.uint8) * 255
+        for pair in pairs:
+            candidate_detection = CableDetection2D(
+                mask=np.ascontiguousarray(component_mask, dtype=np.uint8),
+                skeleton=np.zeros_like(component_mask, dtype=np.uint8),
+                centerline_xy=np.empty((0, 2), dtype=np.float32),
+                component_count=1,
+                branch_count=0,
+                centerline_paths_xy=(),
+            )
+            candidates.append(
+                CableComponentCandidate(
+                    detection=candidate_detection,
+                    marker_indices=tuple(pair),
+                    endpoint_centers_xyz=np.ascontiguousarray(centers_xyz[np.asarray(pair, dtype=np.int64), :3], dtype=np.float32),
+                    center_xy=np.asarray(centroids[int(label)], dtype=np.float32),
+                    area_px=int(stats[int(label), cv2.CC_STAT_AREA]),
+                )
+            )
+
+    candidates.sort(key=lambda item: item.area_px, reverse=True)
+    return candidates[: max(1, int(max_count))]
+
+
+def component_label_near_xy(labels, center_xy, radius_px=36):
+    labels = np.asarray(labels, dtype=np.int32)
+    if labels.ndim != 2:
+        return 0
+    x = int(round(float(center_xy[0])))
+    y = int(round(float(center_xy[1])))
+    height, width = labels.shape[:2]
+    if 0 <= x < width and 0 <= y < height and labels[y, x] > 0:
+        return int(labels[y, x])
+
+    radius_px = max(1, int(radius_px))
+    x0 = max(0, x - radius_px)
+    x1 = min(width, x + radius_px + 1)
+    y0 = max(0, y - radius_px)
+    y1 = min(height, y + radius_px + 1)
+    crop = labels[y0:y1, x0:x1]
+    ys, xs = np.nonzero(crop > 0)
+    if len(xs) == 0:
+        return 0
+    dx = xs + x0 - x
+    dy = ys + y0 - y
+    nearest = int(np.argmin(dx * dx + dy * dy))
+    return int(crop[ys[nearest], xs[nearest]])
+
+
+def choose_endpoint_marker_pair(marker_indices, centers_xyz, centers_xy):
+    pairs = choose_endpoint_marker_pairs(marker_indices, centers_xyz, centers_xy, max_pairs=1)
+    return pairs[0] if pairs else list(marker_indices)[:2]
+
+
+def choose_endpoint_marker_pairs(marker_indices, centers_xyz, centers_xy, max_pairs=1):
+    indices = list(marker_indices)
+    if len(indices) < 2:
+        return []
+    centers_xyz = np.asarray(centers_xyz, dtype=np.float32)
+    centers_xy = np.asarray(centers_xy, dtype=np.float32)
+    pairs = []
+    remaining = list(indices)
+    max_pairs = max(1, int(max_pairs))
+    while len(remaining) >= 2 and len(pairs) < max_pairs:
+        best_pair = remaining[:2]
+        best_distance = -np.inf
+        for i, first in enumerate(remaining[:-1]):
+            for second in remaining[i + 1 :]:
+                p0 = centers_xyz[first, :3]
+                p1 = centers_xyz[second, :3]
+                if np.all(np.isfinite(p0)) and np.all(np.isfinite(p1)):
+                    distance = float(np.linalg.norm(p0 - p1))
+                else:
+                    q0 = centers_xy[first, :2]
+                    q1 = centers_xy[second, :2]
+                    distance = float(np.linalg.norm(q0 - q1))
+                if distance > best_distance:
+                    best_distance = distance
+                    best_pair = [first, second]
+        pairs.append(best_pair)
+        remaining = [index for index in remaining if index not in best_pair]
+    return pairs
+
+
+def assign_candidates_to_trackers(candidates, previous_nodes_by_cable, cable_count):
+    cable_count = max(1, int(cable_count))
+    assignments = [None for _ in range(cable_count)]
+    candidates = list(candidates)
+    if not candidates:
+        return assignments
+
+    remaining_candidates = set(range(len(candidates)))
+    remaining_trackers = set(range(cable_count))
+    scored = []
+    for tracker_index, previous_nodes in enumerate(previous_nodes_by_cable[:cable_count]):
+        reference = measurement_nodes_array(previous_nodes)
+        if reference is None or len(reference) < 2:
+            continue
+        for candidate_index, candidate in enumerate(candidates):
+            cost = endpoint_pair_cost(candidate, reference)
+            if np.isfinite(cost):
+                scored.append((float(cost), int(tracker_index), int(candidate_index)))
+    for _cost, tracker_index, candidate_index in sorted(scored, key=lambda item: item[0]):
+        if tracker_index not in remaining_trackers or candidate_index not in remaining_candidates:
+            continue
+        assignments[tracker_index] = candidates[candidate_index]
+        remaining_trackers.remove(tracker_index)
+        remaining_candidates.remove(candidate_index)
+
+    ordered_remaining = sorted(
+        remaining_candidates,
+        key=lambda index: float(candidates[index].center_xy[0]) if len(candidates[index].center_xy) else 0.0,
+    )
+    for tracker_index, candidate_index in zip(sorted(remaining_trackers), ordered_remaining):
+        assignments[tracker_index] = candidates[candidate_index]
+    return assignments
+
+
+def endpoint_pair_cost(candidate, reference_nodes):
+    endpoints = np.asarray(getattr(candidate, "endpoint_centers_xyz", np.empty((0, 3))), dtype=np.float32)
+    reference = measurement_nodes_array(reference_nodes)
+    if endpoints.ndim != 2 or len(endpoints) < 2 or reference is None or len(reference) < 2:
+        return np.inf
+    if not np.all(np.isfinite(endpoints[:2, :3])):
+        return np.inf
+    direct = float(np.linalg.norm(endpoints[0] - reference[0]) + np.linalg.norm(endpoints[1] - reference[-1]))
+    reverse = float(np.linalg.norm(endpoints[1] - reference[0]) + np.linalg.norm(endpoints[0] - reference[-1]))
+    return min(direct, reverse)
+
+
+def endpoint_markers_for_candidate(endpoint_markers, candidate, reference_nodes, args):
+    if endpoint_markers is None or candidate is None:
+        return None
+    indices = np.asarray(candidate.marker_indices, dtype=np.int64)
+    return endpoint_markers_for_indices(endpoint_markers, indices, reference_nodes, args)
+
+
+def endpoint_markers_for_detection(endpoint_markers, detection, reference_nodes, args, marker_search_px=48):
+    if endpoint_markers is None:
+        return None
+    reference = measurement_nodes_array(reference_nodes)
+    centers_xyz = np.asarray(getattr(endpoint_markers, "centers_xyz", np.empty((0, 3))), dtype=np.float32)
+    centers_xy = np.asarray(getattr(endpoint_markers, "centers_xy", np.empty((0, 2))), dtype=np.float32)
+    if len(centers_xyz) < 2 or len(centers_xy) < 2:
+        return None
+
+    if reference is not None and len(reference) >= 2:
+        indices = endpoint_marker_indices_for_reference(centers_xyz, reference)
+        return endpoint_markers_for_indices(endpoint_markers, indices, reference_nodes, args)
+
+    if detection is None or getattr(detection, "mask", None) is None:
+        return None
+    labels = (np.asarray(detection.mask, dtype=np.uint8) > 0).astype(np.int32)
+    marker_indices = []
+    for marker_index, center_xy in enumerate(centers_xy):
+        if component_label_near_xy(labels, center_xy, radius_px=marker_search_px) > 0:
+            marker_indices.append(int(marker_index))
+    if len(marker_indices) < 2:
+        return None
+    pairs = choose_endpoint_marker_pairs(marker_indices, centers_xyz, centers_xy, max_pairs=1)
+    return endpoint_markers_for_indices(endpoint_markers, pairs[0] if pairs else marker_indices[:2], reference_nodes, args)
+
+
+def endpoint_markers_for_reference(endpoint_markers, reference_nodes, args):
+    if endpoint_markers is None:
+        return None
+    reference = measurement_nodes_array(reference_nodes)
+    if reference is None or len(reference) < 2:
+        return None
+    centers_xyz = np.asarray(getattr(endpoint_markers, "centers_xyz", np.empty((0, 3))), dtype=np.float32)
+    if len(centers_xyz) < 2:
+        return None
+    indices = endpoint_marker_indices_for_reference(centers_xyz, reference)
+    return endpoint_markers_for_indices(endpoint_markers, indices, reference_nodes, args)
+
+
+def endpoint_marker_indices_for_reference(centers_xyz, reference_nodes):
+    centers = np.asarray(centers_xyz, dtype=np.float32)
+    reference = measurement_nodes_array(reference_nodes)
+    if centers.ndim != 2 or centers.shape[1] < 3 or len(centers) < 2 or reference is None or len(reference) < 2:
+        return np.empty(0, dtype=np.int64)
+    finite = np.all(np.isfinite(centers[:, :3]), axis=1)
+    if int(np.count_nonzero(finite)) < 2:
+        return np.empty(0, dtype=np.int64)
+    valid_indices = np.flatnonzero(finite)
+    valid_centers = centers[valid_indices, :3]
+    start_distances = np.linalg.norm(valid_centers - reference[0][None, :3], axis=1)
+    first_local = int(np.argmin(start_distances))
+    first = int(valid_indices[first_local])
+    remaining_local = [idx for idx in range(len(valid_indices)) if idx != first_local]
+    if not remaining_local:
+        return np.empty(0, dtype=np.int64)
+    end_distances = np.linalg.norm(valid_centers[remaining_local] - reference[-1][None, :3], axis=1)
+    second = int(valid_indices[remaining_local[int(np.argmin(end_distances))]])
+    return np.asarray([first, second], dtype=np.int64)
+
+
+def endpoint_markers_for_indices(endpoint_markers, indices, reference_nodes, args):
+    if endpoint_markers is None:
+        return None
+    indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+    centers_xyz = np.asarray(getattr(endpoint_markers, "centers_xyz", np.empty((0, 3))), dtype=np.float32)
+    centers_xy = np.asarray(getattr(endpoint_markers, "centers_xy", np.empty((0, 2))), dtype=np.float32)
+    if len(indices) < 2 or np.any(indices < 0) or np.any(indices >= len(centers_xyz)):
+        return None
+    centers_xyz = np.ascontiguousarray(centers_xyz[indices[:2], :3], dtype=np.float32)
+    centers_xy = np.ascontiguousarray(centers_xy[indices[:2], :2], dtype=np.float32)
+    centers_xyz, centers_xy = order_endpoint_centers_to_reference(centers_xyz, centers_xy, reference_nodes)
+    endpoint_nodes = endpoint_nodes_from_marker_centers(
+        centers_xyz,
+        reference_nodes=reference_nodes,
+        tape_length_m=args.endpoint_marker_tape_length,
+        offset_to_tips=bool(args.endpoint_marker_offset_to_tips),
+    )
+    marker_mask = np.zeros_like(getattr(endpoint_markers, "mask", np.zeros((1, 1), dtype=np.uint8)), dtype=np.uint8)
+    centers_int = np.round(centers_xy).astype(np.int32)
+    for center in centers_int:
+        cv2.circle(marker_mask, tuple(center), 10, 255, -1, cv2.LINE_AA)
+    return EndpointMarker3D(
+        mask=np.ascontiguousarray(marker_mask, dtype=np.uint8),
+        centers_xyz=centers_xyz,
+        centers_xy=centers_xy,
+        endpoint_nodes=endpoint_nodes,
+        component_count=2,
+        points_xyz=np.empty((0, 3), dtype=np.float32),
+    )
+
+
+def order_endpoint_centers_to_reference(centers_xyz, centers_xy, reference_nodes):
+    centers_xyz = np.asarray(centers_xyz, dtype=np.float32)
+    centers_xy = np.asarray(centers_xy, dtype=np.float32)
+    reference = measurement_nodes_array(reference_nodes)
+    if len(centers_xyz) != 2:
+        return centers_xyz, centers_xy
+    if reference is not None and len(reference) >= 2:
+        direct = float(np.linalg.norm(centers_xyz[0] - reference[0]) + np.linalg.norm(centers_xyz[1] - reference[-1]))
+        reverse = float(np.linalg.norm(centers_xyz[1] - reference[0]) + np.linalg.norm(centers_xyz[0] - reference[-1]))
+        if reverse < direct:
+            return centers_xyz[::-1].copy(), centers_xy[::-1].copy()
+        return centers_xyz, centers_xy
+    order = np.argsort(centers_xyz[:, 0])
+    return centers_xyz[order].copy(), centers_xy[order].copy()
+
+
+def combine_cable_estimates(estimates, method="multi-cable"):
+    valid_estimates = [estimate for estimate in estimates if estimate is not None]
+    if not valid_estimates:
+        return None
+    nodes = concatenate_node_chains([getattr(estimate, "points_xyz", None) for estimate in valid_estimates])
+    source_points = concatenate_point_sets([getattr(estimate, "source_points", None) for estimate in valid_estimates])
+    residuals = [float(getattr(estimate, "residual_m", np.nan)) for estimate in valid_estimates]
+    finite_residuals = [value for value in residuals if np.isfinite(value)]
+    residual = float(np.mean(finite_residuals)) if finite_residuals else 0.0
+    centers_xyz = concatenate_point_sets([getattr(estimate, "endpoint_marker_centers_xyz", None) for estimate in valid_estimates])
+    centers_xy = concatenate_xy_sets([getattr(estimate, "endpoint_marker_centers_xy", None) for estimate in valid_estimates])
+    endpoint_nodes = concatenate_node_chains([getattr(estimate, "endpoint_nodes", None) for estimate in valid_estimates])
+    return CableEstimate3D(
+        points_xyz=nodes,
+        source_points=source_points,
+        residual_m=residual,
+        method=f"{method} | active={len(valid_estimates)}",
+        endpoint_nodes=endpoint_nodes,
+        endpoint_marker_centers_xyz=centers_xyz if len(centers_xyz) else None,
+        endpoint_marker_centers_xy=centers_xy if len(centers_xy) else None,
+        endpoint_marker_mask=None,
+        endpoint_marker_count=int(len(centers_xy)),
+    )
+
+
+def concatenate_node_chains(chains):
+    output = []
+    for chain in chains:
+        points = np.asarray(chain, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
+            continue
+        if output:
+            output.append(np.full((1, 3), np.nan, dtype=np.float32))
+        output.append(np.ascontiguousarray(points[:, :3], dtype=np.float32))
+    if not output:
+        return np.empty((0, 3), dtype=np.float32)
+    return np.ascontiguousarray(np.vstack(output), dtype=np.float32)
+
+
+def concatenate_point_sets(point_sets):
+    output = []
+    for point_set in point_sets:
+        points = np.asarray(point_set, dtype=np.float32)
+        if points.ndim == 2 and points.shape[1] >= 3 and len(points):
+            output.append(points[:, :3])
+    if not output:
+        return np.empty((0, 3), dtype=np.float32)
+    return np.ascontiguousarray(np.vstack(output), dtype=np.float32)
+
+
+def concatenate_xy_sets(point_sets):
+    output = []
+    for point_set in point_sets:
+        points = np.asarray(point_set, dtype=np.float32)
+        if points.ndim == 2 and points.shape[1] >= 2 and len(points):
+            output.append(points[:, :2])
+    if not output:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.ascontiguousarray(np.vstack(output), dtype=np.float32)
+
+
+def combine_filter_results(filter_results):
+    valid_results = [result for result in filter_results if result is not None]
+    if not valid_results:
+        return None
+    visible_nodes = concatenate_bool_chains([getattr(result, "visible_nodes", None) for result in valid_results])
+    extended_nodes = concatenate_bool_chains([
+        np.ones_like(np.asarray(getattr(result, "visible_nodes", []), dtype=bool))
+        for result in valid_results
+    ])
+    visible_segments = np.concatenate([
+        np.asarray(getattr(result, "visible_segments", np.empty(0, dtype=bool)), dtype=bool).reshape(-1)
+        for result in valid_results
+    ])
+    stage_seconds = {}
+    for result in valid_results:
+        for key, value in dict(getattr(result, "stage_seconds", {}) or {}).items():
+            stage_seconds[key] = stage_seconds.get(key, 0.0) + float(value)
+    return SimpleNamespace(
+        visible_nodes=visible_nodes,
+        extended_visible_nodes=extended_nodes,
+        visible_segments=visible_segments,
+        measurement_used=any(bool(getattr(result, "measurement_used", False)) for result in valid_results),
+        prediction_only=all(bool(getattr(result, "prediction_only", False)) for result in valid_results),
+        lost_frames=max(int(getattr(result, "lost_frames", 0)) for result in valid_results),
+        measurement_point_count=sum(int(getattr(result, "measurement_point_count", 0)) for result in valid_results),
+        segment_length_m=float(np.nanmean([float(getattr(result, "segment_length_m", np.nan)) for result in valid_results])),
+        measurement_proposal_ratio=float(np.nanmean([float(getattr(result, "measurement_proposal_ratio", np.nan)) for result in valid_results])),
+        global_random_particle_ratio=float(np.nanmean([float(getattr(result, "global_random_particle_ratio", np.nan)) for result in valid_results])),
+        coarse_score_point_count=sum(int(getattr(result, "coarse_score_point_count", 0)) for result in valid_results),
+        full_score_particle_count=sum(int(getattr(result, "full_score_particle_count", 0)) for result in valid_results),
+        mean_node_speed_mps=float(np.nanmean([float(getattr(result, "mean_node_speed_mps", np.nan)) for result in valid_results])),
+        stage_seconds=stage_seconds,
+    )
+
+
+def concatenate_bool_chains(chains):
+    output = []
+    for chain in chains:
+        values = np.asarray(chain, dtype=bool).reshape(-1)
+        if len(values) == 0:
+            continue
+        if output:
+            output.append(np.zeros(1, dtype=bool))
+        output.append(values)
+    if not output:
+        return np.empty(0, dtype=bool)
+    return np.concatenate(output)
+
+
+def combine_tracking_diagnostics(diagnostics, candidate_count=0, cable_count=1):
+    valid = [dict(item) for item in diagnostics if isinstance(item, dict)]
+    combined = {
+        "cable_count": int(cable_count),
+        "candidate_count": int(candidate_count),
+        "active_cables": int(sum(1 for item in valid if np.isfinite(float(item.get("filtered_residual_m", np.nan))))),
+    }
+    for key in (
+        "raw_to_filter_m",
+        "smooth_delta_m",
+        "proposal_ratio",
+        "global_random_ratio",
+        "mean_node_speed_mps",
+    ):
+        values = [float(item.get(key, np.nan)) for item in valid]
+        finite = [value for value in values if np.isfinite(value)]
+        if finite:
+            combined[key] = float(np.mean(finite))
+    pf_stage = {}
+    for item in valid:
+        for key, value in dict(item.get("pf_stage_ms", {}) or {}).items():
+            pf_stage[key] = pf_stage.get(key, 0.0) + float(value)
+    if pf_stage:
+        combined["pf_stage_ms"] = pf_stage
+    return combined
 
 
 def should_submit_async_frame(args, frame_count, latest_result):
@@ -901,16 +1746,50 @@ def should_submit_async_frame(args, frame_count, latest_result):
     return int(frame_count) % update_every == 0
 
 
+def format_runtime_status(
+    frame_count,
+    render_fps,
+    compute_fps,
+    submit_fps,
+    main_ms,
+    worker_ms,
+    result_age_frames,
+    result_age_ms,
+    latest_stats,
+    main_stage_ms,
+    worker_stage_ms,
+    async_worker,
+    latest_cable_status,
+):
+    lag_text = "no-result" if result_age_frames < 0 else f"{result_age_frames}f/{result_age_ms:.0f}ms"
+    cloud_text = f"{int(latest_stats['returned'])}/{int(latest_stats['sampled'])}"
+    return (
+        f"Frame {frame_count} | GUI {render_fps:.1f}Hz | TRACK {compute_fps:.1f}Hz "
+        f"(submit {submit_fps:.1f}Hz) | lag {lag_text} | "
+        f"main {main_ms:.1f}ms cap={main_stage_ms['capture']:.1f} "
+        f"cloud={main_stage_ms['cloud']:.1f} copy={main_stage_ms['copy']:.1f} "
+        f"ui={main_stage_ms['ui']:.1f} | "
+        f"worker {worker_ms:.1f}ms det={worker_stage_ms['detect']:.1f} "
+        f"fit={worker_stage_ms['fit']:.1f} pf={worker_stage_ms['filter']:.1f} | "
+        f"async sub/ok/drop={async_worker.submitted}/{async_worker.completed}/{async_worker.dropped} "
+        f"busy={1 if async_worker.is_busy() else 0} | cloud {cloud_text} pts | "
+        f"{latest_cable_status}"
+    )
+
+
 def run_live(args):
     cable_detector = load_cable_detector(args)
     if cable_detector is None:
         raise RuntimeError("Live cable tracking requires a trained PIDNet checkpoint.")
-    particle_filter = (
-        CableParticleFilter(node_count=args.cable_segments + 1, config=make_particle_filter_config(args))
+    particle_filters = (
+        [
+            CableParticleFilter(node_count=args.cable_segments + 1, config=make_particle_filter_config(args))
+            for _index in range(args.cable_count)
+        ]
         if args.particle_filter
-        else None
+        else []
     )
-    async_worker = AsyncTrackingWorker(args, cable_detector, particle_filter)
+    async_worker = AsyncTrackingWorker(args, cable_detector, particle_filters)
 
     zed = open_zed(args)
     runtime = make_runtime_parameters(args)
@@ -1111,23 +1990,21 @@ def run_live(args):
                     result_age_frames = -1 if latest_result is None else max(0, frame_count - int(latest_result.frame_index))
                     result_age_ms = float("nan") if latest_result is None else 1000.0 * max(0.0, now - latest_result.frame_timestamp_s)
                     print(
-                        f"Frame {frame_count}: pipeline=async | "
-                        f"GUI render {render_fps:.1f} fps | "
-                        f"COMPUTE detect/track {compute_fps:.1f} fps | "
-                        f"submit {submit_fps:.1f} fps | "
-                        f"main {main_ms:.1f} ms worker {worker_ms:.1f} ms | "
-                        f"result_age={result_age_frames} frames/{result_age_ms:.0f} ms | "
-                        f"sampled {latest_stats['sampled']} finite {latest_stats['finite']} "
-                        f"in range {latest_stats['in_range']} returned {latest_stats['returned']} "
-                        f"capped {latest_stats['capped']} | "
-                        f"main_ms capture {main_stage_ms['capture']:.1f} cloud {main_stage_ms['cloud']:.1f} "
-                        f"copy {main_stage_ms['copy']:.1f} ui {main_stage_ms['ui']:.1f} | "
-                        f"worker_ms detect {worker_stage_ms['detect']:.1f} fit {worker_stage_ms['fit']:.1f} "
-                        f"filter {worker_stage_ms['filter']:.1f} | "
-                        f"async submitted {async_worker.submitted} completed {async_worker.completed} "
-                        f"dropped {async_worker.dropped} busy_frames {async_worker.busy_frames} "
-                        f"busy {1 if async_worker.is_busy() else 0} | "
-                        f"{latest_cable_status}"
+                        format_runtime_status(
+                            frame_count,
+                            render_fps,
+                            compute_fps,
+                            submit_fps,
+                            main_ms,
+                            worker_ms,
+                            result_age_frames,
+                            result_age_ms,
+                            latest_stats,
+                            main_stage_ms,
+                            worker_stage_ms,
+                            async_worker,
+                            latest_cable_status,
+                        )
                     )
                     last_stats_time = now
                     last_stats_frame_count = frame_count
@@ -1282,17 +2159,6 @@ def should_use_hsv_mask_only(args, frame_count, last_filter_nodes, lost_frames):
     return True
 
 
-def should_update_measurement(args, frame_count, last_filter_nodes, lost_frames):
-    if last_filter_nodes is None:
-        return True
-    if int(lost_frames) > 0:
-        return True
-    if args.detector_full_every > 0 and int(frame_count) % int(args.detector_full_every) == 0:
-        return True
-    update_every = max(1, int(args.detector_update_every))
-    return int(frame_count) % update_every == 0
-
-
 def smooth_measurement_nodes(measurement, previous_nodes, args, lost_frames):
     diagnostics = {
         "smoothing": "off",
@@ -1361,6 +2227,18 @@ def cable_tracking_diagnostics(previous_filter_nodes, raw_measurement, measureme
         if filter_result is not None
         else 0
     )
+    diagnostics["mean_node_speed_mps"] = (
+        float(getattr(filter_result, "mean_node_speed_mps", np.nan))
+        if filter_result is not None
+        else np.nan
+    )
+    stage_seconds = getattr(filter_result, "stage_seconds", None) if filter_result is not None else None
+    if isinstance(stage_seconds, dict):
+        diagnostics["pf_stage_ms"] = {
+            str(name): 1000.0 * float(value)
+            for name, value in stage_seconds.items()
+            if np.isfinite(float(value)) and float(value) > 0.0
+        }
     return diagnostics
 
 
@@ -1462,44 +2340,56 @@ def centerline_roi_bbox(centerline_xy, image_shape, padding):
 
 def cable_status(detection, measurement, estimate, filter_result, segment_count, detector_name="detector", diagnostics=None):
     if detection is None:
-        return "cable detector unavailable"
+        return "cable: no detector result"
 
     diagnostics = dict(diagnostics or {})
-    centerline_count = len(detection.centerline_xy)
-    prefix = str(detector_name)
+    prefix = f"cable:{detector_name}"
+    cable_count = int(diagnostics.get("cable_count", 1) or 1)
+    if cable_count > 1:
+        prefix = f"cables:{detector_name}"
     if estimate is not None:
         residual = float(getattr(estimate, "residual_m", 0.0))
         source_count = 0 if measurement is None else len(getattr(measurement, "source_points", ()))
         marker_count = int(getattr(measurement, "endpoint_marker_count", 0)) if measurement is not None else 0
-        marker_text = f" endpoints={marker_count}/2" if marker_count > 0 else ""
         mode = "measurement"
+        details = []
         if filter_result is not None:
             mode = "filtered" if filter_result.measurement_used else f"prediction lost={filter_result.lost_frames}"
             visible_segments = getattr(filter_result, "visible_segments", None)
             if visible_segments is not None:
-                mode += f" visible={int(np.count_nonzero(visible_segments))}/{len(visible_segments)}"
-            mode += f" support={int(getattr(filter_result, 'measurement_point_count', 0))}"
+                details.append(f"vis={int(np.count_nonzero(visible_segments))}/{len(visible_segments)}")
+            details.append(f"pts={int(getattr(filter_result, 'measurement_point_count', 0))}")
             segment_length = float(getattr(filter_result, "segment_length_m", np.nan))
             if np.isfinite(segment_length):
-                mode += f" seglen={format_mm(segment_length)}"
+                details.append(f"seg={format_mm(segment_length)}")
+        details.append(f"src={source_count}")
+        details.append(f"res={format_mm(residual)}")
+        if cable_count > 1:
+            active = int(diagnostics.get("active_cables", 0) or 0)
+            candidates = int(diagnostics.get("candidate_count", 0) or 0)
+            details.append(f"active={active}/{cable_count}")
+            details.append(f"cand={candidates}")
+        if marker_count > 0:
+            details.append(f"end={marker_count}/{2 * cable_count if cable_count > 1 else 2}")
         diag_text = format_tracking_diagnostics(diagnostics)
-        return (
-            f"{prefix} | {segment_count} segments | {mode} | residual {residual:.4f}m | "
-            f"source={source_count} mask components {detection.component_count} "
-            f"centerline {centerline_count} branches {detection.branch_count}{marker_text}{diag_text}"
-        )
+        return f"{prefix} {mode} nseg={segment_count} " + " ".join(details) + diag_text
     if measurement is None:
-        return (
-            f"{prefix} | {segment_count} segments | waiting for valid 3D cable points | "
-            f"mask components {detection.component_count} centerline {centerline_count} branches {detection.branch_count}"
-        )
-    return f"{prefix} | {segment_count} segments | waiting for filter | centerline {centerline_count}"
+        return f"{prefix} waiting for 3D support mask={detection.component_count}"
+    return f"{prefix} waiting for filter nseg={segment_count}"
 
 
 def format_tracking_diagnostics(diagnostics):
     if not diagnostics:
         return ""
     parts = []
+    cable_count = int(diagnostics.get("cable_count", 1) or 1)
+    if cable_count > 1:
+        active = int(diagnostics.get("active_cables", 0) or 0)
+        candidates = int(diagnostics.get("candidate_count", 0) or 0)
+        parts.append(f"cables={active}/{cable_count} cand={candidates}")
+        association = str(diagnostics.get("association", "") or "")
+        if association:
+            parts.append(f"assoc={association}")
     raw_to_filter = diagnostics.get("raw_to_filter_m", np.nan)
     if np.isfinite(raw_to_filter):
         parts.append(f"raw2f={format_mm(raw_to_filter)}")
@@ -1507,25 +2397,50 @@ def format_tracking_diagnostics(diagnostics):
     smoothing = diagnostics.get("smoothing", "")
     if np.isfinite(smooth_delta):
         parts.append(f"smooth={format_mm(smooth_delta)}")
-    elif smoothing in {"raw", "reset"}:
+    elif smoothing == "reset":
         parts.append(f"smooth={smoothing}")
-    raw_residual = diagnostics.get("raw_residual_m", np.nan)
-    if np.isfinite(raw_residual):
-        parts.append(f"rawres={format_mm(raw_residual)}")
-    filtered_residual = diagnostics.get("filtered_residual_m", np.nan)
-    if np.isfinite(filtered_residual):
-        parts.append(f"filtres={format_mm(filtered_residual)}")
     proposal_ratio = diagnostics.get("proposal_ratio", np.nan)
     if np.isfinite(proposal_ratio):
         parts.append(f"prop={proposal_ratio:.2f}")
     random_ratio = diagnostics.get("global_random_ratio", np.nan)
     if np.isfinite(random_ratio):
         parts.append(f"rand={random_ratio:.2f}")
+    mean_node_speed = diagnostics.get("mean_node_speed_mps", np.nan)
+    if np.isfinite(mean_node_speed):
+        parts.append(f"v={mean_node_speed:.2f}m/s")
     coarse_points = int(diagnostics.get("coarse_score_points", 0) or 0)
     full_particles = int(diagnostics.get("full_score_particles", 0) or 0)
     if coarse_points > 0 and full_particles > 0:
         parts.append(f"score={coarse_points}c/{full_particles}f")
+    pf_stage_ms = diagnostics.get("pf_stage_ms", None)
+    if isinstance(pf_stage_ms, dict):
+        stage_text = format_pf_stage_ms(pf_stage_ms)
+        if stage_text:
+            parts.append(stage_text)
     return "" if not parts else " | " + " ".join(parts)
+
+
+def format_pf_stage_ms(stage_ms):
+    labels = (
+        ("prepare", "prep"),
+        ("initialize", "init"),
+        ("predict", "pred"),
+        ("measurement", "meas"),
+        ("velocity", "vel"),
+        ("proposal", "propms"),
+        ("associate", "assoc"),
+        ("random", "randms"),
+        ("score", "scorems"),
+        ("weight", "w"),
+        ("estimate", "est"),
+        ("resample", "resamp"),
+    )
+    parts = []
+    for key, label in labels:
+        value = float(stage_ms.get(key, 0.0))
+        if np.isfinite(value) and value >= 0.05:
+            parts.append(f"{label}={value:.1f}")
+    return "" if not parts else "pfms:" + ",".join(parts)
 
 
 def draw_cable_rgb_panel(
