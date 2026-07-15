@@ -245,31 +245,43 @@ def constrain_chains(chains, endpoints, segment_length_m, iterations, tolerance_
     return chains
 
 
-def build_ransac_chains(anchors, endpoints, node_count, segment_length_m, iterations, tolerance_m, stream):
-    anchors = anchors.contiguous()
-    endpoints = endpoints.contiguous()
-    chains = torch.empty(
-        (anchors.shape[0], int(node_count), 3),
-        dtype=torch.float32,
-        device=anchors.device,
-    )
+def particle_point_distances(particles, points, stream):
+    """Fused minimum point-to-segment distances for all cables and particles.
+
+    ``particles`` is ``[cable, particle, node, xyz]`` and ``points`` is the
+    shared unordered RGB-D support ``[point, xyz]``. One CUDA thread evaluates
+    one particle/point pair and loops over the short cable segment dimension,
+    avoiding the large temporary tensors created by broadcasted PyTorch code.
+    """
+
+    particles = particles.contiguous()
+    points = points.contiguous()
+    if particles.ndim != 4 or particles.shape[-1] != 3 or particles.shape[2] < 2:
+        raise ValueError("particles must have shape [cable, particle, node, 3].")
+    if points.ndim != 2 or points.shape[-1] != 3:
+        raise ValueError("points must have shape [point, 3].")
+    if particles.device != points.device:
+        raise ValueError("particles and points must be on the same CUDA device.")
+    shape = (int(particles.shape[0]), int(particles.shape[1]), int(points.shape[0]))
+    squared = torch.empty(shape, dtype=torch.float32, device=particles.device)
+    nearest = torch.empty(shape, dtype=torch.int32, device=particles.device)
     cable_cuda_kernels().launch(
-        "build_ransac_chains_kernel",
-        len(chains),
+        "particle_point_distances_kernel",
+        squared.numel(),
         [
-            ("tensor", anchors),
-            ("tensor", endpoints),
-            ("tensor", chains),
-            ("int", len(chains)),
-            ("int", anchors.shape[1]),
-            ("int", node_count),
-            ("float", segment_length_m),
-            ("int", iterations),
-            ("float", tolerance_m),
+            ("tensor", particles),
+            ("tensor", points),
+            ("tensor", squared),
+            ("tensor", nearest),
+            ("int", particles.shape[0]),
+            ("int", particles.shape[1]),
+            ("int", particles.shape[2]),
+            ("int", points.shape[0]),
         ],
         stream,
+        block_size=256,
     )
-    return chains
+    return squared, nearest
 
 
 _SAMPLER_LOCAL = threading.local()

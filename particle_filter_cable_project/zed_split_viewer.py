@@ -679,6 +679,12 @@ class ZedDepthGLViewer:
                 alpha=0.95,
                 line_width=3.0,
             )
+            self._draw_line_vertices(
+                group["tangent_line_vertices"],
+                UI_ACCENT_2,
+                alpha=0.95,
+                line_width=4.0,
+            )
         glDisable(GL_BLEND)
 
         for group in self.particle_diagnostics:
@@ -1275,11 +1281,44 @@ class ZedDepthGLViewer:
             map_error = float(getattr(values, "map_to_average_node_error_m", np.nan))
             mean_spread = float(getattr(values, "mean_node_spread_m", np.nan))
             max_spread = float(getattr(values, "max_node_spread_m", np.nan))
+            tangents = np.asarray(getattr(values, "endpoint_tangents_xyz", ()), dtype=np.float32)
+            tangent_confidence = np.asarray(
+                getattr(values, "endpoint_tangent_confidence", (np.nan, np.nan)),
+                dtype=np.float32,
+            ).reshape(-1)
+            tangent_support = np.asarray(
+                getattr(values, "endpoint_tangent_support_count", (0, 0)),
+                dtype=np.int32,
+            ).reshape(-1)
+            tangent_segments = []
+            if tangents.shape == (2, 3) and np.all(np.isfinite(tangents)):
+                for endpoint_index, node_index in ((0, 0), (1, -1)):
+                    confidence = float(tangent_confidence[endpoint_index]) if len(tangent_confidence) > endpoint_index else 0.0
+                    length = 0.025 + 0.050 * np.clip(confidence, 0.0, 1.0)
+                    tangent_segments.append((average[node_index], average[node_index] + length * tangents[endpoint_index]))
+            tangent_lines = (
+                np.ascontiguousarray(np.asarray(tangent_segments, dtype=np.float32).reshape(-1, 3))
+                if tangent_segments
+                else np.empty((0, 3), dtype=np.float32)
+            )
+            mean_ownership = float(getattr(values, "mean_ownership_responsibility", np.nan))
+            ownership_entropy = float(getattr(values, "ownership_entropy", np.nan))
+            visible_fraction = float(getattr(values, "visible_segment_fraction", np.nan))
+            conditioned_ratio = float(getattr(values, "endpoint_conditioned_proposal_ratio", np.nan))
+            tangent_mean = (
+                float(np.mean(tangent_confidence[np.isfinite(tangent_confidence)]))
+                if np.any(np.isfinite(tangent_confidence))
+                else np.nan
+            )
+            tangent_count = int(np.sum(tangent_support)) if len(tangent_support) else 0
             label = (
                 f"PF{cable_id + 1} TOP={len(top_particles)} "
                 f"MAP-AVG={cls._format_mm_compact(map_error)} "
                 f"spread={cls._format_mm_compact(mean_spread)}/{cls._format_mm_compact(max_spread)} "
-                f"dir={cls._format_angle_compact(start_delta)}/{cls._format_angle_compact(end_delta)}"
+                f"dir={cls._format_angle_compact(start_delta)}/{cls._format_angle_compact(end_delta)} "
+                f"tan={cls._format_fraction_compact(tangent_mean)}/{tangent_count} "
+                f"own={cls._format_fraction_compact(mean_ownership)} H={cls._format_fraction_compact(ownership_entropy)} "
+                f"vis={cls._format_fraction_compact(visible_fraction)} cond={cls._format_fraction_compact(conditioned_ratio)}"
             )
             anchor = average[len(average) // 2].copy()
             anchor[1] += 0.018
@@ -1290,6 +1329,7 @@ class ZedDepthGLViewer:
                 "top_line_vertices": cls._chain_line_vertices(top_particles),
                 "map_line_vertices": cls._chain_line_vertices(map_nodes[None, :, :]),
                 "spread_line_vertices": np.ascontiguousarray(spread_segments.reshape(-1, 3), dtype=np.float32),
+                "tangent_line_vertices": tangent_lines,
                 "label_anchor": np.ascontiguousarray(anchor, dtype=np.float32),
                 "label": label,
             })
@@ -1311,6 +1351,10 @@ class ZedDepthGLViewer:
     @staticmethod
     def _format_angle_compact(value):
         return f"{float(value):.1f}deg" if np.isfinite(float(value)) else "nan"
+
+    @staticmethod
+    def _format_fraction_compact(value):
+        return f"{float(value):.2f}" if np.isfinite(float(value)) else "nan"
 
     @staticmethod
     def _as_points(points):

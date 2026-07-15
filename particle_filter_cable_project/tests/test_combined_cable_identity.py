@@ -39,10 +39,6 @@ class CombinedCableIdentityTests(unittest.TestCase):
             lost_frames=0,
             measurement_point_count=100,
             segment_length_m=0.1,
-            ransac_inlier_count=60,
-            ransac_error_m=0.005,
-            coarse_score_point_count=100,
-            full_score_particle_count=100,
             mean_node_speed_mps=0.0,
             stage_seconds={},
         )
@@ -50,19 +46,21 @@ class CombinedCableIdentityTests(unittest.TestCase):
             **common,
             measurement_used=True,
             prediction_only=False,
-            measurement_proposal_ratio=0.02,
+            endpoint_conditioned_proposal_ratio=0.25,
             global_random_particle_ratio=0.10,
-            ransac_inlier_ratio=0.60,
-            ransac_hypothesis_count=32,
+            mean_ownership_responsibility=0.45,
+            ownership_entropy=0.20,
+            ownership_effective_point_count=45.0,
         )
         predicted = SimpleNamespace(
             **common,
             measurement_used=False,
             prediction_only=True,
-            measurement_proposal_ratio=0.0,
+            endpoint_conditioned_proposal_ratio=0.0,
             global_random_particle_ratio=0.0,
-            ransac_inlier_ratio=0.0,
-            ransac_hypothesis_count=0,
+            mean_ownership_responsibility=np.nan,
+            ownership_entropy=np.nan,
+            ownership_effective_point_count=0.0,
         )
 
         combined = combine_filter_results([updated, predicted])
@@ -76,7 +74,8 @@ class CombinedCableIdentityTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(combined.global_random_particle_ratio, 0.10)
-        self.assertAlmostEqual(combined.ransac_inlier_ratio, 0.60)
+        self.assertAlmostEqual(combined.endpoint_conditioned_proposal_ratio, 0.25)
+        self.assertAlmostEqual(combined.mean_ownership_responsibility, 0.45)
         self.assertEqual(diagnostics["active_cables"], 1)
         self.assertAlmostEqual(diagnostics["global_random_ratio"], 0.10)
 

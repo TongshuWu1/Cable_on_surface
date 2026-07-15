@@ -1,7 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
-
 import numpy as np
 
 from cable_detection import CableEstimate3D, polyline_residual
@@ -35,7 +33,7 @@ class ParticleFilterInvariantTests(unittest.TestCase):
                 np.linalg.norm(np.diff(result, axis=0), axis=1), segment_length, atol=1e-10
             )
 
-    def test_rejected_support_does_not_commit_candidate_endpoints(self):
+    def test_endpoint_only_observation_updates_constraints_during_occlusion(self):
         config = CableParticleFilterConfig(
             segment_length_m=0.1,
             scoring_backend="cpu",
@@ -44,17 +42,25 @@ class ParticleFilterInvariantTests(unittest.TestCase):
         particle_filter = CableParticleFilter(node_count=6, config=config)
         old_endpoints = np.asarray([[0.0, 0.0, 1.0], [0.4, 0.0, 1.0]], dtype=np.float32)
         candidate = np.asarray([[0.0, 0.1, 1.0], [0.4, 0.1, 1.0]], dtype=np.float32)
-        particle_filter._set_endpoint_nodes(old_endpoints)
-        measurement = CableEstimate3D(
+        support = np.linspace(old_endpoints[0], old_endpoints[1], 24, dtype=np.float32)
+        initial = CableEstimate3D(
             points_xyz=np.empty((0, 3), dtype=np.float32),
-            source_points=np.asarray([[0.1, 0.1, 1.0], [0.2, 0.1, 1.0]], dtype=np.float32),
+            source_points=support,
             residual_m=0.0,
             method="test",
+            endpoint_nodes=old_endpoints,
+        )
+        self.assertIsNotNone(particle_filter.step(initial))
+        occluded = CableEstimate3D(
+            points_xyz=np.empty((0, 3), dtype=np.float32),
+            source_points=np.empty((0, 3), dtype=np.float32),
+            residual_m=np.nan,
+            method="endpoint-only",
             endpoint_nodes=candidate,
         )
-        with patch.object(particle_filter, "_select_ransac_inlier_points", return_value=None):
-            particle_filter.step(measurement)
-        np.testing.assert_allclose(particle_filter.last_endpoint_nodes, old_endpoints)
+        result = particle_filter.step(occluded)
+        self.assertTrue(result.prediction_only)
+        np.testing.assert_allclose(particle_filter.last_endpoint_nodes, candidate)
 
     def test_estimate_is_mean_of_top_ranked_particles(self):
         config = CableParticleFilterConfig(
@@ -202,7 +208,7 @@ class ParticleFilterInvariantTests(unittest.TestCase):
         np.testing.assert_allclose(estimate, base, atol=1e-7)
         self.assertEqual(particle_filter._estimate_particle_count_cache, 3)
 
-    def test_global_random_particles_are_fixed_ten_percent_with_healthy_ess(self):
+    def test_transition_mixture_keeps_ten_percent_global_recovery(self):
         config = CableParticleFilterConfig(
             particle_count=100,
             segment_length_m=0.1,
@@ -210,23 +216,19 @@ class ParticleFilterInvariantTests(unittest.TestCase):
             global_random_particle_ratio=0.10,
         )
         particle_filter = CableParticleFilter(node_count=3, config=config, seed=7)
-        base_chain = np.asarray(
-            [[0.0, 0.0, 1.0], [0.05, 0.0866, 1.0], [0.1, 0.0, 1.0]],
-            dtype=np.float64,
+        endpoints = np.asarray([[0.0, 0.0, 1.0], [0.2, 0.0, 1.0]], dtype=np.float32)
+        support = np.linspace(endpoints[0], endpoints[1], 40, dtype=np.float32)
+        measurement = CableEstimate3D(
+            points_xyz=np.empty((0, 3), dtype=np.float32),
+            source_points=support,
+            residual_m=0.0,
+            method="test",
+            endpoint_nodes=endpoints,
         )
-        particle_filter.particles = np.repeat(base_chain[None, :, :], 100, axis=0)
-        particle_filter.weights = np.full(100, 0.01, dtype=np.float64)
-        particle_filter._set_endpoint_nodes(base_chain[[0, -1]])
-        support = np.asarray(
-            [[-0.05, -0.05, 0.95], [0.15, 0.15, 1.05]],
-            dtype=np.float64,
-        )
-
-        particle_filter._inject_global_random_particles(support)
-
+        self.assertIsNotNone(particle_filter.step(measurement))
+        self.assertIsNotNone(particle_filter.step(measurement))
         self.assertAlmostEqual(particle_filter.last_global_random_particle_ratio, 0.10)
-        highest_weight = float(np.max(particle_filter.weights))
-        self.assertEqual(int(np.count_nonzero(np.isclose(particle_filter.weights, highest_weight))), 10)
+        self.assertAlmostEqual(particle_filter.last_endpoint_conditioned_proposal_ratio, 0.25)
 
     def test_filtered_estimate_uses_selected_pf_support_for_residual(self):
         chain = np.asarray(

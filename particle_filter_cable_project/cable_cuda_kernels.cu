@@ -1,7 +1,6 @@
 namespace {
 
 constexpr int kMaxNodes = 64;
-constexpr int kMaxAnchors = 16;
 
 __device__ inline void normalize3(float& x, float& y, float& z) {
     const float norm_sq = x * x + y * y + z * z;
@@ -93,87 +92,55 @@ extern "C" __global__ void constrain_chains_kernel(
     );
 }
 
-extern "C" __global__ void build_ransac_chains_kernel(
-    const float* anchors,
-    const float* endpoints,
-    float* chains,
-    int hypothesis_count,
-    int anchor_count,
+extern "C" __global__ void particle_point_distances_kernel(
+    const float* particles,
+    const float* points,
+    float* squared_distances,
+    int* nearest_segments,
+    int cable_count,
+    int particle_count,
     int node_count,
-    float segment_length,
-    int constraint_iterations,
-    float constraint_tolerance
+    int point_count
 ) {
-    const int hypothesis = blockIdx.x * blockDim.x + threadIdx.x;
-    if (
-        hypothesis >= hypothesis_count || node_count < 2 || node_count > kMaxNodes ||
-        anchor_count < 1 || anchor_count > kMaxAnchors
-    ) {
+    const int output_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = cable_count * particle_count * point_count;
+    if (output_index >= total || node_count < 2 || node_count > kMaxNodes) {
         return;
     }
 
-    float polyline[(kMaxAnchors + 2) * 3];
-    float cumulative[kMaxAnchors + 2];
-    const int polyline_count = anchor_count + 2;
-    polyline[0] = endpoints[0];
-    polyline[1] = endpoints[1];
-    polyline[2] = endpoints[2];
-    for (int index = 0; index < anchor_count; ++index) {
-        const int source = (hypothesis * anchor_count + index) * 3;
-        polyline[3 * (index + 1)] = anchors[source];
-        polyline[3 * (index + 1) + 1] = anchors[source + 1];
-        polyline[3 * (index + 1) + 2] = anchors[source + 2];
-    }
-    polyline[3 * (polyline_count - 1)] = endpoints[3];
-    polyline[3 * (polyline_count - 1) + 1] = endpoints[4];
-    polyline[3 * (polyline_count - 1) + 2] = endpoints[5];
+    const int point_index = output_index % point_count;
+    const int particle_flat = output_index / point_count;
+    const int particle_index = particle_flat % particle_count;
+    const int cable_index = particle_flat / particle_count;
+    const float* chain = particles + ((cable_index * particle_count + particle_index) * node_count * 3);
+    const float px = points[3 * point_index];
+    const float py = points[3 * point_index + 1];
+    const float pz = points[3 * point_index + 2];
 
-    cumulative[0] = 0.0f;
-    for (int index = 1; index < polyline_count; ++index) {
-        const float dx = polyline[3 * index] - polyline[3 * (index - 1)];
-        const float dy = polyline[3 * index + 1] - polyline[3 * (index - 1) + 1];
-        const float dz = polyline[3 * index + 2] - polyline[3 * (index - 1) + 2];
-        cumulative[index] = cumulative[index - 1] + sqrtf(dx * dx + dy * dy + dz * dz);
-    }
-
-    float resampled[kMaxNodes * 3];
-    const float total = cumulative[polyline_count - 1];
-    for (int node = 0; node < node_count; ++node) {
-        const float target = total * static_cast<float>(node) / static_cast<float>(node_count - 1);
-        int segment = 0;
-        while (segment + 1 < polyline_count - 1 && cumulative[segment + 1] < target) {
-            ++segment;
-        }
-        const float span = fmaxf(cumulative[segment + 1] - cumulative[segment], 1.0e-12f);
-        const float alpha = fminf(fmaxf((target - cumulative[segment]) / span, 0.0f), 1.0f);
-        for (int axis = 0; axis < 3; ++axis) {
-            resampled[3 * node + axis] =
-                polyline[3 * segment + axis] +
-                alpha * (polyline[3 * (segment + 1) + axis] - polyline[3 * segment + axis]);
+    float best_squared = 3.402823466e+38F;
+    int best_segment = 0;
+    for (int segment_index = 0; segment_index < node_count - 1; ++segment_index) {
+        const float* start = chain + 3 * segment_index;
+        const float* end = start + 3;
+        const float sx = end[0] - start[0];
+        const float sy = end[1] - start[1];
+        const float sz = end[2] - start[2];
+        const float length_sq = fmaxf(sx * sx + sy * sy + sz * sz, 1.0e-20f);
+        const float dx = px - start[0];
+        const float dy = py - start[1];
+        const float dz = pz - start[2];
+        const float position = fminf(fmaxf((dx * sx + dy * sy + dz * sz) / length_sq, 0.0f), 1.0f);
+        const float rx = dx - position * sx;
+        const float ry = dy - position * sy;
+        const float rz = dz - position * sz;
+        const float squared = rx * rx + ry * ry + rz * rz;
+        if (squared < best_squared) {
+            best_squared = squared;
+            best_segment = segment_index;
         }
     }
-
-    float* chain = chains + hypothesis * node_count * 3;
-    chain[0] = resampled[0];
-    chain[1] = resampled[1];
-    chain[2] = resampled[2];
-    for (int node = 1; node < node_count; ++node) {
-        float dx = resampled[3 * node] - resampled[3 * (node - 1)];
-        float dy = resampled[3 * node + 1] - resampled[3 * (node - 1) + 1];
-        float dz = resampled[3 * node + 2] - resampled[3 * (node - 1) + 2];
-        normalize3(dx, dy, dz);
-        chain[3 * node] = chain[3 * (node - 1)] + segment_length * dx;
-        chain[3 * node + 1] = chain[3 * (node - 1) + 1] + segment_length * dy;
-        chain[3 * node + 2] = chain[3 * (node - 1) + 2] + segment_length * dz;
-    }
-    constrain_one_chain(
-        chain,
-        endpoints,
-        node_count,
-        segment_length,
-        constraint_iterations,
-        constraint_tolerance
-    );
+    squared_distances[output_index] = best_squared;
+    nearest_segments[output_index] = best_segment;
 }
 
 extern "C" __global__ void gather_indexed_points_kernel(

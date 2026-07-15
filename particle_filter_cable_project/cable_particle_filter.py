@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-import heapq
 from itertools import combinations
 import time
 
 import numpy as np
 
-from cable_cuda import build_ransac_chains as build_ransac_chains_cuda
 from cable_cuda import constrain_chains as constrain_chains_cuda
+from cable_cuda import particle_point_distances as particle_point_distances_cuda
 from cable_detection import (
     CableEstimate3D,
     EndpointMarker3D,
@@ -25,8 +24,6 @@ class CableParticleFilterConfig:
     particle_count: int = 200
     estimate_top_particle_count: int = 32
     segment_length_m: float = 0.0
-    initial_node_std_m: float = 0.025
-    initial_direction_std: float = 0.10
     process_node_std_m: float = 0.006
     process_direction_std: float = 0.020
     velocity_enabled: bool = True
@@ -38,43 +35,29 @@ class CableParticleFilterConfig:
     measurement_node_std_m: float = 0.030
     measurement_max_points: int = 1024
     scoring_backend: str = "auto"
-    score_chunk_points: int = 512
-    endpoint_ordering: bool = True
-    ordering_max_points: int = 384
-    ordering_knn: int = 8
-    endpoint_refresh_interval: int = 0
-    reference_ordering: bool = True
-    reference_ordering_gate_m: float = 0.08
-    measurement_fit_interval: int = 1
-    endpoint_penalty_weight: float = 1.0
-    measurement_reset_error_m: float = 0.25
-    measurement_proposal_ratio: float = 0.30
-    measurement_proposal_stable_ratio: float = 0.04
-    measurement_proposal_start_error_m: float = 0.015
-    measurement_proposal_full_error_m: float = 0.060
-    measurement_proposal_node_std_m: float = 0.012
-    measurement_proposal_direction_std: float = 0.025
-    ransac_inlier_selection_enabled: bool = True
-    ransac_hypotheses: int = 32
-    ransac_subset_points: int = 2
-    ransac_inlier_distance_m: float = 0.025
-    ransac_min_points: int = 24
-    score_keep_fraction: float = 0.80
+    endpoint_tangent_min_radius_m: float = 0.008
+    endpoint_tangent_radius_m: float = 0.075
+    endpoint_tangent_sigma_m: float = 0.035
+    endpoint_tangent_min_points: int = 8
+    endpoint_tangent_min_confidence: float = 0.20
+    endpoint_conditioned_proposal_ratio: float = 0.25
+    endpoint_conditioned_direction_std: float = 0.08
+    endpoint_conditioned_deformation_std_m: float = 0.025
+    endpoint_conditioned_deformation_modes: int = 3
+    ownership_outlier_likelihood: float = 0.05
+    ownership_outlier_prior: float = 0.10
+    ownership_min_responsibility: float = 0.01
+    ownership_visibility_threshold: float = 0.15
+    robust_distance_m: float = 0.05
     coverage_penalty_m: float = 0.025
     coverage_min_fraction: float = 0.05
     bend_penalty_m: float = 0.030
-    coarse_score_points: int = 192
-    coarse_score_full_fraction: float = 0.25
-    coarse_score_min_particles: int = 160
     global_random_particle_ratio: float = 0.10
-    global_random_bounds_padding_m: float = 0.10
     endpoint_constraint_iterations: int = 128
     endpoint_constraint_tolerance_m: float = 1e-4
     min_measurement_points: int = 12
     min_segment_points: int = 4
     occlusion_assignment_max_distance_m: float = 0.12
-    outlier_distance_m: float = 0.08
-    resample_effective_ratio: float = 0.50
     max_prediction_frames: int = 12
     max_motion_noise_scale: float = 4.0
 
@@ -90,6 +73,13 @@ class ParticleEstimateDiagnostics:
     mean_node_spread_m: float
     max_node_spread_m: float
     endpoint_direction_delta_deg: np.ndarray
+    endpoint_tangents_xyz: np.ndarray
+    endpoint_tangent_confidence: np.ndarray
+    endpoint_tangent_support_count: np.ndarray
+    mean_ownership_responsibility: float
+    ownership_entropy: float
+    visible_segment_fraction: float
+    endpoint_conditioned_proposal_ratio: float
 
 
 @dataclass
@@ -105,19 +95,29 @@ class CableParticleFilterResult:
     support_points_xyz: np.ndarray | None = None
     visible_segments: np.ndarray | None = None
     visible_nodes: np.ndarray | None = None
-    measurement_proposal_ratio: float = 0.0
+    endpoint_conditioned_proposal_ratio: float = 0.0
     global_random_particle_ratio: float = 0.0
-    ransac_inlier_ratio: float = 0.0
-    ransac_inlier_count: int = 0
-    ransac_error_m: float = np.nan
-    ransac_hypothesis_count: int = 0
-    coarse_score_point_count: int = 0
-    full_score_particle_count: int = 0
+    mean_ownership_responsibility: float = np.nan
+    ownership_entropy: float = np.nan
+    ownership_effective_point_count: float = 0.0
+    endpoint_tangent_confidence: np.ndarray | None = None
+    endpoint_tangent_support_count: np.ndarray | None = None
     estimate_particle_count: int = 1
     estimate_weight_mass: float = 1.0
     mean_node_speed_mps: float = 0.0
     stage_seconds: dict | None = None
     particle_diagnostics: ParticleEstimateDiagnostics | None = None
+
+
+@dataclass
+class ParticleFilterUpdateContext:
+    measurement: object | None
+    measurement_points: np.ndarray | None
+    endpoint_nodes: np.ndarray | None
+    dt: float
+    measurement_used: bool = False
+    prediction_only: bool = False
+    initialized_this_frame: bool = False
 
 
 @dataclass(frozen=True)
@@ -495,18 +495,19 @@ class CableParticleFilter:
         self.last_visible_nodes = np.zeros(self.node_count, dtype=bool)
         self.last_measurement_point_count = 0
         self.last_support_points = np.empty((0, 3), dtype=np.float32)
-        self.last_measurement_proposal_ratio = 0.0
+        self.last_endpoint_conditioned_proposal_ratio = 0.0
         self.last_global_random_particle_ratio = 0.0
-        self.last_ransac_inlier_ratio = 0.0
-        self.last_ransac_inlier_count = 0
-        self.last_ransac_error_m = np.nan
-        self.last_ransac_hypothesis_count = 0
-        self.last_coarse_score_point_count = 0
-        self.last_full_score_particle_count = 0
+        self.last_endpoint_tangents = np.full((2, 3), np.nan, dtype=np.float32)
+        self.last_endpoint_tangent_confidence = np.zeros(2, dtype=np.float32)
+        self.last_endpoint_tangent_support_count = np.zeros(2, dtype=np.int32)
+        self.last_endpoint_tangents_t = None
+        self.last_endpoint_tangent_confidence_t = None
+        self.last_mean_ownership_responsibility = np.nan
+        self.last_ownership_entropy = np.nan
+        self.last_ownership_effective_point_count = 0.0
         self.last_ordered_measurement_nodes = None
         self.last_endpoint_nodes = None
-        self.last_measurement_node_velocity = None
-        self.last_measurement_nodes_from_prediction = False
+        self.last_posterior_nodes = None
         self.last_stage_seconds = {}
         self._cuda_stage_events = []
         self._cuda_previous_event = None
@@ -534,113 +535,58 @@ class CableParticleFilter:
                 ).contiguous()
 
     def step(self, measurement, dt=1.0 / 30.0, count_lost=True):
+        return update_cable_particle_filters([self], [measurement], dt=dt, count_lost=count_lost)[0]
+
+    def _prepare_update(self, measurement, dt, count_lost=True):
         self._reset_stage_seconds()
         self.last_support_points = np.empty((0, 3), dtype=np.float32)
-        self.last_measurement_proposal_ratio = 0.0
+        self.last_endpoint_conditioned_proposal_ratio = 0.0
         self.last_global_random_particle_ratio = 0.0
-        self.last_ransac_inlier_ratio = 0.0
-        self.last_ransac_inlier_count = 0
-        self.last_ransac_error_m = np.nan
-        self.last_ransac_hypothesis_count = 0
+        self.last_mean_ownership_responsibility = np.nan
+        self.last_ownership_entropy = np.nan
+        self.last_ownership_effective_point_count = 0.0
         prepare_start = time.perf_counter()
         dt = float(np.clip(dt, 1e-3, 0.20))
         measurement_points = self._measurement_points(measurement)
         endpoint_nodes = self._measurement_endpoint_nodes(measurement)
+        if endpoint_nodes is not None:
+            self._set_endpoint_nodes(endpoint_nodes)
         if measurement_points is not None:
+            self.last_support_points = np.ascontiguousarray(measurement_points, dtype=np.float32)
             self.last_measurement_point_count = int(len(measurement_points))
         elif count_lost:
             self.last_measurement_point_count = 0
         self._record_stage("prepare", prepare_start)
-        if measurement_points is not None:
+
+        if measurement_points is not None and endpoint_nodes is not None:
             stage_start = time.perf_counter()
-            measurement_points = self._select_ransac_inlier_points(
-                measurement_points,
-                endpoint_nodes=endpoint_nodes,
-            )
-            self._record_stage("ransac", stage_start)
-            if measurement_points is not None:
-                self.last_support_points = np.ascontiguousarray(measurement_points, dtype=np.float32)
-                self.last_measurement_point_count = int(len(measurement_points))
-                if endpoint_nodes is not None:
-                    # Commit endpoints only after the same observation has
-                    # supplied a geometrically valid cable-support set.
-                    self._set_endpoint_nodes(endpoint_nodes)
-            elif count_lost:
-                self.last_measurement_point_count = 0
-
-        if measurement_points is not None:
-            if not self.initialized:
-                stage_start = time.perf_counter()
-                self._initialize(measurement, measurement_points)
-                self._record_stage("initialize", stage_start)
-                self._weight_initialized_particles()
-            else:
-                stage_start = time.perf_counter()
-                self._predict(dt, noise_scale=1.0)
+            self._estimate_endpoint_tangents(measurement_points, endpoint_nodes)
+            self._record_stage("tangent", stage_start)
+            initialized_before = self.initialized
+            stage_start = time.perf_counter()
+            if initialized_before:
+                self._predict_transition(dt)
                 self._record_stage("predict", stage_start)
-                stage_start = time.perf_counter()
-                previous_measurement_nodes = valid_points(self.last_ordered_measurement_nodes)
-                measurement_nodes = self._measurement_nodes(measurement, measurement_points)
-                self._record_stage("measurement", stage_start)
-                if not self.last_measurement_nodes_from_prediction and self._should_reset_to_measurement(measurement_nodes):
-                    self.initialized = False
-                    stage_start = time.perf_counter()
-                    self._initialize(measurement, measurement_points)
-                    self._record_stage("initialize", stage_start)
-                    self._weight_initialized_particles()
-                    self.lost_frames = 0
-                    return self._estimate(measurement_used=True, prediction_only=False)
-                stage_start = time.perf_counter()
-                self._update_velocities_from_measurement(previous_measurement_nodes, measurement_nodes, dt)
-                self._record_stage("velocity", stage_start)
-                stage_start = time.perf_counter()
-                self._inject_measurement_proposals(measurement_nodes)
-                self._record_stage("proposal", stage_start)
-                stage_start = time.perf_counter()
-                measurement_points, _segment_indices, visible_segments = self._associate_visible_points(
-                    measurement_points,
-                    candidate_nodes=measurement_nodes,
-                )
-                self._record_stage("associate", stage_start)
-                if measurement_points is None:
-                    self.last_support_points = np.empty((0, 3), dtype=np.float32)
-                    self.last_measurement_point_count = 0
-                    return self._prediction_only_after_update_drop()
-                self.last_support_points = np.ascontiguousarray(measurement_points, dtype=np.float32)
-                self.last_measurement_point_count = int(len(measurement_points))
-                stage_start = time.perf_counter()
-                self._inject_global_random_particles(measurement_points)
-                self._record_stage("random", stage_start)
-                self._weight(
-                    measurement_points,
-                    visible_segments=visible_segments,
-                    measurement_nodes=measurement_nodes,
-                )
-                stage_start = time.perf_counter()
-                self._set_visibility(visible_segments)
-                result = self._estimate(measurement_used=True, prediction_only=False)
-                self._record_stage("estimate", stage_start)
-                stage_start = time.perf_counter()
-                self._maybe_resample(noise_scale=self.last_motion_noise_scale)
-                self._record_stage("resample", stage_start)
-                if result is not None:
-                    result.stage_seconds = self._resolved_stage_seconds()
-                self.lost_frames = 0
-                return result
-
-            self.lost_frames = 0
-            return self._estimate(measurement_used=True, prediction_only=False)
+            else:
+                self._initialize(endpoint_nodes)
+                self._record_stage("initialize", stage_start)
+            return ParticleFilterUpdateContext(
+                measurement=measurement,
+                measurement_points=measurement_points,
+                endpoint_nodes=endpoint_nodes,
+                dt=dt,
+                measurement_used=bool(self.initialized),
+                initialized_this_frame=bool(self.initialized and not initialized_before),
+            )
 
         if not self.initialized:
-            return None
+            return ParticleFilterUpdateContext(measurement, None, endpoint_nodes, dt)
 
-        self.last_measurement_point_count = 0
         if count_lost:
             self.lost_frames += 1
         if self.lost_frames > int(self.config.max_prediction_frames):
             self.initialized = False
-            return None
-
+            return ParticleFilterUpdateContext(measurement, None, endpoint_nodes, dt)
         self.last_motion_noise_scale = min(
             1.0 + 0.25 * self.lost_frames,
             float(self.config.max_motion_noise_scale),
@@ -650,108 +596,345 @@ class CableParticleFilter:
         self._record_stage("predict", stage_start)
         if count_lost:
             self._set_visibility(np.zeros(self.segment_count, dtype=bool))
-        stage_start = time.perf_counter()
-        result = self._estimate(measurement_used=False, prediction_only=True)
-        self._record_stage("estimate", stage_start)
-        stage_start = time.perf_counter()
-        self._maybe_resample(force=self.lost_frames > 1 and not self._velocity_enabled(), noise_scale=self.last_motion_noise_scale)
-        self._record_stage("resample", stage_start)
-        if result is not None:
-            result.stage_seconds = self._resolved_stage_seconds()
-        return result
+        return ParticleFilterUpdateContext(
+            measurement=measurement,
+            measurement_points=None,
+            endpoint_nodes=endpoint_nodes,
+            dt=dt,
+            prediction_only=True,
+        )
 
-    def _initialize(self, measurement, measurement_points):
-        nodes = self._initial_nodes(measurement, measurement_points)
-        if nodes is None:
+    def _initialize(self, endpoint_nodes):
+        if self.segment_length_m is None or endpoint_nodes is None:
             return
-
-        if self.segment_length_m is None:
-            self.segment_length_m = estimate_equal_segment_length(nodes, self.segment_count)
-        nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
-        endpoint_nodes = self._measurement_endpoint_nodes(measurement)
-        if endpoint_nodes is not None:
-            self._set_endpoint_nodes(endpoint_nodes)
-            nodes = constrain_chain_to_endpoints(
-                nodes,
-                endpoint_nodes,
-                self.segment_length_m,
-                iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
-                tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-            )
+        nodes = endpoint_tangent_bridge_nodes(
+            endpoint_nodes,
+            self.last_endpoint_tangents,
+            node_count=self.node_count,
+            segment_length_m=self.segment_length_m,
+        )
         if nodes is None:
             return
         self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
-        directions = chain_directions(nodes)
         count = max(32, int(self.config.particle_count))
+        global_count = transition_component_count(
+            count,
+            float(getattr(self.config, "global_random_particle_ratio", 0.10)),
+        )
+        conditioned_count = count - global_count
         if self.cuda_state:
             with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
                 nodes_t = torch.as_tensor(nodes, dtype=torch.float32, device=self.device)
-                starts = nodes_t[0][None, :] + torch.randn(
-                    (count, 3),
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=self.torch_generator,
-                ) * float(self.config.initial_node_std_m)
-                direction_noise = torch.randn(
-                    (count, self.segment_count, 3),
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=self.torch_generator,
-                ) * float(self.config.initial_direction_std)
-                particle_directions_t = smooth_particle_directions_torch(
-                    normalize_vectors_torch(nodes_t[1:, :][None, :, :] - nodes_t[:-1, :][None, :, :] + direction_noise),
-                    passes=int(getattr(self.config, "direction_smooth_passes", 1)),
+                conditioned = endpoint_conditioned_chains_torch(
+                    nodes_t[None, :, :].expand(conditioned_count, -1, -1).clone(),
+                    self.last_endpoint_nodes_t,
+                    self.last_endpoint_tangents_t,
+                    self.last_endpoint_tangent_confidence_t,
+                    self.segment_length_m,
+                    self.config,
+                    self.torch_generator,
+                    self.cuda_stream,
+                    initialization=True,
+                    slack_m=max(
+                        0.0,
+                        self.segment_length_m * self.segment_count
+                        - float(np.linalg.norm(endpoint_nodes[-1] - endpoint_nodes[0])),
+                    ),
                 )
-                self.particles = build_chains_torch(starts, particle_directions_t, self.segment_length_m)
-                self._constrain_particles_to_known_endpoints()
+                global_particles = global_endpoint_chains_torch(
+                    global_count,
+                    self.node_count,
+                    self.last_endpoint_nodes_t,
+                    self.segment_length_m,
+                    self.config,
+                    self.torch_generator,
+                    self.cuda_stream,
+                )
+                self.particles = torch.cat((conditioned, global_particles), dim=0).contiguous()
                 self._reset_velocities(count)
-                self.weights = torch.full(
-                    (count,),
-                    1.0 / count,
-                    dtype=torch.float32,
+                self.weights = transition_component_weights_torch(
+                    conditioned_count,
+                    global_count,
+                    conditioned_mass=1.0 - float(global_count) / float(count),
                     device=self.device,
                 )
         else:
-            starts = nodes[0][None, :] + self.rng.normal(
-                0.0,
-                float(self.config.initial_node_std_m),
-                (count, 3),
+            conditioned = endpoint_conditioned_chains(
+                np.repeat(nodes[None, :, :], conditioned_count, axis=0),
+                endpoint_nodes,
+                self.last_endpoint_tangents,
+                self.last_endpoint_tangent_confidence,
+                self.segment_length_m,
+                self.config,
+                self.rng,
+                initialization=True,
             )
-            direction_noise = self.rng.normal(
-                0.0,
-                float(self.config.initial_direction_std),
-                (count, self.segment_count, 3),
+            global_particles = global_endpoint_chains(
+                global_count,
+                self.node_count,
+                endpoint_nodes,
+                self.segment_length_m,
+                self.config,
+                self.rng,
             )
-            particle_directions = smooth_particle_directions(
-                normalize_vectors(directions[None, :, :] + direction_noise),
-                passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-            )
-            self.particles = build_chains(starts, particle_directions, self.segment_length_m)
-            self._constrain_particles_to_known_endpoints()
+            self.particles = np.ascontiguousarray(np.concatenate((conditioned, global_particles), axis=0))
             self._reset_velocities(count)
-            self.weights = np.full(count, 1.0 / count, dtype=np.float64)
+            self.weights = transition_component_weights(
+                conditioned_count,
+                global_count,
+                conditioned_mass=1.0 - float(global_count) / float(count),
+            )
         self._invalidate_estimate_cache()
         self.initialized = True
         self.last_motion_noise_scale = 1.0
-        self.last_measurement_proposal_ratio = 0.0
-        self.last_global_random_particle_ratio = 0.0
-        self.last_measurement_node_velocity = None
+        self.last_endpoint_conditioned_proposal_ratio = float(conditioned_count) / float(count)
+        self.last_global_random_particle_ratio = float(global_count) / float(count)
         self.measurement_update_count = 1
-        associated_points, _indices, visible_segments = self._associate_visible_points(measurement_points)
-        support_points = measurement_points if associated_points is None else associated_points
-        self.last_support_points = np.ascontiguousarray(support_points, dtype=np.float32)
-        self.last_measurement_point_count = int(len(self.last_support_points))
-        self._inject_global_random_particles(self.last_support_points)
-        self._set_visibility(visible_segments)
 
-    def _weight_initialized_particles(self):
-        if not self.initialized or len(self.last_support_points) == 0:
+    def _estimate_endpoint_tangents(self, measurement_points, endpoint_nodes):
+        if self.cuda_state:
+            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
+                points_t = torch.as_tensor(
+                    measurement_points,
+                    dtype=torch.float32,
+                    device=self.device,
+                ).contiguous()
+                endpoints_t = self.last_endpoint_nodes_t
+                tangents_t, confidence_t, support_count_t = estimate_endpoint_tangents_torch(
+                    points_t,
+                    endpoints_t,
+                    min_radius_m=float(self.config.endpoint_tangent_min_radius_m),
+                    radius_m=float(self.config.endpoint_tangent_radius_m),
+                    sigma_m=float(self.config.endpoint_tangent_sigma_m),
+                    min_points=int(self.config.endpoint_tangent_min_points),
+                )
+                self.last_endpoint_tangents_t = tangents_t.contiguous()
+                self.last_endpoint_tangent_confidence_t = confidence_t.contiguous()
+                self.last_endpoint_tangents = tangents_t.cpu().numpy().astype(np.float32, copy=False)
+                self.last_endpoint_tangent_confidence = confidence_t.cpu().numpy().astype(np.float32, copy=False)
+                self.last_endpoint_tangent_support_count = support_count_t.cpu().numpy().astype(np.int32, copy=False)
             return
-        self._weight(
-            self.last_support_points,
-            visible_segments=self.last_visible_segments,
-            measurement_nodes=self.last_ordered_measurement_nodes,
+        tangents, confidence, support_count = estimate_endpoint_tangents(
+            measurement_points,
+            endpoint_nodes,
+            min_radius_m=float(self.config.endpoint_tangent_min_radius_m),
+            radius_m=float(self.config.endpoint_tangent_radius_m),
+            sigma_m=float(self.config.endpoint_tangent_sigma_m),
+            min_points=int(self.config.endpoint_tangent_min_points),
         )
+        self.last_endpoint_tangents = tangents
+        self.last_endpoint_tangent_confidence = confidence
+        self.last_endpoint_tangent_support_count = support_count
+
+    def _predict_transition(self, dt):
+        if self.particles is None or self.weights is None or self.segment_length_m is None:
+            return
+        total_count = len(self.particles)
+        global_ratio = float(np.clip(self.config.global_random_particle_ratio, 0.0, 0.95))
+        conditioned_ratio = float(np.clip(
+            self.config.endpoint_conditioned_proposal_ratio,
+            0.0,
+            1.0 - global_ratio,
+        ))
+        global_count = transition_component_count(total_count, global_ratio)
+        conditioned_count = transition_component_count(total_count, conditioned_ratio)
+        if global_count + conditioned_count >= total_count:
+            conditioned_count = max(0, total_count - global_count - 1)
+        local_count = total_count - conditioned_count - global_count
+        local_mass = 1.0 - conditioned_ratio - global_ratio
+        self.last_motion_noise_scale = 1.0
+
+        if self.cuda_state:
+            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
+                probabilities = torch.clamp_min(self.weights, 0.0)
+                probabilities = probabilities / probabilities.sum().clamp_min(1e-12)
+                parent_indices = torch.multinomial(
+                    probabilities,
+                    local_count + conditioned_count,
+                    replacement=True,
+                    generator=self.torch_generator,
+                )
+                self._ensure_velocity_array()
+                local_particles = self.particles.index_select(0, parent_indices[:local_count]).contiguous()
+                local_velocities = self.node_velocities.index_select(0, parent_indices[:local_count]).contiguous()
+                if self._velocity_enabled():
+                    damping = float(np.clip(self.config.velocity_damping, 0.0, 1.0))
+                    local_velocities.mul_(damping).add_(
+                        torch.randn(
+                            local_velocities.shape,
+                            dtype=torch.float32,
+                            device=self.device,
+                            generator=self.torch_generator,
+                        ) * float(self.config.velocity_process_std_mps)
+                    )
+                    local_velocities = clip_vector_norms_torch(local_velocities, self.config.max_node_speed_mps)
+                    predicted = local_particles + local_velocities * float(dt)
+                    local_directions = normalize_vectors_torch(predicted[:, 1:, :] - predicted[:, :-1, :])
+                else:
+                    local_directions = normalize_vectors_torch(local_particles[:, 1:, :] - local_particles[:, :-1, :])
+                    local_directions = normalize_vectors_torch(
+                        local_directions
+                        + torch.randn(
+                            local_directions.shape,
+                            dtype=torch.float32,
+                            device=self.device,
+                            generator=self.torch_generator,
+                        ) * float(self.config.process_direction_std)
+                    )
+                    local_velocities.zero_()
+                local_particles = build_chains_torch(
+                    self.last_endpoint_nodes_t[0][None, :].expand(local_count, -1),
+                    local_directions,
+                    self.segment_length_m,
+                )
+                local_particles = constrain_chains_cuda(
+                    local_particles,
+                    self.last_endpoint_nodes_t,
+                    self.segment_length_m,
+                    int(self.config.endpoint_constraint_iterations),
+                    float(self.config.endpoint_constraint_tolerance_m),
+                    self.cuda_stream,
+                )
+                conditioned_base = self.particles.index_select(
+                    0,
+                    parent_indices[local_count:],
+                ).contiguous()
+                conditioned_particles = endpoint_conditioned_chains_torch(
+                    conditioned_base,
+                    self.last_endpoint_nodes_t,
+                    self.last_endpoint_tangents_t,
+                    self.last_endpoint_tangent_confidence_t,
+                    self.segment_length_m,
+                    self.config,
+                    self.torch_generator,
+                    self.cuda_stream,
+                    slack_m=max(
+                        0.0,
+                        self.segment_length_m * self.segment_count
+                        - float(np.linalg.norm(self.last_endpoint_nodes[-1] - self.last_endpoint_nodes[0])),
+                    ),
+                )
+                global_particles = global_endpoint_chains_torch(
+                    global_count,
+                    self.node_count,
+                    self.last_endpoint_nodes_t,
+                    self.segment_length_m,
+                    self.config,
+                    self.torch_generator,
+                    self.cuda_stream,
+                )
+                self.particles = torch.cat(
+                    (local_particles, conditioned_particles, global_particles),
+                    dim=0,
+                ).contiguous()
+                zero_velocities = torch.zeros(
+                    (conditioned_count + global_count, self.node_count, 3),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.node_velocities = torch.cat((local_velocities, zero_velocities), dim=0).contiguous()
+                self.weights = transition_mixture_weights_torch(
+                    local_count,
+                    conditioned_count,
+                    global_count,
+                    local_mass,
+                    conditioned_ratio,
+                    global_ratio,
+                    self.device,
+                )
+                permutation = torch.randperm(total_count, device=self.device, generator=self.torch_generator)
+                self.particles = self.particles.index_select(0, permutation).contiguous()
+                self.node_velocities = self.node_velocities.index_select(0, permutation).contiguous()
+                self.weights = self.weights.index_select(0, permutation).contiguous()
+        else:
+            probabilities = np.maximum(np.asarray(self.weights, dtype=np.float64), 0.0)
+            probabilities /= max(float(np.sum(probabilities)), 1e-12)
+            parent_indices = self.rng.choice(
+                total_count,
+                size=local_count + conditioned_count,
+                replace=True,
+                p=probabilities,
+            )
+            self._ensure_velocity_array()
+            local_particles = self.particles[parent_indices[:local_count]].copy()
+            local_velocities = self.node_velocities[parent_indices[:local_count]].copy()
+            if self._velocity_enabled():
+                local_velocities *= float(np.clip(self.config.velocity_damping, 0.0, 1.0))
+                local_velocities += self.rng.normal(
+                    0.0,
+                    float(self.config.velocity_process_std_mps),
+                    local_velocities.shape,
+                )
+                local_velocities = clip_vector_norms(local_velocities, self.config.max_node_speed_mps)
+                predicted = local_particles + local_velocities * float(dt)
+                local_directions = particle_directions(predicted)
+            else:
+                local_directions = normalize_vectors(
+                    particle_directions(local_particles)
+                    + self.rng.normal(
+                        0.0,
+                        float(self.config.process_direction_std),
+                        (local_count, self.segment_count, 3),
+                    )
+                )
+                local_velocities.fill(0.0)
+            local_particles = build_chains(
+                np.repeat(np.asarray(self.last_endpoint_nodes[0])[None, :], local_count, axis=0),
+                local_directions,
+                self.segment_length_m,
+            )
+            local_particles = constrain_chains_to_endpoints(
+                local_particles,
+                self.last_endpoint_nodes,
+                self.segment_length_m,
+                iterations=int(self.config.endpoint_constraint_iterations),
+                tolerance_m=float(self.config.endpoint_constraint_tolerance_m),
+            )
+            conditioned_particles = endpoint_conditioned_chains(
+                self.particles[parent_indices[local_count:]],
+                self.last_endpoint_nodes,
+                self.last_endpoint_tangents,
+                self.last_endpoint_tangent_confidence,
+                self.segment_length_m,
+                self.config,
+                self.rng,
+            )
+            global_particles = global_endpoint_chains(
+                global_count,
+                self.node_count,
+                self.last_endpoint_nodes,
+                self.segment_length_m,
+                self.config,
+                self.rng,
+            )
+            self.particles = np.ascontiguousarray(np.concatenate(
+                (local_particles, conditioned_particles, global_particles),
+                axis=0,
+            ))
+            self.node_velocities = np.ascontiguousarray(np.concatenate(
+                (
+                    local_velocities,
+                    np.zeros((conditioned_count + global_count, self.node_count, 3), dtype=np.float64),
+                ),
+                axis=0,
+            ))
+            self.weights = transition_mixture_weights(
+                local_count,
+                conditioned_count,
+                global_count,
+                local_mass,
+                conditioned_ratio,
+                global_ratio,
+            )
+            permutation = self.rng.permutation(total_count)
+            self.particles = self.particles[permutation].copy()
+            self.node_velocities = self.node_velocities[permutation].copy()
+            self.weights = self.weights[permutation].copy()
+
+        self.last_endpoint_conditioned_proposal_ratio = float(conditioned_count) / float(total_count)
+        self.last_global_random_particle_ratio = float(global_count) / float(total_count)
+        self.measurement_update_count += 1
+        self._invalidate_estimate_cache()
 
     def _predict(self, dt, noise_scale=1.0):
         if self.particles is None or self.segment_length_m is None:
@@ -837,171 +1020,6 @@ class CableParticleFilter:
         self._constrain_particles_to_known_endpoints()
         self._invalidate_estimate_cache()
 
-    def _weight(self, measurement_points, visible_segments=None, measurement_nodes=None):
-        sigma = max(float(self.config.measurement_node_std_m), 1e-5)
-        outlier_distance = max(float(self.config.outlier_distance_m), sigma)
-        expected_segments = None
-        if visible_segments is not None:
-            visible_segments = np.asarray(visible_segments, dtype=bool).reshape(-1)
-            expected_segments = np.flatnonzero(visible_segments)
-        stage_start = time.perf_counter()
-        scores = self._score_particles(
-            measurement_points,
-            outlier_distance=outlier_distance,
-            expected_segments=expected_segments,
-        )
-        self._record_stage("score", stage_start)
-
-        if self.cuda_state:
-            weight_start = time.perf_counter()
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                endpoint_weight = float(getattr(self.config, "endpoint_penalty_weight", 0.0))
-                if endpoint_weight > 0.0 and measurement_nodes is not None:
-                    nodes_t = torch.as_tensor(measurement_nodes, dtype=torch.float32, device=self.device)
-                    start_error = torch.sum((self.particles[:, 0, :] - nodes_t[0][None, :]) ** 2, dim=1)
-                    end_error = torch.sum((self.particles[:, -1, :] - nodes_t[-1][None, :]) ** 2, dim=1)
-                    scores = scores + 0.5 * endpoint_weight * (start_error + end_error)
-                finite = torch.isfinite(scores)
-                if self.last_endpoint_nodes_t is not None:
-                    endpoint_tolerance = max(
-                        float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-                        1e-7,
-                    )
-                    start_residual = torch.linalg.vector_norm(
-                        self.particles[:, 0, :] - self.last_endpoint_nodes_t[0][None, :], dim=1
-                    )
-                    end_residual = torch.linalg.vector_norm(
-                        self.particles[:, -1, :] - self.last_endpoint_nodes_t[-1][None, :], dim=1
-                    )
-                    finite &= torch.maximum(start_residual, end_residual) <= endpoint_tolerance
-                maximum = torch.max(torch.where(finite, scores, torch.full_like(scores, -torch.inf)))
-                finite_scores = torch.where(finite, scores, maximum + outlier_distance**2)
-                log_likelihood = -0.5 * finite_scores / (sigma * sigma)
-                log_likelihood = log_likelihood - torch.max(log_likelihood)
-                weighted = self.weights * torch.exp(log_likelihood)
-                total = torch.sum(weighted)
-                normalized = weighted / total.clamp_min(1e-12)
-                valid_uniform = finite.to(self.weights.dtype)
-                valid_uniform = valid_uniform / valid_uniform.sum().clamp_min(1.0)
-                uniform = torch.where(
-                    torch.any(finite),
-                    valid_uniform,
-                    torch.full_like(self.weights, 1.0 / len(self.weights)),
-                )
-                valid_total = torch.isfinite(total) & (total > 1e-12)
-                self.weights = torch.where(valid_total, normalized, uniform)
-            self._invalidate_estimate_cache()
-            self._record_stage("weight", weight_start)
-            return
-
-        if not np.any(np.isfinite(scores)):
-            return
-
-        stage_start = time.perf_counter()
-        endpoint_weight = float(getattr(self.config, "endpoint_penalty_weight", 0.0))
-        if endpoint_weight > 0.0 and measurement_nodes is not None:
-            scores = scores + endpoint_order_penalty(self.particles, measurement_nodes, weight=endpoint_weight)
-        if self.last_endpoint_nodes is not None:
-            endpoint_tolerance = max(
-                float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-                1e-7,
-            )
-            start_residual = np.linalg.norm(
-                self.particles[:, 0, :] - self.last_endpoint_nodes[0][None, :], axis=1
-            )
-            end_residual = np.linalg.norm(
-                self.particles[:, -1, :] - self.last_endpoint_nodes[-1][None, :], axis=1
-            )
-            scores[np.maximum(start_residual, end_residual) > endpoint_tolerance] = np.inf
-
-        finite_scores = np.where(np.isfinite(scores), scores, np.nanmax(scores[np.isfinite(scores)]) + outlier_distance**2)
-        log_likelihood = -0.5 * finite_scores / (sigma * sigma)
-        log_likelihood -= float(np.max(log_likelihood))
-        likelihood = np.exp(log_likelihood)
-        weighted = self.weights * likelihood
-        total = float(np.sum(weighted))
-        if not np.isfinite(total) or total <= 1e-12:
-            self.weights.fill(1.0 / len(self.weights))
-            return
-        self.weights = weighted / total
-        self._invalidate_estimate_cache()
-        self._record_stage("weight", stage_start)
-
-    def _maybe_resample(self, force=False, noise_scale=1.0):
-        if self.weights is None or self.particles is None:
-            return
-        effective = self._effective_sample_size()
-        threshold = float(self.config.resample_effective_ratio) * len(self.weights)
-        if not force and effective >= threshold:
-            return
-
-        indices = self._systematic_resample()
-        if self.cuda_state:
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                self.particles = self.particles.index_select(0, indices).contiguous()
-                if self.node_velocities is not None:
-                    self.node_velocities = self.node_velocities.index_select(0, indices).contiguous()
-                self.weights.fill_(1.0 / len(self.weights))
-        else:
-            self.particles = self.particles[indices].copy()
-            if self.node_velocities is not None:
-                self.node_velocities = self.node_velocities[indices].copy()
-            self.weights.fill(1.0 / len(self.weights))
-        self._roughen(noise_scale=float(noise_scale))
-        self._invalidate_estimate_cache()
-
-    def _roughen(self, noise_scale=1.0):
-        if self.particles is None or self.segment_length_m is None:
-            return
-        if self.cuda_state:
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                starts = self.particles[:, 0, :] + torch.randn(
-                    (len(self.particles), 3),
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=self.torch_generator,
-                ) * (float(self.config.process_node_std_m) * 0.5 * noise_scale)
-                directions = normalize_vectors_torch(self.particles[:, 1:, :] - self.particles[:, :-1, :])
-                directions = normalize_vectors_torch(
-                    directions
-                    + torch.randn(
-                        directions.shape,
-                        dtype=torch.float32,
-                        device=self.device,
-                        generator=self.torch_generator,
-                    ) * (float(self.config.process_direction_std) * 0.5 * noise_scale)
-                )
-                directions = smooth_particle_directions_torch(
-                    directions,
-                    passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-                )
-                self.particles = build_chains_torch(starts, directions, self.segment_length_m)
-                self._constrain_particles_to_known_endpoints()
-                self._roughen_velocities(noise_scale=float(noise_scale))
-            self._invalidate_estimate_cache()
-            return
-        starts = self.particles[:, 0, :] + self.rng.normal(
-            0.0,
-            float(self.config.process_node_std_m) * 0.5 * noise_scale,
-            (len(self.particles), 3),
-        )
-        directions = normalize_vectors(
-            particle_directions(self.particles)
-            + self.rng.normal(
-                0.0,
-                float(self.config.process_direction_std) * 0.5 * noise_scale,
-                (len(self.particles), self.segment_count, 3),
-            )
-        )
-        directions = smooth_particle_directions(
-            directions,
-            passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-        )
-        self.particles = build_chains(starts, directions, self.segment_length_m)
-        self._constrain_particles_to_known_endpoints()
-        self._roughen_velocities(noise_scale=float(noise_scale))
-        self._invalidate_estimate_cache()
-
     def _estimate(self, measurement_used, prediction_only):
         if self.particles is None or self.weights is None or self.segment_length_m is None:
             return None
@@ -1018,14 +1036,13 @@ class CableParticleFilter:
             support_points_xyz=self.last_support_points.copy(),
             visible_segments=self.last_visible_segments.copy(),
             visible_nodes=self.last_visible_nodes.copy(),
-            measurement_proposal_ratio=float(self.last_measurement_proposal_ratio),
+            endpoint_conditioned_proposal_ratio=float(self.last_endpoint_conditioned_proposal_ratio),
             global_random_particle_ratio=float(self.last_global_random_particle_ratio),
-            ransac_inlier_ratio=float(self.last_ransac_inlier_ratio),
-            ransac_inlier_count=int(self.last_ransac_inlier_count),
-            ransac_error_m=float(self.last_ransac_error_m),
-            ransac_hypothesis_count=int(self.last_ransac_hypothesis_count),
-            coarse_score_point_count=int(self.last_coarse_score_point_count),
-            full_score_particle_count=int(self.last_full_score_particle_count),
+            mean_ownership_responsibility=float(self.last_mean_ownership_responsibility),
+            ownership_entropy=float(self.last_ownership_entropy),
+            ownership_effective_point_count=float(self.last_ownership_effective_point_count),
+            endpoint_tangent_confidence=self.last_endpoint_tangent_confidence.copy(),
+            endpoint_tangent_support_count=self.last_endpoint_tangent_support_count.copy(),
             estimate_particle_count=int(self._estimate_particle_count_cache),
             estimate_weight_mass=float(self._estimate_weight_mass_cache),
             mean_node_speed_mps=float(self._weighted_node_speed()),
@@ -1094,6 +1111,13 @@ class CableParticleFilter:
                 self._estimate_nodes_cache,
                 map_nodes,
                 selected_particles,
+                endpoint_tangents=self.last_endpoint_tangents,
+                endpoint_tangent_confidence=self.last_endpoint_tangent_confidence,
+                endpoint_tangent_support_count=self.last_endpoint_tangent_support_count,
+                mean_ownership_responsibility=self.last_mean_ownership_responsibility,
+                ownership_entropy=self.last_ownership_entropy,
+                visible_segment_fraction=float(np.mean(self.last_visible_segments)),
+                endpoint_conditioned_proposal_ratio=self.last_endpoint_conditioned_proposal_ratio,
             )
             return self._estimate_nodes_cache.copy()
 
@@ -1117,6 +1141,13 @@ class CableParticleFilter:
             self._estimate_nodes_cache,
             map_nodes,
             self.particles[selected],
+            endpoint_tangents=self.last_endpoint_tangents,
+            endpoint_tangent_confidence=self.last_endpoint_tangent_confidence,
+            endpoint_tangent_support_count=self.last_endpoint_tangent_support_count,
+            mean_ownership_responsibility=self.last_mean_ownership_responsibility,
+            ownership_entropy=self.last_ownership_entropy,
+            visible_segment_fraction=float(np.mean(self.last_visible_segments)),
+            endpoint_conditioned_proposal_ratio=self.last_endpoint_conditioned_proposal_ratio,
         )
         return self._estimate_nodes_cache.copy()
 
@@ -1142,387 +1173,16 @@ class CableParticleFilter:
         if measurement is None:
             return None
 
-        endpoint_nodes = self._measurement_endpoint_nodes(measurement)
         source_points = getattr(measurement, "source_points", None)
         if source_points is not None:
             points = valid_points(source_points)
-            points = self._filter_points_to_known_endpoint_reach(points, endpoint_nodes)
             if len(points) >= int(self.config.min_measurement_points):
                 return sample_points(points, int(self.config.measurement_max_points))
-            if endpoint_nodes is not None:
-                return None
 
         points = valid_points(getattr(measurement, "points_xyz", measurement))
-        points = self._filter_points_to_known_endpoint_reach(points, endpoint_nodes)
         if len(points) >= int(self.config.min_measurement_points):
             return sample_points(points, int(self.config.measurement_max_points))
         return None
-
-    def _initial_nodes(self, measurement, measurement_points):
-        endpoint_nodes = self._measurement_endpoint_nodes(measurement)
-        if endpoint_nodes is not None and self.segment_length_m is not None:
-            nodes = self._fit_measurement_point_chain(
-                measurement_points,
-                reference_nodes=None,
-                force_endpoint=True,
-            )
-            if nodes is None:
-                return None
-            return self._constrain_nodes_to_known_endpoints(nodes, endpoint_nodes)
-
-        candidate = getattr(measurement, "points_xyz", None)
-        nodes = fit_polyline_segments(candidate, segment_count=self.segment_count) if candidate is not None else None
-        if nodes is None:
-            nodes = self._fit_measurement_point_chain(measurement_points)
-        return nodes
-
-    def _measurement_nodes(self, measurement, measurement_points):
-        self.last_measurement_nodes_from_prediction = False
-        candidate = valid_points(getattr(measurement, "points_xyz", None))
-        if len(candidate) >= 2:
-            nodes = fit_polyline_segments(candidate, segment_count=self.segment_count)
-        else:
-            reference_nodes = self._estimate_nodes() if self.initialized and self.particles is not None else None
-            force_endpoint = self._should_refresh_endpoint_ordering()
-            if not self._should_fit_measurement_nodes(force_endpoint):
-                nodes = reference_nodes
-                if nodes is not None:
-                    self.measurement_update_count += 1
-                    self.last_measurement_nodes_from_prediction = True
-                    nodes = np.ascontiguousarray(nodes, dtype=np.float64)
-                    self.last_ordered_measurement_nodes = nodes
-                    return nodes
-            else:
-                nodes = self._fit_measurement_point_chain(
-                    measurement_points,
-                    reference_nodes=reference_nodes,
-                    force_endpoint=force_endpoint,
-                )
-            self.measurement_update_count += 1
-        if nodes is None or self.segment_length_m is None:
-            return None
-        nodes = project_equal_length_chain(nodes, self.segment_length_m, self.node_count)
-        if nodes is None:
-            return None
-        nodes = self._constrain_nodes_to_known_endpoints(nodes, self._measurement_endpoint_nodes(measurement))
-        if self.initialized and self.particles is not None:
-            nodes = align_polyline_orientation(self._estimate_nodes(), nodes)
-            nodes = self._constrain_nodes_to_known_endpoints(nodes, self._measurement_endpoint_nodes(measurement))
-        self.last_ordered_measurement_nodes = np.ascontiguousarray(nodes, dtype=np.float64)
-        return np.ascontiguousarray(nodes, dtype=np.float64)
-
-    def _should_fit_measurement_nodes(self, force_endpoint=False):
-        if bool(force_endpoint) or not self.initialized or self.particles is None:
-            return True
-        if self.lost_frames > 0:
-            return True
-        interval = max(1, int(getattr(self.config, "measurement_fit_interval", 1)))
-        if interval <= 1:
-            return True
-        if self.last_ordered_measurement_nodes is None:
-            return True
-        return int(self.measurement_update_count) % interval == 0
-
-    def _fit_measurement_point_chain(
-        self,
-        measurement_points,
-        reference_nodes=None,
-        force_endpoint=False,
-    ):
-        use_reference = (
-            bool(getattr(self.config, "reference_ordering", True))
-            and reference_nodes is not None
-            and not bool(force_endpoint)
-        )
-        if not use_reference:
-            nodes = fit_unordered_point_cloud_chain(
-                measurement_points,
-                segment_count=self.segment_count,
-                endpoint_ordering=bool(getattr(self.config, "endpoint_ordering", True)),
-                max_points=int(getattr(self.config, "ordering_max_points", 768)),
-                knn=int(getattr(self.config, "ordering_knn", 10)),
-            )
-            if nodes is not None:
-                return nodes
-            return None
-
-        return fit_reference_ordered_point_cloud_chain(
-            measurement_points,
-            reference_nodes=reference_nodes,
-            segment_count=self.segment_count,
-            gate_m=float(getattr(self.config, "reference_ordering_gate_m", 0.08)),
-            min_points=int(getattr(self.config, "min_measurement_points", 12)),
-        )
-
-    def _should_refresh_endpoint_ordering(self):
-        interval = int(getattr(self.config, "endpoint_refresh_interval", 0))
-        if interval <= 0 or not bool(getattr(self.config, "endpoint_ordering", True)):
-            return False
-        if self.lost_frames > 0:
-            return True
-        return int(self.measurement_update_count) > 0 and int(self.measurement_update_count) % interval == 0
-
-    def _inject_measurement_proposals(self, measurement_nodes):
-        if measurement_nodes is None or self.particles is None or self.weights is None or self.segment_length_m is None:
-            self.last_measurement_proposal_ratio = 0.0
-            return
-        if self.last_measurement_nodes_from_prediction:
-            self.last_measurement_proposal_ratio = 0.0
-            return
-
-        ratio = self._adaptive_measurement_proposal_ratio(measurement_nodes)
-        self.last_measurement_proposal_ratio = float(ratio)
-        if ratio <= 0.0:
-            return
-        total_count = len(self.particles)
-        proposal_count = int(round(ratio * total_count))
-        proposal_count = int(np.clip(proposal_count, 1, total_count))
-
-        if self.cuda_state:
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                nodes_t = torch.as_tensor(measurement_nodes, dtype=torch.float32, device=self.device)
-                directions_t = normalize_vectors_torch(nodes_t[1:, :] - nodes_t[:-1, :])
-                starts_t = nodes_t[0][None, :] + torch.randn(
-                    (proposal_count, 3),
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=self.torch_generator,
-                ) * float(self.config.measurement_proposal_node_std_m)
-                noisy_directions = directions_t[None, :, :] + torch.randn(
-                    (proposal_count, self.segment_count, 3),
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=self.torch_generator,
-                ) * float(self.config.measurement_proposal_direction_std)
-                noisy_directions = smooth_particle_directions_torch(
-                    normalize_vectors_torch(noisy_directions),
-                    passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-                )
-                proposals = build_chains_torch(starts_t, noisy_directions, self.segment_length_m)
-                proposals = constrain_chains_cuda(
-                    proposals,
-                    self.last_endpoint_nodes_t,
-                    self.segment_length_m,
-                    int(getattr(self.config, "endpoint_constraint_iterations", 16)),
-                    float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-                    self.cuda_stream,
-                )
-                replace_indices = torch.randperm(
-                    total_count,
-                    device=self.device,
-                    generator=self.torch_generator,
-                )[:proposal_count]
-                self.particles.index_copy_(0, replace_indices, proposals)
-                self._assign_measurement_velocity(replace_indices)
-                self.weights.mul_(1.0 - ratio)
-                self.weights[replace_indices] = ratio / proposal_count
-                total = torch.sum(self.weights)
-                normalized = self.weights / total.clamp_min(1e-12)
-                uniform = torch.full_like(self.weights, 1.0 / total_count)
-                self.weights = torch.where(torch.isfinite(total) & (total > 1e-12), normalized, uniform)
-            self._invalidate_estimate_cache()
-            return
-
-        proposals = sample_noisy_chains_around_nodes(
-            measurement_nodes,
-            proposal_count,
-            self.segment_length_m,
-            self.rng,
-            node_std_m=float(self.config.measurement_proposal_node_std_m),
-            direction_std=float(self.config.measurement_proposal_direction_std),
-            direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-        )
-        replace_indices = self.rng.choice(total_count, size=proposal_count, replace=False)
-        self.particles[replace_indices] = proposals
-        self._constrain_particles_to_known_endpoints(indices=replace_indices)
-        self._assign_measurement_velocity(replace_indices)
-
-        self.weights *= 1.0 - ratio
-        self.weights[replace_indices] = ratio / proposal_count
-        total = float(np.sum(self.weights))
-        if np.isfinite(total) and total > 1e-12:
-            self.weights /= total
-        else:
-            self.weights.fill(1.0 / total_count)
-        self._invalidate_estimate_cache()
-
-    def _select_ransac_inlier_points(self, measurement_points, endpoint_nodes=None):
-        self.last_ransac_inlier_ratio = 0.0
-        self.last_ransac_inlier_count = 0
-        self.last_ransac_error_m = np.nan
-        self.last_ransac_hypothesis_count = 0
-        if not bool(getattr(self.config, "ransac_inlier_selection_enabled", True)):
-            return measurement_points
-        endpoints = _association_reference(endpoint_nodes)
-        if self.segment_length_m is None or endpoints is None:
-            return None
-
-        points = valid_points(measurement_points)
-        min_points = max(2, int(getattr(self.config, "ransac_min_points", 24)))
-        if len(points) < min_points:
-            return None
-
-        hypothesis_count = max(0, int(getattr(self.config, "ransac_hypotheses", 0)))
-        if hypothesis_count <= 0:
-            return points
-        backend = str(getattr(self.config, "scoring_backend", "auto")).strip().lower()
-        if backend == "cuda":
-            selected, inlier_count, inlier_ratio, error_m = select_endpoint_ransac_inliers_torch(
-                points,
-                endpoints,
-                hypothesis_count,
-                self.segment_count,
-                self.segment_length_m,
-                self.rng,
-                subset_points=int(getattr(self.config, "ransac_subset_points", 2)),
-                inlier_distance=float(getattr(self.config, "ransac_inlier_distance_m", 0.025)),
-                min_points=min_points,
-                endpoint_constraint_iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
-                endpoint_constraint_tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-                chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
-                device=self.device,
-                stream=self.cuda_stream,
-            )
-            self.last_ransac_hypothesis_count = hypothesis_count
-            self.last_ransac_inlier_count = int(inlier_count)
-            self.last_ransac_inlier_ratio = float(inlier_ratio)
-            self.last_ransac_error_m = float(error_m)
-            return selected
-
-        hypotheses = sample_endpoint_ransac_chains(
-            points,
-            endpoints,
-            hypothesis_count,
-            self.segment_count,
-            self.segment_length_m,
-            self.rng,
-            subset_points=int(getattr(self.config, "ransac_subset_points", 2)),
-            endpoint_constraint_iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
-            endpoint_constraint_tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-        )
-        self.last_ransac_hypothesis_count = int(len(hypotheses))
-        if len(hypotheses) == 0:
-            return None
-
-        inlier_distance = float(getattr(self.config, "ransac_inlier_distance_m", 0.025))
-        inlier_counts, inlier_sums = ransac_inlier_stats(
-            points,
-            hypotheses,
-            inlier_distance,
-            backend=str(getattr(self.config, "scoring_backend", "auto")),
-            chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
-        )
-        if len(inlier_counts) != len(hypotheses) or len(inlier_sums) != len(hypotheses):
-            return None
-        valid = inlier_counts >= min_points
-        if not np.any(valid):
-            return None
-
-        best_count = int(np.max(inlier_counts[valid]))
-        best_candidates = np.flatnonzero(valid & (inlier_counts == best_count))
-        best_index = int(best_candidates[np.argmin(inlier_sums[best_candidates])])
-        keep = points_near_polyline_mask(points, hypotheses[best_index], inlier_distance)
-        selected = np.ascontiguousarray(points[keep], dtype=np.float64)
-        self.last_ransac_inlier_count = int(len(selected))
-        self.last_ransac_inlier_ratio = float(len(selected)) / max(float(len(points)), 1.0)
-        self.last_ransac_error_m = float(np.sqrt(inlier_sums[best_index] / max(float(len(selected)), 1.0)))
-        return selected
-
-    def _inject_global_random_particles(self, measurement_points):
-        self.last_global_random_particle_ratio = 0.0
-        if self.particles is None or self.weights is None or self.segment_length_m is None:
-            return
-        ratio = float(np.clip(getattr(self.config, "global_random_particle_ratio", 0.0), 0.0, 1.0))
-        if ratio <= 0.0:
-            return
-        points = valid_points(measurement_points)
-        if len(points) < 2:
-            return
-
-        total_count = len(self.particles)
-        random_count = int(round(ratio * total_count))
-        random_count = int(np.clip(random_count, 1, total_count))
-        padding = max(0.0, float(getattr(self.config, "global_random_bounds_padding_m", 0.10)))
-        if self.cuda_state:
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                points_t = torch.as_tensor(points, dtype=torch.float32, device=self.device)
-                mins = torch.amin(points_t, dim=0) - padding
-                maxs = torch.amax(points_t, dim=0) + padding
-                span = maxs - mins
-                min_span = max(float(self.segment_length_m), 1e-3)
-                center = 0.5 * (mins + maxs)
-                tiny = span < min_span
-                mins = torch.where(tiny, center - 0.5 * min_span, mins)
-                maxs = torch.where(tiny, center + 0.5 * min_span, maxs)
-                starts = mins[None, :] + torch.rand(
-                    (random_count, 3),
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=self.torch_generator,
-                ) * (maxs - mins)[None, :]
-                directions = normalize_vectors_torch(
-                    torch.randn(
-                        (random_count, self.segment_count, 3),
-                        dtype=torch.float32,
-                        device=self.device,
-                        generator=self.torch_generator,
-                    )
-                )
-                directions = smooth_particle_directions_torch(
-                    directions,
-                    passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-                )
-                random_particles = build_chains_torch(starts, directions, self.segment_length_m)
-                random_particles = constrain_chains_cuda(
-                    random_particles,
-                    self.last_endpoint_nodes_t,
-                    self.segment_length_m,
-                    int(getattr(self.config, "endpoint_constraint_iterations", 16)),
-                    float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-                    self.cuda_stream,
-                )
-                replace_indices = torch.randperm(
-                    total_count,
-                    device=self.device,
-                    generator=self.torch_generator,
-                )[:random_count]
-                self.particles.index_copy_(0, replace_indices, random_particles)
-                self._zero_velocities(replace_indices)
-                self.weights.mul_(1.0 - ratio)
-                self.weights[replace_indices] = ratio / random_count
-                total = torch.sum(self.weights)
-                normalized = self.weights / total.clamp_min(1e-12)
-                uniform = torch.full_like(self.weights, 1.0 / total_count)
-                self.weights = torch.where(torch.isfinite(total) & (total > 1e-12), normalized, uniform)
-            self.last_global_random_particle_ratio = float(random_count) / max(float(total_count), 1.0)
-            self._invalidate_estimate_cache()
-            return
-
-        random_particles = sample_global_random_chains(
-            points,
-            random_count,
-            self.segment_count,
-            self.segment_length_m,
-            self.rng,
-            padding_m=padding,
-            direction_smooth_passes=int(getattr(self.config, "direction_smooth_passes", 1)),
-        )
-        if len(random_particles) != random_count:
-            return
-
-        replace_indices = self.rng.choice(total_count, size=random_count, replace=False)
-        self.particles[replace_indices] = random_particles
-        self._constrain_particles_to_known_endpoints(indices=replace_indices)
-        self._zero_velocities(replace_indices)
-        self.weights *= 1.0 - ratio
-        self.weights[replace_indices] = ratio / random_count
-        total = float(np.sum(self.weights))
-        if np.isfinite(total) and total > 1e-12:
-            self.weights /= total
-        else:
-            self.weights.fill(1.0 / total_count)
-        self.last_global_random_particle_ratio = float(random_count) / max(float(total_count), 1.0)
-        self._invalidate_estimate_cache()
 
     def _velocity_enabled(self):
         return bool(getattr(self.config, "velocity_enabled", True))
@@ -1584,94 +1244,6 @@ class CableParticleFilter:
                 self.node_velocities = np.zeros(shape, dtype=np.float64)
         return True
 
-    def _update_velocities_from_measurement(self, previous_nodes, measurement_nodes, dt):
-        if not self._ensure_velocity_array():
-            return
-        if self.last_measurement_nodes_from_prediction:
-            return
-        node_velocity = measurement_node_velocity(previous_nodes, measurement_nodes, dt)
-        if node_velocity is None:
-            return
-        blend = float(np.clip(getattr(self.config, "velocity_measurement_blend", 0.30), 0.0, 1.0))
-        if self.cuda_state:
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                node_velocity_t = torch.as_tensor(node_velocity, dtype=torch.float32, device=self.device)
-                self.node_velocities.mul_(1.0 - blend).add_(node_velocity_t[None, :, :], alpha=blend)
-        else:
-            self.node_velocities = (1.0 - blend) * self.node_velocities + blend * node_velocity[None, :, :]
-        self.last_measurement_node_velocity = np.ascontiguousarray(node_velocity, dtype=np.float64)
-        self._clip_velocities()
-
-    def _assign_measurement_velocity(self, indices):
-        if not self._ensure_velocity_array():
-            return
-        if self.cuda_state:
-            indices = indices.to(device=self.device, dtype=torch.int64).reshape(-1)
-        else:
-            indices = np.asarray(indices, dtype=np.int64).reshape(-1)
-        if len(indices) == 0:
-            return
-        if self.last_measurement_node_velocity is None:
-            self._zero_velocities(indices)
-            return
-        if self.cuda_state:
-            measurement_velocity_t = torch.as_tensor(
-                self.last_measurement_node_velocity,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            self.node_velocities[indices] = measurement_velocity_t[None, :, :] + torch.randn(
-                (len(indices), self.node_count, 3),
-                dtype=torch.float32,
-                device=self.device,
-                generator=self.torch_generator,
-            ) * (0.5 * float(getattr(self.config, "velocity_process_std_mps", 0.03)))
-        else:
-            self.node_velocities[indices] = self.last_measurement_node_velocity[None, :, :] + self.rng.normal(
-                0.0,
-                0.5 * float(getattr(self.config, "velocity_process_std_mps", 0.03)),
-                (len(indices), self.node_count, 3),
-            )
-        self._clip_velocities(indices=indices)
-
-    def _zero_velocities(self, indices=None):
-        if not self._ensure_velocity_array():
-            return
-        if indices is None:
-            if self.cuda_state:
-                self.node_velocities.zero_()
-            else:
-                self.node_velocities.fill(0.0)
-            return
-        if self.cuda_state:
-            indices = indices.to(device=self.device, dtype=torch.int64).reshape(-1)
-        else:
-            indices = np.asarray(indices, dtype=np.int64).reshape(-1)
-        if len(indices) == 0:
-            return
-        self.node_velocities[indices] = 0.0
-
-    def _roughen_velocities(self, noise_scale=1.0):
-        if not self._ensure_velocity_array():
-            return
-        noise_scale = float(np.clip(noise_scale, 0.25, self.config.max_motion_noise_scale))
-        if self.cuda_state:
-            self.node_velocities.add_(
-                torch.randn(
-                    self.node_velocities.shape,
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=self.torch_generator,
-                ) * (0.5 * float(getattr(self.config, "velocity_process_std_mps", 0.03)) * noise_scale)
-            )
-        else:
-            self.node_velocities += self.rng.normal(
-                0.0,
-                0.5 * float(getattr(self.config, "velocity_process_std_mps", 0.03)) * noise_scale,
-                self.node_velocities.shape,
-            )
-        self._clip_velocities()
-
     def _clip_velocities(self, indices=None):
         if self.node_velocities is None:
             return
@@ -1710,125 +1282,6 @@ class CableParticleFilter:
         speeds = np.mean(np.linalg.norm(self.node_velocities, axis=2), axis=1)
         return weighted_mean_or_zero(speeds, self.weights)
 
-    def _should_reset_to_measurement(self, measurement_nodes):
-        threshold = float(getattr(self.config, "measurement_reset_error_m", 0.0))
-        if threshold <= 0.0 or measurement_nodes is None or not self.initialized:
-            return False
-        current_nodes = self._estimate_nodes()
-        error_m = mean_node_distance(current_nodes, measurement_nodes)
-        return bool(np.isfinite(error_m) and error_m > threshold)
-
-    def _adaptive_measurement_proposal_ratio(self, measurement_nodes):
-        max_ratio = float(np.clip(self.config.measurement_proposal_ratio, 0.0, 1.0))
-        if max_ratio <= 0.0 or measurement_nodes is None:
-            return 0.0
-        if self.lost_frames > 0:
-            return max_ratio
-
-        stable_ratio = float(np.clip(self.config.measurement_proposal_stable_ratio, 0.0, max_ratio))
-        current_nodes = self._estimate_nodes() if self.initialized else None
-        error_m = mean_node_distance(current_nodes, measurement_nodes)
-        if not np.isfinite(error_m):
-            return max_ratio
-
-        start_error = max(0.0, float(self.config.measurement_proposal_start_error_m))
-        full_error = max(start_error + 1e-6, float(self.config.measurement_proposal_full_error_m))
-        if error_m <= start_error:
-            return stable_ratio
-        if error_m >= full_error:
-            return max_ratio
-
-        blend = (error_m - start_error) / (full_error - start_error)
-        return stable_ratio + blend * (max_ratio - stable_ratio)
-
-    def _score_particles(self, measurement_points, outlier_distance, expected_segments=None):
-        self.last_coarse_score_point_count = 0
-        self.last_full_score_particle_count = 0
-        particle_count = len(self.particles)
-        point_count = len(measurement_points)
-        coarse_points = int(getattr(self.config, "coarse_score_points", 0))
-        full_fraction = float(np.clip(getattr(self.config, "coarse_score_full_fraction", 1.0), 0.0, 1.0))
-        min_full = max(1, int(getattr(self.config, "coarse_score_min_particles", 1)))
-        full_count = int(np.ceil(full_fraction * particle_count))
-        full_count = int(np.clip(max(full_count, min_full), 1, particle_count))
-        use_coarse = coarse_points > 0 and point_count > coarse_points and full_count < particle_count
-
-        if self.cuda_state:
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                points_t = torch.as_tensor(measurement_points, dtype=torch.float32, device=self.device)
-                common_torch = dict(
-                    outlier_distance=outlier_distance,
-                    score_keep_fraction=float(self.config.score_keep_fraction),
-                    coverage_penalty_m=float(self.config.coverage_penalty_m),
-                    coverage_min_fraction=float(self.config.coverage_min_fraction),
-                    bend_penalty_m=float(getattr(self.config, "bend_penalty_m", 0.0)),
-                    expected_segments=expected_segments,
-                    chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
-                )
-                if not use_coarse:
-                    self.last_full_score_particle_count = int(particle_count)
-                    return particle_distance_scores_torch_tensor(points_t, self.particles, **common_torch)
-
-                coarse_indices = torch.linspace(
-                    0,
-                    point_count - 1,
-                    coarse_points,
-                    dtype=torch.float32,
-                    device=self.device,
-                ).to(torch.int64)
-                coarse_scores = particle_distance_scores_torch_tensor(
-                    points_t.index_select(0, coarse_indices),
-                    self.particles,
-                    **common_torch,
-                )
-                full_indices = torch.topk(coarse_scores, k=full_count, largest=False, sorted=False).indices
-                full_scores = particle_distance_scores_torch_tensor(
-                    points_t,
-                    self.particles.index_select(0, full_indices),
-                    **common_torch,
-                )
-                scores = coarse_scores.clone()
-                scores.index_copy_(0, full_indices, full_scores)
-                self.last_coarse_score_point_count = int(coarse_points)
-                self.last_full_score_particle_count = int(full_count)
-                return scores
-
-        common = dict(
-            outlier_distance=outlier_distance,
-            score_keep_fraction=float(self.config.score_keep_fraction),
-            coverage_penalty_m=float(self.config.coverage_penalty_m),
-            coverage_min_fraction=float(self.config.coverage_min_fraction),
-            bend_penalty_m=float(getattr(self.config, "bend_penalty_m", 0.0)),
-            expected_segments=expected_segments,
-            backend=str(getattr(self.config, "scoring_backend", "auto")),
-            chunk_points=int(getattr(self.config, "score_chunk_points", 512)),
-        )
-        if not use_coarse:
-            self.last_full_score_particle_count = int(particle_count)
-            return particle_distance_scores(measurement_points, self.particles, **common)
-
-        coarse_measurement_points = sample_points(measurement_points, coarse_points)
-        coarse_scores = particle_distance_scores(coarse_measurement_points, self.particles, **common)
-        if not np.any(np.isfinite(coarse_scores)):
-            self.last_full_score_particle_count = int(particle_count)
-            return coarse_scores
-
-        finite_scores = np.where(
-            np.isfinite(coarse_scores),
-            coarse_scores,
-            np.nanmax(coarse_scores[np.isfinite(coarse_scores)]) + float(outlier_distance) ** 2,
-        )
-        full_indices = np.argsort(finite_scores)[:full_count]
-        scores = coarse_scores.copy()
-        scores[full_indices] = particle_distance_scores(
-            measurement_points,
-            self.particles[full_indices],
-            **common,
-        )
-        self.last_coarse_score_point_count = int(len(coarse_measurement_points))
-        self.last_full_score_particle_count = int(len(full_indices))
-        return scores
-
     def _measurement_endpoint_nodes(self, measurement):
         if measurement is None:
             return None
@@ -1839,42 +1292,6 @@ class CableParticleFilter:
         if not np.all(np.isfinite(endpoint_nodes)):
             return None
         return endpoint_nodes
-
-    def _filter_points_to_known_endpoint_reach(self, points, endpoint_nodes):
-        points = valid_points(points)
-        if len(points) == 0 or endpoint_nodes is None or self.segment_length_m is None:
-            return points
-        endpoints = valid_points(endpoint_nodes)
-        if len(endpoints) < 2:
-            return points
-        total_length = float(self.segment_count) * float(self.segment_length_m)
-        if not np.isfinite(total_length) or total_length <= 0.0:
-            return points
-        start = endpoints[0, :3]
-        end = endpoints[-1, :3]
-        margin = max(
-            float(getattr(self.config, "outlier_distance_m", 0.08)),
-            0.75 * float(self.segment_length_m),
-            0.02,
-        )
-        reachable = np.linalg.norm(points - start[None, :], axis=1) + np.linalg.norm(points - end[None, :], axis=1)
-        keep = reachable <= total_length + margin
-        return np.ascontiguousarray(points[keep], dtype=np.float64)
-
-    def _constrain_nodes_to_known_endpoints(self, nodes, endpoint_nodes=None):
-        endpoint_nodes = self.last_endpoint_nodes if endpoint_nodes is None else endpoint_nodes
-        if endpoint_nodes is None or self.segment_length_m is None:
-            return nodes
-        constrained = constrain_chain_to_endpoints(
-            nodes,
-            endpoint_nodes,
-            self.segment_length_m,
-            iterations=int(getattr(self.config, "endpoint_constraint_iterations", 16)),
-            tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
-        )
-        if constrained is None:
-            raise ValueError("Endpoint-constrained cable projection failed for the current node chain.")
-        return constrained
 
     def _constrain_particles_to_known_endpoints(self, indices=None):
         if self.particles is None or self.segment_length_m is None or self.last_endpoint_nodes is None:
@@ -1929,72 +1346,12 @@ class CableParticleFilter:
             tolerance_m=float(getattr(self.config, "endpoint_constraint_tolerance_m", 1e-4)),
         )
 
-    def _associate_visible_points(self, measurement_points, candidate_nodes=None):
-        if self.last_measurement_nodes_from_prediction and candidate_nodes is not None:
-            reference_nodes = valid_points(candidate_nodes)
-        else:
-            reference_nodes = self._estimate_nodes() if self.initialized else None
-        if reference_nodes is None:
-            visible_segments = np.ones(self.segment_count, dtype=bool)
-            return measurement_points, None, visible_segments
-
-        associated = associate_points_to_reference(
-            measurement_points,
-            reference_nodes,
-            self.segment_count,
-            gate=float(self.config.occlusion_assignment_max_distance_m),
-            min_measurement_points=int(self.config.min_measurement_points),
-            min_segment_points=int(self.config.min_segment_points),
-        )
-        if associated[0] is not None:
-            return associated
-
-        if candidate_nodes is not None:
-            associated = associate_points_to_reference(
-                measurement_points,
-                candidate_nodes,
-                self.segment_count,
-                gate=float(self.config.occlusion_assignment_max_distance_m),
-                min_measurement_points=int(self.config.min_measurement_points),
-                min_segment_points=int(self.config.min_segment_points),
-            )
-            if associated[0] is not None:
-                return associated
-
-        visible_segments = np.zeros(self.segment_count, dtype=bool)
-        return None, None, visible_segments
-
     def _set_visibility(self, visible_segments):
         visible_segments = np.asarray(visible_segments, dtype=bool).reshape(-1)
         if len(visible_segments) != self.segment_count:
             visible_segments = np.zeros(self.segment_count, dtype=bool)
         self.last_visible_segments = visible_segments.copy()
         self.last_visible_nodes = node_visibility_from_segments(visible_segments, self.node_count)
-
-    def _prediction_only_after_update_drop(self):
-        self.lost_frames += 1
-        self._set_visibility(np.zeros(self.segment_count, dtype=bool))
-        if self.lost_frames > int(self.config.max_prediction_frames):
-            self.initialized = False
-            return None
-        result = self._estimate(measurement_used=False, prediction_only=True)
-        self._maybe_resample(force=self.lost_frames > 1 and not self._velocity_enabled(), noise_scale=self.last_motion_noise_scale)
-        return result
-
-    def _systematic_resample(self):
-        if self.cuda_state:
-            count = len(self.weights)
-            with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
-                offset = torch.rand((), dtype=torch.float32, device=self.device, generator=self.torch_generator)
-                positions = (offset + torch.arange(count, dtype=torch.float32, device=self.device)) / count
-                cumulative = torch.cumsum(self.weights, dim=0)
-                cumulative[-1] = 1.0
-                return torch.searchsorted(cumulative, positions, right=False)
-        count = len(self.weights)
-        positions = (self.rng.random() + np.arange(count)) / count
-        cumulative = np.cumsum(self.weights)
-        cumulative[-1] = 1.0
-        return np.searchsorted(cumulative, positions, side="left")
 
     def _effective_sample_size(self):
         if self.cuda_state:
@@ -2004,52 +1361,428 @@ class CableParticleFilter:
         return float(1.0 / max(np.sum(self.weights * self.weights), 1e-12))
 
 
-def associate_points_to_reference(
+def update_cable_particle_filters(particle_filters, measurements, dt=1.0 / 30.0, count_lost=True):
+    """Advance one or more cable PFs with one shared posterior-consensus update.
+
+    Prediction is performed independently because each cable has its own
+    endpoints and dynamics. Measurement ownership is deliberately coupled:
+    the shared semantic cable cloud is evaluated against all active predicted
+    populations before any filter receives a likelihood update.
+    """
+
+    filters = list(particle_filters or ())
+    observations = list(measurements or ())
+    if len(filters) != len(observations):
+        raise ValueError("particle_filters and measurements must have the same length.")
+    if not filters:
+        return []
+
+    cuda_filters = [particle_filter for particle_filter in filters if particle_filter.cuda_state]
+    if cuda_filters:
+        if len(cuda_filters) != len(filters):
+            raise RuntimeError("A coupled PF update cannot mix CPU and CUDA filter states.")
+        shared_stream = cuda_filters[0].cuda_stream
+        for particle_filter in cuda_filters[1:]:
+            particle_filter.cuda_stream = shared_stream
+
+    contexts = [
+        particle_filter._prepare_update(observation, dt=dt, count_lost=count_lost)
+        for particle_filter, observation in zip(filters, observations)
+    ]
+    active_indices = [
+        index
+        for index, context in enumerate(contexts)
+        if context.measurement_used and filters[index].initialized
+    ]
+    if active_indices:
+        shared_points = contexts[active_indices[0]].measurement_points
+        ownership_indices = [
+            index
+            for index, particle_filter in enumerate(filters)
+            if particle_filter.initialized
+        ]
+        ownership_filters = [filters[index] for index in ownership_indices]
+        update_mask = [index in active_indices for index in ownership_indices]
+        stage_start = time.perf_counter()
+        posterior_consensus_measurement_update(
+            ownership_filters,
+            shared_points,
+            update_mask=update_mask,
+        )
+        for index in active_indices:
+            particle_filter = filters[index]
+            particle_filter._record_stage("consensus", stage_start)
+
+    results = []
+    for particle_filter, context in zip(filters, contexts):
+        if not particle_filter.initialized:
+            results.append(None)
+            continue
+        stage_start = time.perf_counter()
+        if context.measurement_used:
+            nodes = particle_filter._estimate_nodes()
+            update_posterior_velocity(particle_filter, nodes, context.dt, measurement_used=True)
+            particle_filter.lost_frames = 0
+            result = particle_filter._estimate(measurement_used=True, prediction_only=False)
+        else:
+            result = particle_filter._estimate(measurement_used=False, prediction_only=True)
+            if result is not None:
+                update_posterior_velocity(
+                    particle_filter,
+                    result.points_xyz,
+                    context.dt,
+                    measurement_used=False,
+                )
+        particle_filter._record_stage("estimate", stage_start)
+        if result is not None:
+            result.stage_seconds = particle_filter._resolved_stage_seconds()
+        results.append(result)
+    return results
+
+
+def posterior_consensus_measurement_update(
+    particle_filters,
     measurement_points,
-    reference_nodes,
-    segment_count,
-    gate,
-    min_measurement_points,
-    min_segment_points,
+    update_mask=None,
 ):
-    reference_nodes = valid_points(reference_nodes)
-    if len(reference_nodes) < 2:
-        visible_segments = np.zeros(int(segment_count), dtype=bool)
-        return None, None, visible_segments
+    """Partition shared support and update selected PF populations.
 
-    measurement_points = valid_points(measurement_points)
-    if len(measurement_points) == 0:
-        visible_segments = np.zeros(int(segment_count), dtype=bool)
-        return None, None, visible_segments
-
-    segment_indices, distances = assign_points_to_nearest_segments(measurement_points, reference_nodes)
-    gate = float(gate)
-    if gate > 0.0:
-        keep = distances <= gate
+    Every supplied population participates in the ownership denominator.  This
+    includes prediction-only cables during short occlusions, which prevents a
+    visible cable from absorbing support that remains geometrically compatible
+    with the occluded cable.  ``update_mask`` controls which populations receive
+    a measurement likelihood; omitted means that all populations are updated.
+    """
+    filters = list(particle_filters or ())
+    points = valid_points(measurement_points)
+    if not filters or len(points) == 0:
+        return
+    if update_mask is None:
+        update_mask = [True] * len(filters)
     else:
-        keep = np.ones(len(distances), dtype=bool)
+        update_mask = [bool(value) for value in update_mask]
+        if len(update_mask) != len(filters):
+            raise ValueError("update_mask must match particle_filters.")
+    if all(particle_filter.cuda_state for particle_filter in filters):
+        _posterior_consensus_measurement_update_cuda(filters, points, update_mask)
+        return
+    if any(particle_filter.cuda_state for particle_filter in filters):
+        raise RuntimeError("Posterior consensus requires all filter states on one backend.")
+    _posterior_consensus_measurement_update_cpu(filters, points, update_mask)
 
-    if int(np.count_nonzero(keep)) < int(min_measurement_points):
-        visible_segments = np.zeros(int(segment_count), dtype=bool)
-        return None, None, visible_segments
 
-    segment_indices = segment_indices[keep]
-    measurement_points = measurement_points[keep]
-    visible_segments = segment_visibility(
-        segment_indices,
-        int(segment_count),
-        min_points=int(min_segment_points),
+def _posterior_consensus_measurement_update_cuda(filters, points, update_mask):
+    stream = filters[0].cuda_stream
+    device = filters[0].device
+    particle_count = len(filters[0].particles)
+    node_count = filters[0].node_count
+    if any(len(item.particles) != particle_count or item.node_count != node_count for item in filters):
+        raise ValueError("Coupled CUDA filters must use equal particle and node counts.")
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        points_t = torch.as_tensor(points, dtype=torch.float32, device=device).contiguous()
+        particles_t = torch.stack([item.particles for item in filters], dim=0).contiguous()
+        weights_t = torch.stack([item.weights for item in filters], dim=0).contiguous()
+        squared_t, nearest_t = particle_point_distances_cuda(particles_t, points_t, stream)
+
+        ownership_sigma = max(
+            1e-5,
+            float(np.mean([item.config.measurement_node_std_m for item in filters])),
+        )
+        compatibility_t = torch.sum(
+            weights_t[:, :, None]
+            * torch.exp(-0.5 * squared_t / (ownership_sigma * ownership_sigma)),
+            dim=1,
+        )
+        outlier_prior = float(np.clip(
+            np.mean([item.config.ownership_outlier_prior for item in filters]),
+            1e-4,
+            0.95,
+        ))
+        cable_prior = (1.0 - outlier_prior) / float(len(filters))
+        outlier_component = outlier_prior * max(
+            1e-6,
+            float(np.mean([item.config.ownership_outlier_likelihood for item in filters])),
+        )
+        cable_components_t = cable_prior * compatibility_t
+        denominator_t = torch.sum(cable_components_t, dim=0) + outlier_component
+        responsibilities_t = cable_components_t / denominator_t.clamp_min(1e-12)
+        responsibility_floor = max(
+            0.0,
+            float(np.mean([item.config.ownership_min_responsibility for item in filters])),
+        )
+        if responsibility_floor > 0.0:
+            responsibilities_t = torch.clamp_min(responsibilities_t, responsibility_floor)
+            normalizer_t = torch.sum(responsibilities_t, dim=0) + outlier_component / denominator_t.clamp_min(1e-12)
+            responsibilities_t = responsibilities_t / normalizer_t.clamp_min(1e-12)
+        outlier_responsibility_t = torch.clamp(
+            1.0 - torch.sum(responsibilities_t, dim=0),
+            min=0.0,
+            max=1.0,
+        )
+        assignment_probabilities_t = torch.cat(
+            (responsibilities_t, outlier_responsibility_t[None, :]),
+            dim=0,
+        )
+        entropy_t = -torch.sum(
+            assignment_probabilities_t * torch.log(assignment_probabilities_t.clamp_min(1e-12)),
+            dim=0,
+        ) / np.log(float(len(filters) + 1))
+
+        for cable_index, particle_filter in enumerate(filters):
+            if not update_mask[cable_index]:
+                continue
+            responsibility_t = responsibilities_t[cable_index]
+            robust_distance = max(
+                float(particle_filter.config.robust_distance_m),
+                float(particle_filter.config.measurement_node_std_m),
+            )
+            robust_squared_t = torch.clamp(
+                squared_t[cable_index],
+                max=robust_distance * robust_distance,
+            )
+            responsibility_sum_t = torch.sum(responsibility_t).clamp_min(1e-6)
+            scores_t = torch.sum(
+                robust_squared_t * responsibility_t[None, :],
+                dim=1,
+            ) / responsibility_sum_t
+            scores_t = scores_t + posterior_coverage_penalty_torch(
+                nearest_t[cable_index].to(torch.int64),
+                responsibility_t,
+                particle_filter.segment_count,
+                particle_filter.config.coverage_penalty_m,
+                particle_filter.config.coverage_min_fraction,
+            )
+            if float(particle_filter.config.bend_penalty_m) > 0.0:
+                segment = particle_filter.particles[:, 1:, :] - particle_filter.particles[:, :-1, :]
+                directions = normalize_vectors_torch(segment)
+                dots = torch.sum(directions[:, :-1, :] * directions[:, 1:, :], dim=2).clamp(-1.0, 1.0)
+                bend = torch.mean(torch.clamp(1.0 - dots, min=0.0), dim=1)
+                scores_t = scores_t + bend * float(particle_filter.config.bend_penalty_m) ** 2
+            sigma = max(float(particle_filter.config.measurement_node_std_m), 1e-5)
+            log_weights_t = torch.log(particle_filter.weights.clamp_min(1e-20)) - 0.5 * scores_t / (sigma * sigma)
+            endpoint_residual_t = torch.maximum(
+                torch.linalg.vector_norm(
+                    particle_filter.particles[:, 0, :] - particle_filter.last_endpoint_nodes_t[0][None, :],
+                    dim=1,
+                ),
+                torch.linalg.vector_norm(
+                    particle_filter.particles[:, -1, :] - particle_filter.last_endpoint_nodes_t[-1][None, :],
+                    dim=1,
+                ),
+            )
+            valid_t = endpoint_residual_t <= max(
+                float(particle_filter.config.endpoint_constraint_tolerance_m),
+                1e-7,
+            )
+            finite_log_weights_t = torch.where(valid_t, log_weights_t, torch.full_like(log_weights_t, -torch.inf))
+            maximum_t = torch.max(finite_log_weights_t)
+            unnormalized_t = torch.where(
+                valid_t,
+                torch.exp(finite_log_weights_t - maximum_t),
+                torch.zeros_like(finite_log_weights_t),
+            )
+            total_t = torch.sum(unnormalized_t)
+            valid_uniform_t = valid_t.to(torch.float32) / valid_t.to(torch.float32).sum().clamp_min(1.0)
+            fallback_t = torch.where(
+                torch.any(valid_t),
+                valid_uniform_t,
+                torch.full_like(valid_uniform_t, 1.0 / len(valid_uniform_t)),
+            )
+            particle_filter.weights = torch.where(
+                torch.isfinite(total_t) & (total_t > 1e-20),
+                unnormalized_t / total_t.clamp_min(1e-20),
+                fallback_t,
+            )
+            particle_filter._invalidate_estimate_cache()
+
+            map_index_t = torch.argmax(particle_filter.weights)
+            map_nearest_t = nearest_t[cable_index, map_index_t].to(torch.int64)
+            map_distance_t = torch.sqrt(torch.clamp_min(squared_t[cable_index, map_index_t], 0.0))
+            gate = float(particle_filter.config.occlusion_assignment_max_distance_m)
+            support_weights_t = torch.where(
+                map_distance_t <= gate,
+                responsibility_t,
+                torch.zeros_like(responsibility_t),
+            )
+            segment_support_t = torch.zeros(
+                particle_filter.segment_count,
+                dtype=torch.float32,
+                device=device,
+            )
+            segment_support_t.scatter_add_(0, map_nearest_t, support_weights_t)
+            required = (
+                max(1, int(particle_filter.config.min_segment_points))
+                * float(particle_filter.config.ownership_visibility_threshold)
+            )
+            visible_t = segment_support_t >= required
+            particle_filter._set_visibility(visible_t.cpu().numpy().astype(bool, copy=False))
+            particle_filter.last_mean_ownership_responsibility = float(torch.mean(responsibility_t).item())
+            particle_filter.last_ownership_effective_point_count = float(responsibility_sum_t.item())
+            particle_filter.last_ownership_entropy = float(torch.mean(entropy_t).item())
+
+
+def _posterior_consensus_measurement_update_cpu(filters, points, update_mask):
+    squared_by_cable = []
+    nearest_by_cable = []
+    compatibility = []
+    for particle_filter in filters:
+        all_squared = point_to_particle_segment_squared_distances(
+            points,
+            particle_filter.particles[:, :-1, :],
+            particle_filter.particles[:, 1:, :],
+        )
+        squared = np.min(all_squared, axis=1)
+        nearest = np.argmin(all_squared, axis=1)
+        squared_by_cable.append(squared)
+        nearest_by_cable.append(nearest)
+        sigma = max(float(particle_filter.config.measurement_node_std_m), 1e-5)
+        compatibility.append(np.sum(
+            particle_filter.weights[:, None] * np.exp(-0.5 * squared / (sigma * sigma)),
+            axis=0,
+        ))
+    compatibility = np.asarray(compatibility, dtype=np.float64)
+    outlier_prior = float(np.clip(np.mean([item.config.ownership_outlier_prior for item in filters]), 1e-4, 0.95))
+    cable_prior = (1.0 - outlier_prior) / float(len(filters))
+    outlier_component = outlier_prior * max(
+        1e-6,
+        float(np.mean([item.config.ownership_outlier_likelihood for item in filters])),
     )
-    return measurement_points, segment_indices, visible_segments
+    components = cable_prior * compatibility
+    denominator = np.sum(components, axis=0) + outlier_component
+    responsibilities = components / np.maximum(denominator[None, :], 1e-12)
+    floor = max(0.0, float(np.mean([item.config.ownership_min_responsibility for item in filters])))
+    if floor > 0.0:
+        responsibilities = np.maximum(responsibilities, floor)
+        outlier_responsibility = outlier_component / np.maximum(denominator, 1e-12)
+        responsibilities /= np.maximum(np.sum(responsibilities, axis=0) + outlier_responsibility, 1e-12)
+    outlier_responsibility = np.clip(1.0 - np.sum(responsibilities, axis=0), 0.0, 1.0)
+    assignment = np.concatenate((responsibilities, outlier_responsibility[None, :]), axis=0)
+    entropy = -np.sum(assignment * np.log(np.maximum(assignment, 1e-12)), axis=0) / np.log(float(len(filters) + 1))
+
+    for cable_index, particle_filter in enumerate(filters):
+        if not update_mask[cable_index]:
+            continue
+        responsibility = responsibilities[cable_index]
+        robust_distance = max(
+            float(particle_filter.config.robust_distance_m),
+            float(particle_filter.config.measurement_node_std_m),
+        )
+        robust_squared = np.minimum(squared_by_cable[cable_index], robust_distance * robust_distance)
+        responsibility_sum = max(float(np.sum(responsibility)), 1e-6)
+        scores = np.sum(robust_squared * responsibility[None, :], axis=1) / responsibility_sum
+        scores += posterior_coverage_penalty(
+            nearest_by_cable[cable_index],
+            responsibility,
+            particle_filter.segment_count,
+            particle_filter.config.coverage_penalty_m,
+            particle_filter.config.coverage_min_fraction,
+        )
+        if float(particle_filter.config.bend_penalty_m) > 0.0:
+            scores += particle_bend_penalty(
+                particle_filter.particles,
+                penalty_m=float(particle_filter.config.bend_penalty_m),
+            )
+        sigma = max(float(particle_filter.config.measurement_node_std_m), 1e-5)
+        log_weights = np.log(np.maximum(particle_filter.weights, 1e-20)) - 0.5 * scores / (sigma * sigma)
+        endpoint_residual = np.maximum(
+            np.linalg.norm(particle_filter.particles[:, 0, :] - particle_filter.last_endpoint_nodes[0][None, :], axis=1),
+            np.linalg.norm(particle_filter.particles[:, -1, :] - particle_filter.last_endpoint_nodes[-1][None, :], axis=1),
+        )
+        valid = endpoint_residual <= max(float(particle_filter.config.endpoint_constraint_tolerance_m), 1e-7)
+        if np.any(valid):
+            log_weights[~valid] = -np.inf
+            log_weights -= float(np.max(log_weights[valid]))
+            particle_filter.weights = np.where(valid, np.exp(log_weights), 0.0)
+            particle_filter.weights /= max(float(np.sum(particle_filter.weights)), 1e-12)
+        else:
+            particle_filter.weights.fill(1.0 / len(particle_filter.weights))
+        particle_filter._invalidate_estimate_cache()
+
+        map_index = int(np.argmax(particle_filter.weights))
+        map_nearest = nearest_by_cable[cable_index][map_index]
+        map_distance = np.sqrt(np.maximum(squared_by_cable[cable_index][map_index], 0.0))
+        support_weights = np.where(
+            map_distance <= float(particle_filter.config.occlusion_assignment_max_distance_m),
+            responsibility,
+            0.0,
+        )
+        segment_support = np.bincount(
+            map_nearest,
+            weights=support_weights,
+            minlength=particle_filter.segment_count,
+        )
+        required = (
+            max(1, int(particle_filter.config.min_segment_points))
+            * float(particle_filter.config.ownership_visibility_threshold)
+        )
+        particle_filter._set_visibility(segment_support >= required)
+        particle_filter.last_mean_ownership_responsibility = float(np.mean(responsibility))
+        particle_filter.last_ownership_effective_point_count = responsibility_sum
+        particle_filter.last_ownership_entropy = float(np.mean(entropy))
 
 
-def points_near_polyline_mask(points, nodes, distance_m):
-    points = valid_points(points)
-    nodes = valid_points(nodes)
-    if len(points) == 0 or len(nodes) < 2:
-        return np.zeros(len(points), dtype=bool)
-    _segments, distances = assign_points_to_nearest_segments(points, nodes)
-    return np.asarray(distances <= float(distance_m), dtype=bool)
+def posterior_coverage_penalty_torch(
+    nearest_segments_t,
+    responsibility_t,
+    segment_count,
+    penalty_m,
+    min_fraction,
+):
+    if float(penalty_m) <= 0.0 or int(segment_count) <= 0:
+        return torch.zeros(nearest_segments_t.shape[0], dtype=torch.float32, device=nearest_segments_t.device)
+    coverage_t = torch.zeros(
+        (nearest_segments_t.shape[0], int(segment_count)),
+        dtype=torch.float32,
+        device=nearest_segments_t.device,
+    )
+    coverage_t.scatter_add_(
+        1,
+        nearest_segments_t,
+        responsibility_t[None, :].expand(nearest_segments_t.shape[0], -1),
+    )
+    required = torch.sum(responsibility_t) * float(np.clip(min_fraction, 0.0, 1.0))
+    missing = torch.sum((coverage_t < required).to(torch.float32), dim=1)
+    return missing * float(penalty_m) * float(penalty_m)
+
+
+def posterior_coverage_penalty(nearest_segments, responsibility, segment_count, penalty_m, min_fraction):
+    if float(penalty_m) <= 0.0 or int(segment_count) <= 0:
+        return np.zeros(nearest_segments.shape[0], dtype=np.float64)
+    output = np.zeros(nearest_segments.shape[0], dtype=np.float64)
+    required = float(np.sum(responsibility)) * float(np.clip(min_fraction, 0.0, 1.0))
+    for particle_index, indices in enumerate(nearest_segments):
+        coverage = np.bincount(indices, weights=responsibility, minlength=int(segment_count))
+        output[particle_index] = np.count_nonzero(coverage < required) * float(penalty_m) ** 2
+    return output
+
+
+def update_posterior_velocity(particle_filter, nodes, dt, measurement_used):
+    nodes = np.asarray(nodes, dtype=np.float32)
+    previous = valid_points(particle_filter.last_posterior_nodes)
+    if measurement_used and particle_filter._velocity_enabled() and previous.shape == nodes.shape:
+        observed_velocity = clip_vector_norms(
+            (nodes - previous) / max(float(dt), 1e-3),
+            float(particle_filter.config.max_node_speed_mps),
+        )
+        blend = float(np.clip(particle_filter.config.velocity_measurement_blend, 0.0, 1.0))
+        if particle_filter.cuda_state:
+            with torch.inference_mode(), torch.cuda.stream(particle_filter.cuda_stream):
+                particle_filter._ensure_velocity_array()
+                observed_t = torch.as_tensor(observed_velocity, dtype=torch.float32, device=particle_filter.device)
+                particle_filter.node_velocities.mul_(1.0 - blend).add_(observed_t[None, :, :] * blend)
+                particle_filter.node_velocities = clip_vector_norms_torch(
+                    particle_filter.node_velocities,
+                    particle_filter.config.max_node_speed_mps,
+                )
+        else:
+            particle_filter._ensure_velocity_array()
+            particle_filter.node_velocities *= 1.0 - blend
+            particle_filter.node_velocities += blend * observed_velocity[None, :, :]
+            particle_filter.node_velocities = clip_vector_norms(
+                particle_filter.node_velocities,
+                particle_filter.config.max_node_speed_mps,
+            )
+    particle_filter.last_posterior_nodes = np.ascontiguousarray(nodes, dtype=np.float32)
 
 
 def filtered_cable_estimate(measurement, result):
@@ -2076,313 +1809,6 @@ def filtered_cable_estimate(measurement, result):
 def fixed_segment_length_from_config(config):
     length = float(getattr(config, "segment_length_m", 0.0))
     return length if length > 0.0 else None
-
-
-def fit_reference_ordered_point_cloud_chain(
-    points_xyz,
-    reference_nodes,
-    segment_count=12,
-    gate_m=0.08,
-    min_points=12,
-):
-    points = valid_points(points_xyz)
-    reference = valid_points(reference_nodes)
-    if len(points) < 2 or len(reference) < 2:
-        return None
-
-    _segment_indices, distances, arclength = assign_points_to_reference_arclength(points, reference)
-    if len(distances) != len(points):
-        return None
-
-    keep = np.isfinite(distances) & np.isfinite(arclength)
-    gate_m = float(gate_m)
-    if gate_m > 0.0:
-        keep &= distances <= gate_m
-    if int(np.count_nonzero(keep)) < max(2, int(min_points)):
-        return None
-
-    centerline = binned_centerline_from_ordered_points(
-        points[keep],
-        arclength[keep],
-        segment_count=segment_count,
-    )
-    if centerline is None or len(centerline) < 2:
-        return None
-
-    nodes = fit_polyline_segments(centerline, segment_count=segment_count)
-    if nodes is None:
-        return None
-    return align_polyline_orientation(reference, nodes)
-
-
-def fit_unordered_point_cloud_chain(
-    points_xyz,
-    segment_count=12,
-    endpoint_ordering=True,
-    max_points=768,
-    knn=10,
-):
-    points = valid_points(points_xyz)
-    if len(points) < 2:
-        return None
-
-    if bool(endpoint_ordering):
-        nodes = fit_endpoint_ordered_point_cloud_chain(
-            points,
-            segment_count=segment_count,
-            max_points=max_points,
-            knn=knn,
-        )
-        if nodes is not None:
-            return nodes
-
-    return fit_pca_binned_point_cloud_chain(points, segment_count=segment_count)
-
-
-def fit_endpoint_ordered_point_cloud_chain(points_xyz, segment_count=12, max_points=768, knn=10):
-    points = valid_points(points_xyz)
-    if len(points) < 2:
-        return None
-
-    max_points = max(max(64, int(segment_count) * 16), int(max_points))
-    points = sample_points(points, max_points)
-    if len(points) < 2:
-        return None
-
-    neighbors, weights = knn_graph(points, k=knn)
-    if not neighbors:
-        return None
-
-    start_hint, end_hint = pca_endpoint_hints(points)
-    dist0, _parents0 = dijkstra_graph(neighbors, weights, start_hint)
-    start = farthest_reachable_index(dist0)
-    if start < 0:
-        start = int(start_hint)
-    dist1, parents1 = dijkstra_graph(neighbors, weights, start)
-    end = farthest_reachable_index(dist1)
-    if end < 0 or end == start:
-        end = int(end_hint)
-
-    path_indices = reconstruct_index_path(parents1, start, end)
-    if len(path_indices) < 2:
-        return None
-
-    path_points = points[np.asarray(path_indices, dtype=np.int64)]
-    path_points = remove_large_centerline_jumps(path_points)
-    path_points = smooth_centerline_points(path_points)
-    if len(path_points) < 2:
-        return None
-    return fit_polyline_segments(path_points, segment_count=segment_count)
-
-
-def fit_pca_binned_point_cloud_chain(points_xyz, segment_count=12):
-    points = valid_points(points_xyz)
-    if len(points) < 2:
-        return None
-
-    points = sample_points(points, max(256, int(segment_count) * 96))
-    center = np.mean(points, axis=0)
-    centered = points - center[None, :]
-    try:
-        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
-        axis = vh[0]
-    except np.linalg.LinAlgError:
-        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    axis_norm = float(np.linalg.norm(axis))
-    if not np.isfinite(axis_norm) or axis_norm <= 1e-12:
-        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    else:
-        axis = axis / axis_norm
-
-    projection = centered @ axis
-    order = np.argsort(projection)
-    ordered_points = points[order]
-    ordered_projection = projection[order]
-    centerline = binned_centerline_from_ordered_points(
-        ordered_points,
-        ordered_projection,
-        segment_count=segment_count,
-    )
-    if centerline is None or len(centerline) < 2:
-        return None
-    return fit_polyline_segments(centerline, segment_count=segment_count)
-
-
-def pca_endpoint_hints(points):
-    points = valid_points(points)
-    if len(points) < 2:
-        return 0, 0
-    centered = points - np.mean(points, axis=0, keepdims=True)
-    try:
-        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
-        axis = vh[0]
-    except np.linalg.LinAlgError:
-        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    projection = centered @ axis
-    return int(np.argmin(projection)), int(np.argmax(projection))
-
-
-def knn_graph(points, k=10):
-    points = valid_points(points)
-    count = len(points)
-    if count < 2:
-        return [], []
-
-    k = int(np.clip(int(k), 1, max(1, count - 1)))
-    deltas = points[:, None, :] - points[None, :, :]
-    squared = np.sum(deltas * deltas, axis=2)
-    np.fill_diagonal(squared, np.inf)
-    neighbor_idx = np.argpartition(squared, kth=k - 1, axis=1)[:, :k]
-
-    adjacency = [dict() for _ in range(count)]
-    for index in range(count):
-        for neighbor in neighbor_idx[index]:
-            neighbor = int(neighbor)
-            weight = float(np.sqrt(squared[index, neighbor]))
-            if not np.isfinite(weight):
-                continue
-            current = adjacency[index].get(neighbor)
-            if current is None or weight < current:
-                adjacency[index][neighbor] = weight
-                adjacency[neighbor][index] = weight
-
-    neighbors = []
-    weights = []
-    for item in adjacency:
-        ordered = sorted(item.items(), key=lambda pair: pair[1])
-        neighbors.append([int(index) for index, _weight in ordered])
-        weights.append([float(weight) for _index, weight in ordered])
-    return neighbors, weights
-
-
-def dijkstra_graph(neighbors, weights, start):
-    count = len(neighbors)
-    start = int(start)
-    distances = np.full(count, np.inf, dtype=np.float64)
-    parents = np.full(count, -1, dtype=np.int64)
-    if count == 0 or start < 0 or start >= count:
-        return distances, parents
-
-    distances[start] = 0.0
-    queue = [(0.0, start)]
-    while queue:
-        distance, node = heapq.heappop(queue)
-        if distance > distances[node]:
-            continue
-        for neighbor, weight in zip(neighbors[node], weights[node]):
-            candidate = distance + float(weight)
-            if candidate < distances[neighbor]:
-                distances[neighbor] = candidate
-                parents[neighbor] = node
-                heapq.heappush(queue, (candidate, int(neighbor)))
-    return distances, parents
-
-
-def farthest_reachable_index(distances):
-    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
-    finite = np.flatnonzero(np.isfinite(distances))
-    if len(finite) == 0:
-        return -1
-    return int(finite[np.argmax(distances[finite])])
-
-
-def reconstruct_index_path(parents, start, end):
-    parents = np.asarray(parents, dtype=np.int64).reshape(-1)
-    start = int(start)
-    end = int(end)
-    if start < 0 or end < 0 or start >= len(parents) or end >= len(parents):
-        return []
-    path = [end]
-    current = end
-    seen = {end}
-    while current != start:
-        current = int(parents[current])
-        if current < 0 or current in seen:
-            return []
-        seen.add(current)
-        path.append(current)
-    path.reverse()
-    return path
-
-
-def binned_centerline_from_ordered_points(points, projection, segment_count=12):
-    points = valid_points(points)
-    projection = np.asarray(projection, dtype=np.float64).reshape(-1)
-    if len(points) < 2 or len(projection) != len(points):
-        return None
-
-    order = np.argsort(projection)
-    points = points[order]
-    projection = projection[order]
-
-    # Collapse the thick unordered cable cloud into robust slice medians before
-    # resampling. This avoids fitting a long zigzag through cable-mask thickness
-    # and ZED depth jitter.
-    bin_count = int(np.clip(max(int(segment_count) * 6, int(segment_count) + 1), 4, len(points)))
-    edges = np.linspace(0, len(points), bin_count + 1, dtype=np.int64)
-    centers = []
-    for start, end in zip(edges[:-1], edges[1:]):
-        if end <= start:
-            continue
-        chunk = points[start:end]
-        if len(chunk) == 0:
-            continue
-        centers.append(np.median(chunk, axis=0))
-
-    if len(centers) < 2:
-        return None
-
-    centers = np.asarray(centers, dtype=np.float64)
-    centers = remove_large_centerline_jumps(centers)
-    centers = smooth_centerline_points(centers)
-    if len(centers) < 2:
-        return None
-    return np.ascontiguousarray(centers, dtype=np.float32)
-
-
-def remove_large_centerline_jumps(points):
-    points = valid_points(points)
-    if len(points) < 3:
-        return points
-    deltas = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    finite = deltas[np.isfinite(deltas) & (deltas > 1e-9)]
-    if len(finite) == 0:
-        return points
-    median = float(np.median(finite))
-    if median <= 1e-9:
-        return points
-    keep = np.ones(len(points), dtype=bool)
-    # A single bad depth slice should not stretch the whole fixed-length chain.
-    for index, distance in enumerate(deltas):
-        if distance > 6.0 * median and 0 < index + 1 < len(points) - 1:
-            keep[index + 1] = False
-    cleaned = points[keep]
-    return cleaned if len(cleaned) >= 2 else points
-
-
-def smooth_centerline_points(points):
-    points = valid_points(points)
-    if len(points) < 5:
-        return points
-    smoothed = points.copy()
-    smoothed[1:-1] = 0.25 * points[:-2] + 0.50 * points[1:-1] + 0.25 * points[2:]
-    return smoothed
-
-
-def estimate_equal_segment_length(nodes, segment_count):
-    lengths = segment_lengths(nodes)
-    lengths = lengths[np.isfinite(lengths)]
-    if len(lengths) == 0:
-        return 0.05
-    total = float(np.sum(lengths))
-    if not np.isfinite(total) or total <= 1e-9:
-        return 0.05
-    node_points = valid_points(nodes)
-    if len(node_points) >= 2:
-        extent = float(np.linalg.norm(np.max(node_points, axis=0) - np.min(node_points, axis=0)))
-        if np.isfinite(extent) and extent > 1e-6 and total > 3.0 * extent:
-            total = 3.0 * extent
-    return total / max(1, int(segment_count))
 
 
 def project_equal_length_chain(nodes, segment_length_m, node_count=None):
@@ -2481,206 +1907,6 @@ def build_chains(starts, directions, segment_length_m):
     return np.ascontiguousarray(output, dtype=np.float64)
 
 
-def sample_noisy_chains_around_nodes(
-    nodes,
-    count,
-    segment_length_m,
-    rng,
-    node_std_m=0.020,
-    direction_std=0.080,
-    direction_smooth_passes=1,
-):
-    nodes = valid_points(nodes)
-    count = max(0, int(count))
-    if count == 0 or len(nodes) < 2:
-        return np.empty((0, 0, 3), dtype=np.float64)
-
-    directions = chain_directions(nodes)
-    starts = nodes[0][None, :] + rng.normal(0.0, max(0.0, float(node_std_m)), (count, 3))
-    noisy_directions = directions[None, :, :] + rng.normal(
-        0.0,
-        max(0.0, float(direction_std)),
-        (count, len(directions), 3),
-    )
-    noisy_directions = smooth_particle_directions(
-        normalize_vectors(noisy_directions),
-        passes=int(direction_smooth_passes),
-    )
-    return build_chains(starts, noisy_directions, float(segment_length_m))
-
-
-def sample_endpoint_ransac_chains(
-    points_xyz,
-    endpoint_nodes,
-    count,
-    segment_count,
-    segment_length_m,
-    rng,
-    subset_points=2,
-    endpoint_constraint_iterations=16,
-    endpoint_constraint_tolerance_m=1e-4,
-):
-    points = valid_points(points_xyz)
-    endpoints = valid_points(endpoint_nodes)
-    count = max(0, int(count))
-    segment_count = max(1, int(segment_count))
-    subset_points = max(1, int(subset_points))
-    segment_length = float(segment_length_m)
-    if count == 0 or len(points) == 0 or len(endpoints) < 2 or not np.isfinite(segment_length) or segment_length <= 0.0:
-        return np.empty((0, 0, 3), dtype=np.float64)
-
-    start = endpoints[0, :3]
-    end = endpoints[-1, :3]
-    chord = end - start
-    chord_norm = float(np.linalg.norm(chord))
-    if not np.isfinite(chord_norm) or chord_norm <= 1e-9:
-        return np.empty((0, 0, 3), dtype=np.float64)
-    if chord_norm > segment_count * segment_length + max(0.0, float(endpoint_constraint_tolerance_m)):
-        return np.empty((0, 0, 3), dtype=np.float64)
-    direction = chord / chord_norm
-
-    hypotheses = []
-    for _index in range(count):
-        sample_count = min(subset_points, len(points))
-        sample_indices = rng.choice(len(points), size=sample_count, replace=False)
-        anchors = points[sample_indices, :3]
-        projection = np.dot(anchors - start[None, :], direction)
-        anchors = anchors[np.argsort(projection)]
-        polyline = np.vstack([start[None, :], anchors, end[None, :]])
-        nodes = fit_polyline_segments(polyline, segment_count=segment_count)
-        if nodes is None:
-            continue
-        nodes = project_equal_length_chain(nodes, segment_length, node_count=segment_count + 1)
-        if nodes is None:
-            continue
-        nodes = constrain_chain_to_endpoints(
-            nodes,
-            endpoints,
-            segment_length,
-            iterations=int(endpoint_constraint_iterations),
-            tolerance_m=float(endpoint_constraint_tolerance_m),
-        )
-        if nodes is None:
-            continue
-        nodes = np.asarray(nodes, dtype=np.float64)
-        if nodes.shape == (segment_count + 1, 3) and np.all(np.isfinite(nodes)):
-            hypotheses.append(nodes)
-
-    if not hypotheses:
-        return np.empty((0, 0, 3), dtype=np.float64)
-    return np.ascontiguousarray(np.stack(hypotheses, axis=0), dtype=np.float64)
-
-
-def select_endpoint_ransac_inliers_torch(
-    points_xyz,
-    endpoint_nodes,
-    count,
-    segment_count,
-    segment_length_m,
-    rng,
-    subset_points=2,
-    inlier_distance=0.025,
-    min_points=24,
-    endpoint_constraint_iterations=16,
-    endpoint_constraint_tolerance_m=1e-4,
-    chunk_points=512,
-    device=None,
-    stream=None,
-):
-    if torch is None or device is None or device.type != "cuda":
-        raise RuntimeError("CUDA RANSAC requires an available CUDA PyTorch device.")
-    points = valid_points(points_xyz)
-    endpoints = valid_points(endpoint_nodes)
-    if len(points) < int(min_points) or len(endpoints) < 2:
-        return None, 0, 0.0, np.nan
-    if rng is None or stream is None:
-        raise RuntimeError("CUDA RANSAC requires a random generator and CUDA stream.")
-
-    with torch.inference_mode(), torch.cuda.stream(stream):
-        points_t = torch.as_tensor(points[:, :3], dtype=torch.float32, device=device)
-        endpoints_t = torch.as_tensor(endpoints[[0, -1], :3], dtype=torch.float32, device=device)
-        start = endpoints[0, :3]
-        direction = endpoints[-1, :3] - start
-        direction /= max(float(np.linalg.norm(direction)), 1e-12)
-        sample_count = min(max(1, int(subset_points)), len(points))
-        sample_indices = np.stack(
-            [rng.choice(len(points), size=sample_count, replace=False) for _ in range(int(count))],
-            axis=0,
-        )
-        anchors = points[sample_indices, :3]
-        projection = np.sum((anchors - start[None, None, :]) * direction[None, None, :], axis=2)
-        anchors = np.take_along_axis(anchors, np.argsort(projection, axis=1)[:, :, None], axis=1)
-        anchors_t = torch.as_tensor(np.ascontiguousarray(anchors, dtype=np.float32), device=device)
-        hypotheses_t = build_ransac_chains_cuda(
-            anchors_t,
-            endpoints_t,
-            node_count=int(segment_count) + 1,
-            segment_length_m=float(segment_length_m),
-            iterations=int(endpoint_constraint_iterations),
-            tolerance_m=float(endpoint_constraint_tolerance_m),
-            stream=stream,
-        )
-        selected_t, selected_count_t, selected_error_t = best_ransac_inliers_torch_tensor(
-            points_t,
-            hypotheses_t,
-            inlier_distance=float(inlier_distance),
-            min_points=int(min_points),
-            chunk_points=int(chunk_points),
-        )
-        if selected_t is None:
-            stream.synchronize()
-            return None, 0, 0.0, np.nan
-        selected = selected_t.cpu().numpy().astype(np.float64, copy=False)
-        selected_count = int(selected_count_t.item())
-        selected_error = float(selected_error_t.item())
-    return (
-        np.ascontiguousarray(selected, dtype=np.float64),
-        selected_count,
-        float(selected_count) / max(float(len(points)), 1.0),
-        selected_error,
-    )
-
-
-def best_ransac_inliers_torch_tensor(
-    points_t,
-    hypotheses_t,
-    inlier_distance,
-    min_points,
-    chunk_points=512,
-):
-    if hypotheses_t.ndim != 3 or int(hypotheses_t.shape[0]) == 0:
-        return None, None, None
-    starts = hypotheses_t[:, :-1, :]
-    segment = hypotheses_t[:, 1:, :] - starts
-    length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
-    threshold_sq = float(inlier_distance) ** 2
-    best_chunks = []
-    for start_index in range(0, int(points_t.shape[0]), max(1, int(chunk_points))):
-        chunk = points_t[start_index : start_index + max(1, int(chunk_points))]
-        point_delta = chunk[None, None, :, :] - starts[:, :, None, :]
-        position = torch.sum(point_delta * segment[:, :, None, :], dim=3) / length_sq[:, :, None]
-        position = torch.clamp(position, 0.0, 1.0)
-        projection = starts[:, :, None, :] + position[:, :, :, None] * segment[:, :, None, :]
-        squared = torch.sum((chunk[None, None, :, :] - projection) ** 2, dim=3)
-        best_chunks.append(torch.amin(squared, dim=1))
-    point_squared = torch.cat(best_chunks, dim=1)
-    inliers = point_squared <= threshold_sq
-    counts = torch.count_nonzero(inliers, dim=1)
-    sums = torch.sum(torch.where(inliers, point_squared, torch.zeros_like(point_squared)), dim=1)
-    valid = counts >= max(2, int(min_points))
-    if not bool(torch.any(valid).item()):
-        return None, None, None
-
-    best_count = torch.max(counts[valid])
-    candidates = valid & (counts == best_count)
-    ranked_sums = torch.where(candidates, sums, torch.full_like(sums, torch.inf))
-    best_index = torch.argmin(ranked_sums)
-    keep = inliers[best_index]
-    selected_count = counts[best_index]
-    error_m = torch.sqrt(sums[best_index] / selected_count.to(sums.dtype).clamp_min(1.0))
-    return points_t[keep], selected_count, error_m
-
-
 def normalize_vectors_torch(vectors_t):
     norms = torch.linalg.vector_norm(vectors_t, dim=-1, keepdim=True)
     normalized = vectors_t / norms.clamp_min(1e-12)
@@ -2709,41 +1935,421 @@ def build_chains_torch(starts_t, directions_t, segment_length_m):
     return starts_t[:, None, :] + torch.cat((zero, offsets), dim=1)
 
 
-def sample_global_random_chains(
+def clip_vector_norms_torch(vectors_t, max_norm):
+    max_norm = max(0.0, float(max_norm))
+    if max_norm <= 0.0:
+        return torch.zeros_like(vectors_t)
+    norms = torch.linalg.vector_norm(vectors_t, dim=-1, keepdim=True)
+    return vectors_t * torch.clamp(max_norm / norms.clamp_min(1e-12), max=1.0)
+
+
+def transition_component_count(total_count, ratio):
+    total_count = max(0, int(total_count))
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    if total_count == 0 or ratio <= 0.0:
+        return 0
+    return int(np.clip(round(total_count * ratio), 1, total_count))
+
+
+def transition_component_weights(conditioned_count, global_count, conditioned_mass):
+    conditioned_count = max(0, int(conditioned_count))
+    global_count = max(0, int(global_count))
+    conditioned_mass = float(np.clip(conditioned_mass, 0.0, 1.0))
+    values = []
+    if conditioned_count:
+        values.append(np.full(conditioned_count, conditioned_mass / conditioned_count, dtype=np.float64))
+    if global_count:
+        values.append(np.full(global_count, (1.0 - conditioned_mass) / global_count, dtype=np.float64))
+    return np.concatenate(values) if values else np.empty(0, dtype=np.float64)
+
+
+def transition_component_weights_torch(conditioned_count, global_count, conditioned_mass, device):
+    values = transition_component_weights(conditioned_count, global_count, conditioned_mass)
+    return torch.as_tensor(values, dtype=torch.float32, device=device)
+
+
+def transition_mixture_weights(
+    local_count,
+    conditioned_count,
+    global_count,
+    local_mass,
+    conditioned_mass,
+    global_mass,
+):
+    components = []
+    for count, mass in (
+        (local_count, local_mass),
+        (conditioned_count, conditioned_mass),
+        (global_count, global_mass),
+    ):
+        count = max(0, int(count))
+        if count:
+            components.append(np.full(count, max(0.0, float(mass)) / count, dtype=np.float64))
+    weights = np.concatenate(components) if components else np.empty(0, dtype=np.float64)
+    total = float(np.sum(weights))
+    if total > 0.0:
+        weights /= total
+    return weights
+
+
+def transition_mixture_weights_torch(
+    local_count,
+    conditioned_count,
+    global_count,
+    local_mass,
+    conditioned_mass,
+    global_mass,
+    device,
+):
+    return torch.as_tensor(
+        transition_mixture_weights(
+            local_count,
+            conditioned_count,
+            global_count,
+            local_mass,
+            conditioned_mass,
+            global_mass,
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def estimate_endpoint_tangents(
     points_xyz,
-    count,
-    segment_count,
-    segment_length_m,
-    rng,
-    padding_m=0.10,
-    direction_smooth_passes=1,
+    endpoint_nodes,
+    min_radius_m=0.008,
+    radius_m=0.075,
+    sigma_m=0.035,
+    min_points=8,
 ):
     points = valid_points(points_xyz)
-    count = max(0, int(count))
-    segment_count = max(1, int(segment_count))
-    if count == 0 or len(points) < 2:
-        return np.empty((0, 0, 3), dtype=np.float64)
-
-    mins = np.min(points, axis=0) - float(padding_m)
-    maxs = np.max(points, axis=0) + float(padding_m)
-    span = maxs - mins
-    min_span = max(float(segment_length_m), 1e-3)
-    tiny = span < min_span
-    if np.any(tiny):
-        center = 0.5 * (mins + maxs)
-        mins[tiny] = center[tiny] - 0.5 * min_span
-        maxs[tiny] = center[tiny] + 0.5 * min_span
-
-    starts = rng.uniform(mins, maxs, size=(count, 3))
-    directions = normalize_vectors(rng.normal(0.0, 1.0, size=(count, segment_count, 3)))
-    directions = smooth_particle_directions(
-        directions,
-        passes=int(direction_smooth_passes),
+    endpoints = valid_points(endpoint_nodes)
+    if len(endpoints) < 2:
+        return (
+            np.full((2, 3), np.nan, dtype=np.float32),
+            np.zeros(2, dtype=np.float32),
+            np.zeros(2, dtype=np.int32),
+        )
+    chord = normalize_vectors((endpoints[-1] - endpoints[0])[None, :])[0]
+    fallback = np.stack((chord, -chord), axis=0)
+    tangents = fallback.copy()
+    confidence = np.zeros(2, dtype=np.float64)
+    support_count = np.zeros(2, dtype=np.int32)
+    min_radius = max(0.0, float(min_radius_m))
+    radius = max(min_radius + 1e-6, float(radius_m))
+    sigma = max(1e-6, float(sigma_m))
+    for endpoint_index, endpoint in enumerate((endpoints[0], endpoints[-1])):
+        delta = points - endpoint[None, :]
+        distance = np.linalg.norm(delta, axis=1)
+        keep = (distance >= min_radius) & (distance <= radius)
+        count = int(np.count_nonzero(keep))
+        support_count[endpoint_index] = count
+        if count < 2:
+            continue
+        unit = delta[keep] / np.maximum(distance[keep, None], 1e-12)
+        weights = np.exp(-0.5 * (distance[keep] / sigma) ** 2)
+        scatter = np.einsum("n,ni,nj->ij", weights, unit, unit) / max(float(np.sum(weights)), 1e-12)
+        eigenvalues, eigenvectors = np.linalg.eigh(scatter)
+        tangent = eigenvectors[:, -1]
+        mean_direction = np.sum(weights[:, None] * unit, axis=0)
+        orientation = mean_direction if np.linalg.norm(mean_direction) > 1e-8 else fallback[endpoint_index]
+        if float(np.dot(tangent, orientation)) < 0.0:
+            tangent = -tangent
+        anisotropy = max(0.0, float(eigenvalues[-1] - eigenvalues[-2])) / max(float(eigenvalues[-1]), 1e-12)
+        support_factor = min(1.0, count / max(float(min_points), 1.0))
+        tangents[endpoint_index] = tangent
+        confidence[endpoint_index] = anisotropy * support_factor
+    return (
+        np.ascontiguousarray(tangents, dtype=np.float32),
+        np.ascontiguousarray(confidence, dtype=np.float32),
+        support_count,
     )
-    return build_chains(starts, directions, float(segment_length_m))
 
 
-def particle_estimate_diagnostics(average_nodes, map_nodes, top_particles):
+def estimate_endpoint_tangents_torch(
+    points_t,
+    endpoints_t,
+    min_radius_m=0.008,
+    radius_m=0.075,
+    sigma_m=0.035,
+    min_points=8,
+):
+    chord_t = normalize_vectors_torch((endpoints_t[-1] - endpoints_t[0])[None, :])[0]
+    fallback_t = torch.stack((chord_t, -chord_t), dim=0)
+    tangents = []
+    confidence = []
+    support_counts = []
+    min_radius = max(0.0, float(min_radius_m))
+    radius = max(min_radius + 1e-6, float(radius_m))
+    sigma = max(1e-6, float(sigma_m))
+    for endpoint_index in range(2):
+        delta_t = points_t - endpoints_t[endpoint_index][None, :]
+        distance_t = torch.linalg.vector_norm(delta_t, dim=1)
+        keep_t = (distance_t >= min_radius) & (distance_t <= radius)
+        support_count_t = torch.count_nonzero(keep_t)
+        support_counts.append(support_count_t)
+        unit_t = delta_t / distance_t[:, None].clamp_min(1e-12)
+        weights_t = torch.exp(-0.5 * (distance_t / sigma) ** 2) * keep_t.to(points_t.dtype)
+        scatter_t = torch.einsum("n,ni,nj->ij", weights_t, unit_t, unit_t) / weights_t.sum().clamp_min(1e-12)
+        eigenvalues_t, eigenvectors_t = torch.linalg.eigh(scatter_t)
+        tangent_t = eigenvectors_t[:, -1]
+        mean_direction_t = torch.sum(weights_t[:, None] * unit_t, dim=0)
+        orientation_t = torch.where(
+            torch.linalg.vector_norm(mean_direction_t) > 1e-8,
+            mean_direction_t,
+            fallback_t[endpoint_index],
+        )
+        tangent_t = torch.where(
+            torch.dot(tangent_t, orientation_t) < 0.0,
+            -tangent_t,
+            tangent_t,
+        )
+        anisotropy_t = torch.clamp_min(eigenvalues_t[-1] - eigenvalues_t[-2], 0.0) / eigenvalues_t[-1].clamp_min(1e-12)
+        support_factor_t = torch.clamp(support_count_t.to(points_t.dtype) / max(float(min_points), 1.0), max=1.0)
+        valid_t = support_count_t >= 2
+        tangents.append(torch.where(valid_t, tangent_t, fallback_t[endpoint_index]))
+        confidence.append(torch.where(valid_t, anisotropy_t * support_factor_t, torch.zeros_like(anisotropy_t)))
+    return (
+        torch.stack(tangents, dim=0),
+        torch.stack(confidence, dim=0),
+        torch.stack(support_counts, dim=0).to(torch.int32),
+    )
+
+
+def endpoint_tangent_bridge_nodes(endpoint_nodes, endpoint_tangents, node_count, segment_length_m):
+    endpoints = valid_points(endpoint_nodes)
+    if len(endpoints) < 2 or int(node_count) < 2:
+        return None
+    chord = endpoints[-1] - endpoints[0]
+    chord_distance = float(np.linalg.norm(chord))
+    total_length = float(segment_length_m) * (int(node_count) - 1)
+    if chord_distance > total_length + 1e-6:
+        return None
+    chord_direction = normalize_vectors(chord[None, :])[0]
+    tangents = np.asarray(endpoint_tangents, dtype=np.float64)
+    if tangents.shape != (2, 3) or not np.all(np.isfinite(tangents)):
+        tangents = np.stack((chord_direction, -chord_direction), axis=0)
+    tangents = normalize_vectors(tangents)
+    u = np.linspace(0.0, 1.0, int(node_count), dtype=np.float64)
+    h00 = 2.0 * u**3 - 3.0 * u**2 + 1.0
+    h10 = u**3 - 2.0 * u**2 + u
+    h01 = -2.0 * u**3 + 3.0 * u**2
+    h11 = u**3 - u**2
+    tangent_scale = min(total_length / 3.0, max(chord_distance / 3.0, 2.0 * float(segment_length_m)))
+    chain_end_direction = -tangents[1]
+    nodes = (
+        h00[:, None] * endpoints[0][None, :]
+        + h10[:, None] * tangent_scale * tangents[0][None, :]
+        + h01[:, None] * endpoints[-1][None, :]
+        + h11[:, None] * tangent_scale * chain_end_direction[None, :]
+    )
+    nodes = project_equal_length_chain(nodes, segment_length_m, node_count=int(node_count))
+    return constrain_chain_to_endpoints(nodes, endpoints, segment_length_m, iterations=128, tolerance_m=1e-4)
+
+
+def endpoint_conditioned_chains_torch(
+    base_particles_t,
+    endpoints_t,
+    tangents_t,
+    confidence_t,
+    segment_length_m,
+    config,
+    generator,
+    stream,
+    initialization=False,
+    slack_m=None,
+):
+    count, node_count, _ = base_particles_t.shape
+    if count == 0:
+        return base_particles_t
+    modes = max(1, int(config.endpoint_conditioned_deformation_modes))
+    u_t = torch.linspace(0.0, 1.0, node_count, dtype=torch.float32, device=base_particles_t.device)
+    mode_index_t = torch.arange(1, modes + 1, dtype=torch.float32, device=base_particles_t.device)
+    basis_t = torch.sin(np.pi * mode_index_t[:, None] * u_t[None, :]) / torch.sqrt(mode_index_t[:, None])
+    if slack_m is None:
+        total_length = float(segment_length_m) * (node_count - 1)
+        chord_distance = float(torch.linalg.vector_norm(endpoints_t[-1] - endpoints_t[0]).item())
+        slack_m = max(0.0, total_length - chord_distance)
+    deformation_std = float(config.endpoint_conditioned_deformation_std_m) + 0.35 * max(0.0, float(slack_m))
+    if initialization:
+        deformation_std *= 1.25
+    coefficients_t = torch.randn(
+        (count, modes, 3),
+        dtype=torch.float32,
+        device=base_particles_t.device,
+        generator=generator,
+    ) * deformation_std
+    offsets_t = torch.einsum("cmx,mn->cnx", coefficients_t, basis_t)
+    candidate_t = base_particles_t + offsets_t
+    candidate_t[:, 0, :] = endpoints_t[0]
+    candidate_t[:, -1, :] = endpoints_t[-1]
+    directions_t = normalize_vectors_torch(candidate_t[:, 1:, :] - candidate_t[:, :-1, :])
+    directions_t = normalize_vectors_torch(
+        directions_t
+        + torch.randn(
+            directions_t.shape,
+            dtype=torch.float32,
+            device=base_particles_t.device,
+            generator=generator,
+        ) * float(config.endpoint_conditioned_direction_std)
+    )
+    confidence_gate_t = torch.clamp(
+        (confidence_t - float(config.endpoint_tangent_min_confidence))
+        / max(1.0 - float(config.endpoint_tangent_min_confidence), 1e-6),
+        min=0.0,
+        max=1.0,
+    )
+    tangent_noise_t = torch.randn(
+        (count, 2, 3),
+        dtype=torch.float32,
+        device=base_particles_t.device,
+        generator=generator,
+    ) * float(config.endpoint_conditioned_direction_std)
+    start_t = normalize_vectors_torch(tangents_t[0][None, :] + tangent_noise_t[:, 0, :])
+    end_t = normalize_vectors_torch(-tangents_t[1][None, :] + tangent_noise_t[:, 1, :])
+    directions_t[:, 0, :] = normalize_vectors_torch(
+        (1.0 - confidence_gate_t[0]) * directions_t[:, 0, :] + confidence_gate_t[0] * start_t
+    )
+    directions_t[:, -1, :] = normalize_vectors_torch(
+        (1.0 - confidence_gate_t[1]) * directions_t[:, -1, :] + confidence_gate_t[1] * end_t
+    )
+    chains_t = build_chains_torch(
+        endpoints_t[0][None, :].expand(count, -1),
+        directions_t,
+        segment_length_m,
+    )
+    return constrain_chains_cuda(
+        chains_t,
+        endpoints_t,
+        segment_length_m,
+        int(config.endpoint_constraint_iterations),
+        float(config.endpoint_constraint_tolerance_m),
+        stream,
+    )
+
+
+def endpoint_conditioned_chains(
+    base_particles,
+    endpoints,
+    tangents,
+    confidence,
+    segment_length_m,
+    config,
+    rng,
+    initialization=False,
+):
+    base = np.asarray(base_particles, dtype=np.float64)
+    count, node_count, _ = base.shape
+    if count == 0:
+        return base
+    modes = max(1, int(config.endpoint_conditioned_deformation_modes))
+    u = np.linspace(0.0, 1.0, node_count, dtype=np.float64)
+    mode_index = np.arange(1, modes + 1, dtype=np.float64)
+    basis = np.sin(np.pi * mode_index[:, None] * u[None, :]) / np.sqrt(mode_index[:, None])
+    total_length = float(segment_length_m) * (node_count - 1)
+    chord_distance = float(np.linalg.norm(np.asarray(endpoints)[-1] - np.asarray(endpoints)[0]))
+    deformation_std = float(config.endpoint_conditioned_deformation_std_m) + 0.35 * max(0.0, total_length - chord_distance)
+    if initialization:
+        deformation_std *= 1.25
+    coefficients = rng.normal(0.0, deformation_std, (count, modes, 3))
+    candidate = base + np.einsum("cmx,mn->cnx", coefficients, basis)
+    candidate[:, 0, :] = endpoints[0]
+    candidate[:, -1, :] = endpoints[-1]
+    directions = normalize_vectors(
+        candidate[:, 1:, :] - candidate[:, :-1, :]
+        + rng.normal(0.0, float(config.endpoint_conditioned_direction_std), (count, node_count - 1, 3))
+    )
+    gate = np.clip(
+        (np.asarray(confidence) - float(config.endpoint_tangent_min_confidence))
+        / max(1.0 - float(config.endpoint_tangent_min_confidence), 1e-6),
+        0.0,
+        1.0,
+    )
+    tangent_noise = rng.normal(0.0, float(config.endpoint_conditioned_direction_std), (count, 2, 3))
+    start = normalize_vectors(np.asarray(tangents)[0][None, :] + tangent_noise[:, 0, :])
+    end = normalize_vectors(-np.asarray(tangents)[1][None, :] + tangent_noise[:, 1, :])
+    directions[:, 0, :] = normalize_vectors((1.0 - gate[0]) * directions[:, 0, :] + gate[0] * start)
+    directions[:, -1, :] = normalize_vectors((1.0 - gate[1]) * directions[:, -1, :] + gate[1] * end)
+    chains = build_chains(
+        np.repeat(np.asarray(endpoints[0])[None, :], count, axis=0),
+        directions,
+        segment_length_m,
+    )
+    return constrain_chains_to_endpoints(
+        chains,
+        endpoints,
+        segment_length_m,
+        iterations=int(config.endpoint_constraint_iterations),
+        tolerance_m=float(config.endpoint_constraint_tolerance_m),
+    )
+
+
+def global_endpoint_chains_torch(
+    count,
+    node_count,
+    endpoints_t,
+    segment_length_m,
+    config,
+    generator,
+    stream,
+):
+    count = max(0, int(count))
+    if count == 0:
+        return torch.empty((0, int(node_count), 3), dtype=torch.float32, device=endpoints_t.device)
+    directions_t = normalize_vectors_torch(torch.randn(
+        (count, int(node_count) - 1, 3),
+        dtype=torch.float32,
+        device=endpoints_t.device,
+        generator=generator,
+    ))
+    chains_t = build_chains_torch(
+        endpoints_t[0][None, :].expand(count, -1),
+        directions_t,
+        segment_length_m,
+    )
+    return constrain_chains_cuda(
+        chains_t,
+        endpoints_t,
+        segment_length_m,
+        int(config.endpoint_constraint_iterations),
+        float(config.endpoint_constraint_tolerance_m),
+        stream,
+    )
+
+
+def global_endpoint_chains(count, node_count, endpoints, segment_length_m, config, rng):
+    count = max(0, int(count))
+    if count == 0:
+        return np.empty((0, int(node_count), 3), dtype=np.float64)
+    directions = normalize_vectors(rng.normal(0.0, 1.0, (count, int(node_count) - 1, 3)))
+    chains = build_chains(
+        np.repeat(np.asarray(endpoints[0])[None, :], count, axis=0),
+        directions,
+        segment_length_m,
+    )
+    return constrain_chains_to_endpoints(
+        chains,
+        endpoints,
+        segment_length_m,
+        iterations=int(config.endpoint_constraint_iterations),
+        tolerance_m=float(config.endpoint_constraint_tolerance_m),
+    )
+
+
+def particle_estimate_diagnostics(
+    average_nodes,
+    map_nodes,
+    top_particles,
+    *,
+    endpoint_tangents=None,
+    endpoint_tangent_confidence=None,
+    endpoint_tangent_support_count=None,
+    mean_ownership_responsibility=np.nan,
+    ownership_entropy=np.nan,
+    visible_segment_fraction=np.nan,
+    endpoint_conditioned_proposal_ratio=0.0,
+):
     """Describe estimator spread without changing the particle-filter state."""
     average = np.asarray(average_nodes, dtype=np.float32)
     map_nodes = np.asarray(map_nodes, dtype=np.float32)
@@ -2770,6 +2376,24 @@ def particle_estimate_diagnostics(average_nodes, map_nodes, top_particles):
 
     map_error = float(np.mean(np.linalg.norm(map_nodes.astype(np.float64) - average, axis=1)))
     endpoint_delta = endpoint_direction_disagreement_deg(map_nodes, average)
+    tangents = np.asarray(
+        np.full((2, 3), np.nan, dtype=np.float32) if endpoint_tangents is None else endpoint_tangents,
+        dtype=np.float32,
+    )
+    if tangents.shape != (2, 3):
+        tangents = np.full((2, 3), np.nan, dtype=np.float32)
+    tangent_confidence = np.asarray(
+        np.zeros(2, dtype=np.float32) if endpoint_tangent_confidence is None else endpoint_tangent_confidence,
+        dtype=np.float32,
+    ).reshape(-1)
+    if len(tangent_confidence) != 2:
+        tangent_confidence = np.zeros(2, dtype=np.float32)
+    tangent_support = np.asarray(
+        np.zeros(2, dtype=np.int32) if endpoint_tangent_support_count is None else endpoint_tangent_support_count,
+        dtype=np.int32,
+    ).reshape(-1)
+    if len(tangent_support) != 2:
+        tangent_support = np.zeros(2, dtype=np.int32)
     return ParticleEstimateDiagnostics(
         average_points_xyz=average.copy(),
         map_points_xyz=np.ascontiguousarray(map_nodes, dtype=np.float32),
@@ -2780,6 +2404,13 @@ def particle_estimate_diagnostics(average_nodes, map_nodes, top_particles):
         mean_node_spread_m=float(np.mean(node_rms)),
         max_node_spread_m=float(np.max(node_rms)),
         endpoint_direction_delta_deg=endpoint_delta,
+        endpoint_tangents_xyz=np.ascontiguousarray(tangents, dtype=np.float32),
+        endpoint_tangent_confidence=np.ascontiguousarray(tangent_confidence, dtype=np.float32),
+        endpoint_tangent_support_count=np.ascontiguousarray(tangent_support, dtype=np.int32),
+        mean_ownership_responsibility=float(mean_ownership_responsibility),
+        ownership_entropy=float(ownership_entropy),
+        visible_segment_fraction=float(visible_segment_fraction),
+        endpoint_conditioned_proposal_ratio=float(endpoint_conditioned_proposal_ratio),
     )
 
 
@@ -2860,330 +2491,6 @@ def sample_points(points, max_points):
     return np.ascontiguousarray(points, dtype=np.float64)
 
 
-def assign_points_to_nearest_segments(points, nodes):
-    distances = point_to_all_segment_distances(points, nodes)
-    if distances.size == 0:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-    segment_indices = np.argmin(distances, axis=1).astype(np.int64)
-    best_distances = distances[np.arange(len(segment_indices)), segment_indices]
-    return segment_indices, best_distances
-
-
-def assign_points_to_reference_arclength(points, nodes):
-    points = valid_points(points)
-    nodes = valid_points(nodes)
-    if len(points) == 0 or len(nodes) < 2:
-        return (
-            np.empty(0, dtype=np.int64),
-            np.empty(0, dtype=np.float64),
-            np.empty(0, dtype=np.float64),
-        )
-
-    segment_vectors = nodes[1:] - nodes[:-1]
-    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
-    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
-    best_squared = np.full(len(points), np.inf, dtype=np.float64)
-    best_segments = np.zeros(len(points), dtype=np.int64)
-    best_arclength = np.zeros(len(points), dtype=np.float64)
-
-    for index, (start, vector, length, length_start) in enumerate(
-        zip(nodes[:-1], segment_vectors, segment_lengths, cumulative[:-1])
-    ):
-        length_sq = float(np.dot(vector, vector))
-        if length_sq <= 1e-12:
-            projection_fraction = np.zeros(len(points), dtype=np.float64)
-            projected = start[None, :]
-        else:
-            projection_fraction = np.clip(((points - start[None, :]) @ vector) / length_sq, 0.0, 1.0)
-            projected = start[None, :] + projection_fraction[:, None] * vector[None, :]
-        squared = np.sum((points - projected) ** 2, axis=1)
-        update = squared < best_squared
-        if np.any(update):
-            best_squared[update] = squared[update]
-            best_segments[update] = int(index)
-            best_arclength[update] = float(length_start) + projection_fraction[update] * float(length)
-
-    return best_segments, np.sqrt(best_squared), best_arclength
-
-
-def particle_distance_scores(
-    points,
-    particles,
-    outlier_distance=np.inf,
-    score_keep_fraction=1.0,
-    coverage_penalty_m=0.0,
-    coverage_min_fraction=0.05,
-    bend_penalty_m=0.0,
-    expected_segments=None,
-    backend="auto",
-    chunk_points=512,
-):
-    points = valid_points(points)
-    particles = valid_particles(particles)
-    if len(points) == 0 or len(particles) == 0 or particles.shape[1] < 2:
-        return np.full(len(particles), np.inf, dtype=np.float64)
-
-    torch_scores = particle_distance_scores_torch(
-        points,
-        particles,
-        outlier_distance=outlier_distance,
-        score_keep_fraction=score_keep_fraction,
-        coverage_penalty_m=coverage_penalty_m,
-        coverage_min_fraction=coverage_min_fraction,
-        bend_penalty_m=bend_penalty_m,
-        expected_segments=expected_segments,
-        backend=backend,
-        chunk_points=chunk_points,
-    )
-    if torch_scores is not None:
-        return torch_scores
-
-    all_squared_distances = point_to_particle_segment_squared_distances(points, particles[:, :-1, :3], particles[:, 1:, :3])
-    if all_squared_distances.size:
-        squared_distances = np.min(all_squared_distances, axis=1)
-        nearest_segments = np.argmin(all_squared_distances, axis=1)
-    else:
-        squared_distances = np.empty((len(particles), 0), dtype=np.float64)
-        nearest_segments = np.empty((len(particles), 0), dtype=np.int64)
-    expected_segments = expected_segment_indices(expected_segments, particles.shape[1] - 1)
-    if squared_distances.size == 0:
-        return np.full(len(particles), np.inf, dtype=np.float64)
-
-    scores = trimmed_mean_squared_values(
-        squared_distances,
-        outlier_distance=float(outlier_distance),
-        keep_fraction=float(score_keep_fraction),
-    )
-    if coverage_penalty_m > 0.0 and len(expected_segments):
-        scores = scores + segment_coverage_penalty(
-            nearest_segments,
-            expected_segments=expected_segments,
-            penalty_m=float(coverage_penalty_m),
-            min_fraction=float(coverage_min_fraction),
-        )
-    if float(bend_penalty_m) > 0.0:
-        scores = scores + particle_bend_penalty(particles, penalty_m=float(bend_penalty_m))
-    return scores
-
-
-def particle_distance_scores_torch(
-    points,
-    particles,
-    outlier_distance=np.inf,
-    score_keep_fraction=1.0,
-    coverage_penalty_m=0.0,
-    coverage_min_fraction=0.05,
-    bend_penalty_m=0.0,
-    expected_segments=None,
-    backend="auto",
-    chunk_points=512,
-):
-    device = torch_scoring_device(backend)
-    if device is None:
-        return None
-
-    try:
-        with torch.inference_mode():
-            points_t = torch.as_tensor(points[:, :3], dtype=torch.float32, device=device)
-            particles_t = torch.as_tensor(particles[:, :, :3], dtype=torch.float32, device=device)
-            scores = particle_distance_scores_torch_tensor(
-                points_t,
-                particles_t,
-                outlier_distance=outlier_distance,
-                score_keep_fraction=score_keep_fraction,
-                coverage_penalty_m=coverage_penalty_m,
-                coverage_min_fraction=coverage_min_fraction,
-                bend_penalty_m=bend_penalty_m,
-                expected_segments=expected_segments,
-                chunk_points=chunk_points,
-            )
-            return scores.detach().cpu().numpy().astype(np.float64, copy=False)
-    except RuntimeError:
-        if str(backend).strip().lower() == "cuda":
-            raise
-        if torch is not None and torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        return None
-
-
-def ransac_inlier_stats(points, hypotheses, inlier_distance, backend="auto", chunk_points=512):
-    points = valid_points(points)
-    hypotheses = valid_particles(hypotheses)
-    if len(points) == 0 or len(hypotheses) == 0 or hypotheses.shape[1] < 2:
-        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
-
-    torch_stats = ransac_inlier_stats_torch(
-        points,
-        hypotheses,
-        inlier_distance,
-        backend=backend,
-        chunk_points=chunk_points,
-    )
-    if torch_stats is not None:
-        return torch_stats
-
-    squared = point_to_particle_segment_squared_distances(points, hypotheses[:, :-1, :], hypotheses[:, 1:, :])
-    if squared.size == 0:
-        return np.zeros(len(hypotheses), dtype=np.int64), np.full(len(hypotheses), np.inf, dtype=np.float64)
-    point_squared = np.min(squared, axis=1)
-    threshold_sq = float(inlier_distance) * float(inlier_distance)
-    inliers = point_squared <= threshold_sq
-    counts = np.count_nonzero(inliers, axis=1).astype(np.int64, copy=False)
-    sums = np.sum(np.where(inliers, point_squared, 0.0), axis=1).astype(np.float64, copy=False)
-    return counts, sums
-
-
-def ransac_inlier_stats_torch(points, hypotheses, inlier_distance, backend="auto", chunk_points=512):
-    device = torch_scoring_device(backend)
-    if device is None:
-        return None
-    try:
-        with torch.inference_mode():
-            points_t = torch.as_tensor(points[:, :3], dtype=torch.float32, device=device)
-            hypotheses_t = torch.as_tensor(hypotheses[:, :, :3], dtype=torch.float32, device=device)
-            counts_t, sums_t = ransac_inlier_stats_torch_tensor(
-                points_t,
-                hypotheses_t,
-                inlier_distance,
-                chunk_points=chunk_points,
-            )
-            return (
-                counts_t.detach().cpu().numpy().astype(np.int64, copy=False),
-                sums_t.detach().cpu().numpy().astype(np.float64, copy=False),
-            )
-    except RuntimeError:
-        if str(backend).strip().lower() == "cuda":
-            raise
-        if torch is not None and torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        return None
-
-
-def ransac_inlier_stats_torch_tensor(points_t, hypotheses_t, inlier_distance, chunk_points=512):
-    if torch is None:
-        raise RuntimeError("Torch RANSAC scoring requested but torch is not available.")
-    if points_t.ndim != 2 or points_t.shape[1] < 3 or hypotheses_t.ndim != 3 or hypotheses_t.shape[1] < 2:
-        count = int(hypotheses_t.shape[0]) if hypotheses_t.ndim >= 1 else 0
-        return (
-            torch.zeros(count, dtype=torch.int64, device=hypotheses_t.device),
-            torch.full((count,), torch.inf, dtype=torch.float32, device=hypotheses_t.device),
-        )
-
-    points_t = points_t[:, :3]
-    hypotheses_t = hypotheses_t[:, :, :3]
-    starts = hypotheses_t[:, :-1, :]
-    ends = hypotheses_t[:, 1:, :]
-    segment = ends - starts
-    length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
-    threshold_sq = float(inlier_distance) * float(inlier_distance)
-    counts = torch.zeros(int(hypotheses_t.shape[0]), dtype=torch.int64, device=hypotheses_t.device)
-    sums = torch.zeros(int(hypotheses_t.shape[0]), dtype=torch.float32, device=hypotheses_t.device)
-
-    chunk_points = max(1, int(chunk_points))
-    for start_index in range(0, int(points_t.shape[0]), chunk_points):
-        chunk = points_t[start_index : start_index + chunk_points]
-        point_delta = chunk[None, None, :, :] - starts[:, :, None, :]
-        t = torch.sum(point_delta * segment[:, :, None, :], dim=3) / length_sq[:, :, None]
-        t = torch.clamp(t, 0.0, 1.0)
-        projection = starts[:, :, None, :] + t[:, :, :, None] * segment[:, :, None, :]
-        delta = chunk[None, None, :, :] - projection
-        squared = torch.sum(delta * delta, dim=3)
-        best = torch.amin(squared, dim=1)
-        inliers = best <= threshold_sq
-        counts += torch.count_nonzero(inliers, dim=1)
-        sums += torch.sum(torch.where(inliers, best, torch.zeros_like(best)), dim=1)
-    return counts, sums
-
-
-def particle_distance_scores_torch_tensor(
-    points_t,
-    particles_t,
-    outlier_distance=np.inf,
-    score_keep_fraction=1.0,
-    coverage_penalty_m=0.0,
-    coverage_min_fraction=0.05,
-    bend_penalty_m=0.0,
-    expected_segments=None,
-    chunk_points=512,
-):
-    if torch is None:
-        raise RuntimeError("Torch scoring requested but torch is not available.")
-    if points_t.ndim != 2 or points_t.shape[1] < 3 or particles_t.ndim != 3 or particles_t.shape[1] < 2:
-        return torch.full((int(particles_t.shape[0]),), torch.inf, dtype=torch.float32, device=particles_t.device)
-
-    points_t = points_t[:, :3]
-    particles_t = particles_t[:, :, :3]
-    starts = particles_t[:, :-1, :]
-    ends = particles_t[:, 1:, :]
-    segment = ends - starts
-    length_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
-
-    best_chunks = []
-    expected = expected_segment_indices(expected_segments, int(particles_t.shape[1]) - 1)
-    need_coverage = float(coverage_penalty_m) > 0.0 and len(expected) > 0
-    coverage_counts = (
-        torch.zeros((particles_t.shape[0], particles_t.shape[1] - 1), dtype=torch.float32, device=particles_t.device)
-        if need_coverage
-        else None
-    )
-    chunk_points = max(1, int(chunk_points))
-    for start_index in range(0, int(points_t.shape[0]), chunk_points):
-        chunk = points_t[start_index : start_index + chunk_points]
-        point_delta = chunk[None, None, :, :] - starts[:, :, None, :]
-        t = torch.sum(point_delta * segment[:, :, None, :], dim=3) / length_sq[:, :, None]
-        t = torch.clamp(t, 0.0, 1.0)
-        projection = starts[:, :, None, :] + t[:, :, :, None] * segment[:, :, None, :]
-        delta = chunk[None, None, :, :] - projection
-        squared = torch.sum(delta * delta, dim=3)
-        if need_coverage:
-            best, nearest = torch.min(squared, dim=1)
-            coverage_counts.scatter_add_(
-                1,
-                nearest,
-                torch.ones_like(nearest, dtype=torch.float32, device=particles_t.device),
-            )
-        else:
-            best = torch.amin(squared, dim=1)
-        best_chunks.append(best)
-
-    if not best_chunks:
-        return torch.full((int(particles_t.shape[0]),), torch.inf, dtype=torch.float32, device=particles_t.device)
-    squared_distances = torch.cat(best_chunks, dim=1)
-
-    outlier_distance = float(outlier_distance)
-    if np.isfinite(outlier_distance):
-        squared_distances = torch.clamp(squared_distances, max=outlier_distance * outlier_distance)
-    keep_fraction = float(np.clip(score_keep_fraction, 1e-6, 1.0))
-    keep_count = max(1, int(np.ceil(int(squared_distances.shape[1]) * keep_fraction)))
-    if keep_count >= int(squared_distances.shape[1]):
-        scores = torch.mean(squared_distances, dim=1)
-    else:
-        selected, _indices = torch.topk(squared_distances, keep_count, dim=1, largest=False)
-        scores = torch.mean(selected, dim=1)
-
-    if need_coverage and coverage_counts is not None:
-        required = max(1, int(np.ceil(int(points_t.shape[0]) * float(np.clip(coverage_min_fraction, 0.0, 1.0)))))
-        missing = torch.zeros(coverage_counts.shape[0], dtype=torch.float32, device=particles_t.device)
-        for segment_index in expected:
-            counts = coverage_counts[:, int(segment_index)]
-            missing = missing + (counts < required).to(torch.float32)
-        scores = scores + missing * float(coverage_penalty_m) * float(coverage_penalty_m)
-
-    if float(bend_penalty_m) > 0.0 and particles_t.shape[1] > 2:
-        directions = segment / torch.sqrt(length_sq[:, :, None])
-        dots = torch.sum(directions[:, :-1, :] * directions[:, 1:, :], dim=2).clamp(-1.0, 1.0)
-        bend = torch.mean(torch.clamp(1.0 - dots, min=0.0), dim=1)
-        scores = scores + bend * float(bend_penalty_m) * float(bend_penalty_m)
-
-    return scores
-
-
 def torch_scoring_device(backend):
     backend = str(backend or "auto").lower()
     if backend not in {"auto", "cpu", "cuda"}:
@@ -3201,49 +2508,6 @@ def torch_scoring_device(backend):
     return None
 
 
-def expected_segment_indices(expected_segments, segment_count):
-    if expected_segments is None:
-        return np.arange(int(segment_count), dtype=np.int64)
-    expected = np.asarray(expected_segments, dtype=np.int64).reshape(-1)
-    if len(expected) == 0:
-        return expected
-    return np.unique(np.clip(expected, 0, int(segment_count) - 1))
-
-
-def trimmed_mean_squared_values(squared_distances, outlier_distance=np.inf, keep_fraction=1.0):
-    squared = np.asarray(squared_distances, dtype=np.float64)
-    if squared.ndim != 2 or squared.shape[1] == 0:
-        return np.full(squared.shape[0] if squared.ndim == 2 else 0, np.inf, dtype=np.float64)
-
-    outlier_distance = float(outlier_distance)
-    if np.isfinite(outlier_distance):
-        squared = np.minimum(squared, outlier_distance * outlier_distance)
-    keep_fraction = float(np.clip(keep_fraction, 1e-6, 1.0))
-    keep_count = max(1, int(np.ceil(squared.shape[1] * keep_fraction)))
-    if keep_count >= squared.shape[1]:
-        return np.mean(squared, axis=1)
-
-    selected = np.partition(squared, keep_count - 1, axis=1)[:, :keep_count]
-    return np.mean(selected, axis=1)
-
-
-def segment_coverage_penalty(nearest_segments, expected_segments, penalty_m=0.025, min_fraction=0.05):
-    nearest_segments = np.asarray(nearest_segments, dtype=np.int64)
-    if nearest_segments.ndim != 2 or nearest_segments.shape[1] == 0:
-        return np.zeros(nearest_segments.shape[0] if nearest_segments.ndim == 2 else 0, dtype=np.float64)
-
-    expected_segments = np.asarray(expected_segments, dtype=np.int64).reshape(-1)
-    if len(expected_segments) == 0:
-        return np.zeros(nearest_segments.shape[0], dtype=np.float64)
-
-    required = max(1, int(np.ceil(nearest_segments.shape[1] * float(np.clip(min_fraction, 0.0, 1.0)))))
-    missing_counts = np.zeros(nearest_segments.shape[0], dtype=np.float64)
-    for segment_index in expected_segments:
-        counts = np.count_nonzero(nearest_segments == int(segment_index), axis=1)
-        missing_counts += counts < required
-    return missing_counts * float(penalty_m) * float(penalty_m)
-
-
 def particle_bend_penalty(particles, penalty_m=0.030):
     particles = valid_particles(particles)
     if len(particles) == 0 or particles.shape[1] < 3:
@@ -3252,18 +2516,6 @@ def particle_bend_penalty(particles, penalty_m=0.030):
     dots = np.sum(directions[:, :-1, :] * directions[:, 1:, :], axis=2)
     bend = np.mean(np.maximum(0.0, 1.0 - np.clip(dots, -1.0, 1.0)), axis=1)
     return bend * float(penalty_m) * float(penalty_m)
-
-
-def endpoint_order_penalty(particles, measurement_nodes, weight=1.0):
-    particles = valid_particles(particles)
-    nodes = valid_points(measurement_nodes)
-    if len(particles) == 0 or len(nodes) < 2:
-        return np.zeros(len(particles), dtype=np.float64)
-    start = nodes[0]
-    end = nodes[-1]
-    start_error = np.sum((particles[:, 0, :3] - start[None, :]) ** 2, axis=1)
-    end_error = np.sum((particles[:, -1, :3] - end[None, :]) ** 2, axis=1)
-    return 0.5 * float(weight) * (start_error + end_error)
 
 
 def point_to_particle_segment_squared_distances(points, starts, ends):
@@ -3283,48 +2535,11 @@ def point_to_particle_segment_squared_distances(points, starts, ends):
     return np.sum(delta * delta, axis=3)
 
 
-def point_to_all_segment_distances(points, nodes):
-    points = valid_points(points)
-    nodes = valid_points(nodes)
-    if len(points) == 0 or len(nodes) < 2:
-        return np.empty((0, 0), dtype=np.float64)
-
-    output = np.empty((len(points), len(nodes) - 1), dtype=np.float64)
-    for index, (start, end) in enumerate(zip(nodes[:-1], nodes[1:])):
-        output[:, index] = point_to_segment_distances(points, start, end)
-    return output
-
-
 def valid_particles(particles):
     particles = np.asarray(particles, dtype=np.float64)
     if particles.ndim != 3 or particles.shape[1] < 2 or particles.shape[2] < 3:
         return np.empty((0, 0, 3), dtype=np.float64)
     return np.ascontiguousarray(particles[:, :, :3], dtype=np.float64)
-
-
-def point_to_segment_distances(points, start, end):
-    points = valid_points(points)
-    start = np.asarray(start, dtype=np.float64).reshape(1, 3)
-    end = np.asarray(end, dtype=np.float64).reshape(1, 3)
-    segment = end - start
-    length_sq = float(np.sum(segment * segment))
-    if len(points) == 0:
-        return np.empty(0, dtype=np.float64)
-    if length_sq <= 1e-12:
-        return np.linalg.norm(points - start, axis=1)
-    t = np.clip(((points - start) @ segment.reshape(3)) / length_sq, 0.0, 1.0)
-    projection = start + t[:, None] * segment
-    return np.linalg.norm(points - projection, axis=1)
-
-
-def segment_visibility(segment_indices, segment_count, min_points=4):
-    segment_indices = np.asarray(segment_indices, dtype=np.int64).reshape(-1)
-    visible = np.zeros(int(segment_count), dtype=bool)
-    if len(segment_indices) == 0 or segment_count <= 0:
-        return visible
-    counts = np.bincount(np.clip(segment_indices, 0, int(segment_count) - 1), minlength=int(segment_count))
-    visible[:] = counts[: int(segment_count)] >= max(1, int(min_points))
-    return visible
 
 
 def node_visibility_from_segments(visible_segments, node_count):
@@ -3337,38 +2552,6 @@ def node_visibility_from_segments(visible_segments, node_count):
             visible_nodes[index] = True
             visible_nodes[index + 1] = True
     return visible_nodes
-
-
-def align_polyline_orientation(reference_nodes, candidate_nodes):
-    reference = np.asarray(reference_nodes, dtype=np.float64)
-    candidate = np.asarray(candidate_nodes, dtype=np.float64)
-    if reference.shape != candidate.shape:
-        return candidate
-    direct = float(np.mean(np.sum((reference - candidate) ** 2, axis=1)))
-    reversed_error = float(np.mean(np.sum((reference - candidate[::-1]) ** 2, axis=1)))
-    if reversed_error < direct:
-        return candidate[::-1].copy()
-    return candidate
-
-
-def mean_node_distance(reference_nodes, candidate_nodes):
-    reference = valid_points(reference_nodes)
-    candidate = valid_points(candidate_nodes)
-    if reference.shape != candidate.shape or len(reference) == 0:
-        return np.inf
-    distances = np.linalg.norm(reference - candidate, axis=1)
-    if len(distances) == 0:
-        return np.inf
-    return float(np.mean(distances))
-
-
-def measurement_node_velocity(previous_nodes, current_nodes, dt):
-    previous = valid_points(previous_nodes)
-    current = valid_points(current_nodes)
-    if previous.shape != current.shape or len(previous) == 0:
-        return None
-    current = align_polyline_orientation(previous, current)
-    return np.ascontiguousarray((current - previous) / max(float(dt), 1e-3), dtype=np.float64)
 
 
 def clip_vector_norms(vectors, max_norm):
@@ -3392,10 +2575,3 @@ def weighted_mean_or_zero(values, weights):
     if not np.isfinite(total) or total <= 1e-12:
         return 0.0
     return float(np.sum(values * weights) / total)
-
-
-def segment_lengths(nodes):
-    nodes = np.asarray(nodes, dtype=np.float64)
-    if nodes.ndim == 3:
-        return np.linalg.norm(np.diff(nodes[:, :, :3], axis=1), axis=2)
-    return np.linalg.norm(np.diff(nodes[:, :3], axis=0), axis=1)

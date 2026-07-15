@@ -32,6 +32,7 @@ from cable_particle_filter import (
     PerCableEndpointAssociationConfig,
     PerCableEndpointAssociator,
     filtered_cable_estimate,
+    update_cable_particle_filters,
 )
 from zed_spatial import (
     DEPTH_MODES,
@@ -184,8 +185,6 @@ def parse_args():
         ),
         help="Display and propagate the constrained arithmetic mean of the highest-weight N particles.",
     )
-    parser.add_argument("--pf-initial-node-std", type=float, default=config_value(config, "particle_filter", "initial_node_std_m", pf_defaults.initial_node_std_m))
-    parser.add_argument("--pf-initial-direction-std", type=float, default=config_value(config, "particle_filter", "initial_direction_std", pf_defaults.initial_direction_std))
     parser.add_argument("--pf-process-std", type=float, default=config_value(config, "particle_filter", "process_node_std_m", pf_defaults.process_node_std_m))
     parser.add_argument("--pf-process-direction-std", type=float, default=config_value(config, "particle_filter", "process_direction_std", pf_defaults.process_direction_std))
     parser.add_argument("--pf-velocity", action=argparse.BooleanOptionalAction, default=config_value(config, "particle_filter", "velocity", pf_defaults.velocity_enabled))
@@ -207,113 +206,20 @@ def parse_args():
         default=config_value(config, "particle_filter", "scoring_backend", pf_defaults.scoring_backend),
         help="Particle scoring backend. auto uses CUDA tensors when available.",
     )
-    parser.add_argument(
-        "--pf-score-chunk-points",
-        type=int,
-        default=config_value(config, "particle_filter", "score_chunk_points", pf_defaults.score_chunk_points),
-        help="Point chunk size for tensor particle scoring.",
-    )
-    parser.add_argument(
-        "--pf-endpoint-ordering",
-        action=argparse.BooleanOptionalAction,
-        default=config_value(config, "particle_filter", "endpoint_ordering", pf_defaults.endpoint_ordering),
-        help="Order masked 3D cable points by graph endpoints for PF initialization/reacquisition.",
-    )
-    parser.add_argument(
-        "--pf-ordering-max-points",
-        type=int,
-        default=config_value(config, "particle_filter", "ordering_max_points", pf_defaults.ordering_max_points),
-        help="Maximum masked cable points used for endpoint/geodesic ordering.",
-    )
-    parser.add_argument(
-        "--pf-ordering-knn",
-        type=int,
-        default=config_value(config, "particle_filter", "ordering_knn", pf_defaults.ordering_knn),
-        help="K-nearest neighbors for endpoint/geodesic ordering graph.",
-    )
-    parser.add_argument(
-        "--pf-endpoint-refresh-interval",
-        type=int,
-        default=config_value(config, "particle_filter", "endpoint_refresh_interval", pf_defaults.endpoint_refresh_interval),
-        help="Run the endpoint graph ordering every N measurement updates to correct reference-order drift. Use 0 to disable.",
-    )
-    parser.add_argument(
-        "--pf-reference-ordering",
-        action=argparse.BooleanOptionalAction,
-        default=config_value(config, "particle_filter", "reference_ordering", pf_defaults.reference_ordering),
-        help="After initialization, order masked points against the current filtered chain instead of rebuilding the endpoint graph.",
-    )
-    parser.add_argument(
-        "--pf-reference-ordering-gate",
-        type=float,
-        default=config_value(config, "particle_filter", "reference_ordering_gate_m", pf_defaults.reference_ordering_gate_m),
-        help="Max distance from the current chain for points used to build the ordered measurement fit.",
-    )
-    parser.add_argument(
-        "--pf-measurement-fit-interval",
-        type=int,
-        default=config_value(config, "particle_filter", "measurement_fit_interval", pf_defaults.measurement_fit_interval),
-        help="Fit an ordered measurement chain every N healthy PF updates. Skipped updates still score raw mask points.",
-    )
-    parser.add_argument(
-        "--pf-endpoint-penalty-weight",
-        type=float,
-        default=config_value(config, "particle_filter", "endpoint_penalty_weight", pf_defaults.endpoint_penalty_weight),
-        help="Extra score weight that keeps particle start/end near measured cable endpoints.",
-    )
-    parser.add_argument(
-        "--pf-measurement-proposal-ratio",
-        type=float,
-        default=config_value(config, "particle_filter", "measurement_proposal_ratio", pf_defaults.measurement_proposal_ratio),
-        help="Maximum fraction of particles regenerated around the current measured cable fit.",
-    )
-    parser.add_argument(
-        "--pf-measurement-reset-error",
-        type=float,
-        default=config_value(config, "particle_filter", "measurement_reset_error_m", pf_defaults.measurement_reset_error_m),
-        help="Reset the PF from a valid measured cable fit when mean node disagreement exceeds this many meters. Use 0 to disable.",
-    )
-    parser.add_argument(
-        "--pf-measurement-proposal-stable-ratio",
-        type=float,
-        default=config_value(config, "particle_filter", "measurement_proposal_stable_ratio", pf_defaults.measurement_proposal_stable_ratio),
-        help="Proposal fraction used when the measured cable is close to the current estimate.",
-    )
-    parser.add_argument(
-        "--pf-measurement-proposal-start-error",
-        type=float,
-        default=config_value(config, "particle_filter", "measurement_proposal_start_error_m", pf_defaults.measurement_proposal_start_error_m),
-        help="Mean node error below which proposal injection stays at the stable ratio.",
-    )
-    parser.add_argument(
-        "--pf-measurement-proposal-full-error",
-        type=float,
-        default=config_value(config, "particle_filter", "measurement_proposal_full_error_m", pf_defaults.measurement_proposal_full_error_m),
-        help="Mean node error where proposal injection reaches the maximum ratio.",
-    )
-    parser.add_argument(
-        "--pf-measurement-proposal-std",
-        type=float,
-        default=config_value(config, "particle_filter", "measurement_proposal_node_std_m", pf_defaults.measurement_proposal_node_std_m),
-        help="3D start-node noise in meters for measurement-proposal particles.",
-    )
-    parser.add_argument(
-        "--pf-measurement-proposal-direction-std",
-        type=float,
-        default=config_value(config, "particle_filter", "measurement_proposal_direction_std", pf_defaults.measurement_proposal_direction_std),
-        help="Direction noise for measurement-proposal particles.",
-    )
-    parser.add_argument("--pf-ransac-inlier-selection", action=argparse.BooleanOptionalAction, default=config_value(config, "particle_filter", "ransac_inlier_selection", pf_defaults.ransac_inlier_selection_enabled))
-    parser.add_argument("--pf-ransac-hypotheses", type=int, default=config_value(config, "particle_filter", "ransac_hypotheses", pf_defaults.ransac_hypotheses))
-    parser.add_argument("--pf-ransac-subset-points", type=int, default=config_value(config, "particle_filter", "ransac_subset_points", pf_defaults.ransac_subset_points))
-    parser.add_argument("--pf-ransac-inlier-distance", type=float, default=config_value(config, "particle_filter", "ransac_inlier_distance_m", pf_defaults.ransac_inlier_distance_m))
-    parser.add_argument("--pf-ransac-min-points", type=int, default=config_value(config, "particle_filter", "ransac_min_points", pf_defaults.ransac_min_points))
-    parser.add_argument(
-        "--pf-score-keep-fraction",
-        type=float,
-        default=config_value(config, "particle_filter", "score_keep_fraction", pf_defaults.score_keep_fraction),
-        help="Robust score keeps this fraction of lowest point distances per particle.",
-    )
+    parser.add_argument("--pf-tangent-min-radius", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_min_radius_m", pf_defaults.endpoint_tangent_min_radius_m))
+    parser.add_argument("--pf-tangent-radius", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_radius_m", pf_defaults.endpoint_tangent_radius_m))
+    parser.add_argument("--pf-tangent-sigma", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_sigma_m", pf_defaults.endpoint_tangent_sigma_m))
+    parser.add_argument("--pf-tangent-min-points", type=int, default=config_value(config, "particle_filter", "endpoint_tangent_min_points", pf_defaults.endpoint_tangent_min_points))
+    parser.add_argument("--pf-tangent-min-confidence", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_min_confidence", pf_defaults.endpoint_tangent_min_confidence))
+    parser.add_argument("--pf-conditioned-proposal-ratio", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_proposal_ratio", pf_defaults.endpoint_conditioned_proposal_ratio))
+    parser.add_argument("--pf-conditioned-direction-std", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_direction_std", pf_defaults.endpoint_conditioned_direction_std))
+    parser.add_argument("--pf-conditioned-deformation-std", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_deformation_std_m", pf_defaults.endpoint_conditioned_deformation_std_m))
+    parser.add_argument("--pf-conditioned-deformation-modes", type=int, default=config_value(config, "particle_filter", "endpoint_conditioned_deformation_modes", pf_defaults.endpoint_conditioned_deformation_modes))
+    parser.add_argument("--pf-ownership-outlier-likelihood", type=float, default=config_value(config, "particle_filter", "ownership_outlier_likelihood", pf_defaults.ownership_outlier_likelihood))
+    parser.add_argument("--pf-ownership-outlier-prior", type=float, default=config_value(config, "particle_filter", "ownership_outlier_prior", pf_defaults.ownership_outlier_prior))
+    parser.add_argument("--pf-ownership-min-responsibility", type=float, default=config_value(config, "particle_filter", "ownership_min_responsibility", pf_defaults.ownership_min_responsibility))
+    parser.add_argument("--pf-ownership-visibility-threshold", type=float, default=config_value(config, "particle_filter", "ownership_visibility_threshold", pf_defaults.ownership_visibility_threshold))
+    parser.add_argument("--pf-robust-distance", type=float, default=config_value(config, "particle_filter", "robust_distance_m", pf_defaults.robust_distance_m))
     parser.add_argument(
         "--pf-coverage-penalty",
         type=float,
@@ -327,18 +233,12 @@ def parse_args():
         help="Minimum fraction of support points each expected visible segment should own.",
     )
     parser.add_argument("--pf-bend-penalty", type=float, default=config_value(config, "particle_filter", "bend_penalty_m", pf_defaults.bend_penalty_m))
-    parser.add_argument("--pf-coarse-score-points", type=int, default=config_value(config, "particle_filter", "coarse_score_points", pf_defaults.coarse_score_points))
-    parser.add_argument("--pf-coarse-score-full-fraction", type=float, default=config_value(config, "particle_filter", "coarse_score_full_fraction", pf_defaults.coarse_score_full_fraction))
-    parser.add_argument("--pf-coarse-score-min-particles", type=int, default=config_value(config, "particle_filter", "coarse_score_min_particles", pf_defaults.coarse_score_min_particles))
     parser.add_argument("--pf-global-random-ratio", type=float, default=config_value(config, "particle_filter", "global_random_particle_ratio", pf_defaults.global_random_particle_ratio))
-    parser.add_argument("--pf-global-random-bounds-padding", type=float, default=config_value(config, "particle_filter", "global_random_bounds_padding_m", pf_defaults.global_random_bounds_padding_m))
     parser.add_argument("--pf-endpoint-constraint-iterations", type=int, default=config_value(config, "particle_filter", "endpoint_constraint_iterations", pf_defaults.endpoint_constraint_iterations))
     parser.add_argument("--pf-endpoint-constraint-tolerance", type=float, default=config_value(config, "particle_filter", "endpoint_constraint_tolerance_m", pf_defaults.endpoint_constraint_tolerance_m))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
     parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
     parser.add_argument("--pf-occlusion-gate", type=float, default=config_value(config, "particle_filter", "occlusion_gate_m", pf_defaults.occlusion_assignment_max_distance_m))
-    parser.add_argument("--pf-outlier-distance", type=float, default=config_value(config, "particle_filter", "outlier_distance_m", pf_defaults.outlier_distance_m))
-    parser.add_argument("--pf-resample-effective-ratio", type=float, default=config_value(config, "particle_filter", "resample_effective_ratio", pf_defaults.resample_effective_ratio))
     parser.add_argument("--pf-max-prediction-frames", type=int, default=config_value(config, "particle_filter", "max_prediction_frames", pf_defaults.max_prediction_frames))
     parser.add_argument("--pf-max-motion-noise-scale", type=float, default=config_value(config, "particle_filter", "max_motion_noise_scale", pf_defaults.max_motion_noise_scale))
     args = parser.parse_args()
@@ -394,23 +294,29 @@ def parse_args():
         1,
         args.pf_particles,
     ))
-    args.pf_score_chunk_points = max(1, int(args.pf_score_chunk_points))
     args.pf_velocity_damping = float(np.clip(args.pf_velocity_damping, 0.0, 1.0))
     args.pf_velocity_measurement_blend = float(np.clip(args.pf_velocity_measurement_blend, 0.0, 1.0))
     args.pf_velocity_process_std = max(0.0, float(args.pf_velocity_process_std))
     args.pf_max_node_speed = max(0.0, float(args.pf_max_node_speed))
-    args.pf_endpoint_refresh_interval = max(0, int(args.pf_endpoint_refresh_interval))
-    args.pf_reference_ordering_gate = max(0.0, float(args.pf_reference_ordering_gate))
-    args.pf_measurement_fit_interval = max(1, int(args.pf_measurement_fit_interval))
-    args.pf_ransac_hypotheses = max(0, int(args.pf_ransac_hypotheses))
-    args.pf_ransac_subset_points = max(1, int(args.pf_ransac_subset_points))
-    args.pf_ransac_inlier_distance = max(1e-4, float(args.pf_ransac_inlier_distance))
-    args.pf_ransac_min_points = max(2, int(args.pf_ransac_min_points))
-    args.pf_coarse_score_points = max(0, int(args.pf_coarse_score_points))
-    args.pf_coarse_score_full_fraction = float(np.clip(args.pf_coarse_score_full_fraction, 0.0, 1.0))
-    args.pf_coarse_score_min_particles = max(1, int(args.pf_coarse_score_min_particles))
-    args.pf_global_random_ratio = float(np.clip(args.pf_global_random_ratio, 0.0, 1.0))
-    args.pf_global_random_bounds_padding = max(0.0, float(args.pf_global_random_bounds_padding))
+    args.pf_tangent_min_radius = max(0.0, float(args.pf_tangent_min_radius))
+    args.pf_tangent_radius = max(args.pf_tangent_min_radius + 1e-4, float(args.pf_tangent_radius))
+    args.pf_tangent_sigma = max(1e-4, float(args.pf_tangent_sigma))
+    args.pf_tangent_min_points = max(2, int(args.pf_tangent_min_points))
+    args.pf_tangent_min_confidence = float(np.clip(args.pf_tangent_min_confidence, 0.0, 1.0))
+    args.pf_global_random_ratio = float(np.clip(args.pf_global_random_ratio, 0.0, 0.95))
+    args.pf_conditioned_proposal_ratio = float(np.clip(
+        args.pf_conditioned_proposal_ratio,
+        0.0,
+        1.0 - args.pf_global_random_ratio,
+    ))
+    args.pf_conditioned_direction_std = max(0.0, float(args.pf_conditioned_direction_std))
+    args.pf_conditioned_deformation_std = max(0.0, float(args.pf_conditioned_deformation_std))
+    args.pf_conditioned_deformation_modes = max(1, int(args.pf_conditioned_deformation_modes))
+    args.pf_ownership_outlier_likelihood = float(np.clip(args.pf_ownership_outlier_likelihood, 1e-6, 1.0))
+    args.pf_ownership_outlier_prior = float(np.clip(args.pf_ownership_outlier_prior, 1e-4, 0.95))
+    args.pf_ownership_min_responsibility = float(np.clip(args.pf_ownership_min_responsibility, 0.0, 0.25))
+    args.pf_ownership_visibility_threshold = float(np.clip(args.pf_ownership_visibility_threshold, 0.0, 1.0))
+    args.pf_robust_distance = max(1e-4, float(args.pf_robust_distance))
     args.pf_endpoint_constraint_iterations = max(1, int(args.pf_endpoint_constraint_iterations))
     args.pf_endpoint_constraint_tolerance = max(0.0, float(args.pf_endpoint_constraint_tolerance))
     return args
@@ -573,8 +479,6 @@ def make_particle_filter_config(args, cable_index=0):
         particle_count=int(args.pf_particles),
         estimate_top_particle_count=int(args.pf_estimate_top_particles),
         segment_length_m=cable_segment_length_m(args, cable_index),
-        initial_node_std_m=float(args.pf_initial_node_std),
-        initial_direction_std=float(args.pf_initial_direction_std),
         process_node_std_m=float(args.pf_process_std),
         process_direction_std=float(args.pf_process_direction_std),
         velocity_enabled=bool(args.pf_velocity),
@@ -586,43 +490,29 @@ def make_particle_filter_config(args, cable_index=0):
         measurement_node_std_m=float(args.pf_measurement_std),
         measurement_max_points=int(args.pf_measurement_points),
         scoring_backend=str(args.pf_scoring_backend),
-        score_chunk_points=int(args.pf_score_chunk_points),
-        endpoint_ordering=bool(args.pf_endpoint_ordering),
-        ordering_max_points=int(args.pf_ordering_max_points),
-        ordering_knn=int(args.pf_ordering_knn),
-        endpoint_refresh_interval=int(args.pf_endpoint_refresh_interval),
-        reference_ordering=bool(args.pf_reference_ordering),
-        reference_ordering_gate_m=float(args.pf_reference_ordering_gate),
-        measurement_fit_interval=int(args.pf_measurement_fit_interval),
-        endpoint_penalty_weight=float(args.pf_endpoint_penalty_weight),
-        measurement_reset_error_m=float(args.pf_measurement_reset_error),
-        measurement_proposal_ratio=float(args.pf_measurement_proposal_ratio),
-        measurement_proposal_stable_ratio=float(args.pf_measurement_proposal_stable_ratio),
-        measurement_proposal_start_error_m=float(args.pf_measurement_proposal_start_error),
-        measurement_proposal_full_error_m=float(args.pf_measurement_proposal_full_error),
-        measurement_proposal_node_std_m=float(args.pf_measurement_proposal_std),
-        measurement_proposal_direction_std=float(args.pf_measurement_proposal_direction_std),
-        ransac_inlier_selection_enabled=bool(args.pf_ransac_inlier_selection),
-        ransac_hypotheses=int(args.pf_ransac_hypotheses),
-        ransac_subset_points=int(args.pf_ransac_subset_points),
-        ransac_inlier_distance_m=float(args.pf_ransac_inlier_distance),
-        ransac_min_points=int(args.pf_ransac_min_points),
-        score_keep_fraction=float(args.pf_score_keep_fraction),
+        endpoint_tangent_min_radius_m=float(args.pf_tangent_min_radius),
+        endpoint_tangent_radius_m=float(args.pf_tangent_radius),
+        endpoint_tangent_sigma_m=float(args.pf_tangent_sigma),
+        endpoint_tangent_min_points=int(args.pf_tangent_min_points),
+        endpoint_tangent_min_confidence=float(args.pf_tangent_min_confidence),
+        endpoint_conditioned_proposal_ratio=float(args.pf_conditioned_proposal_ratio),
+        endpoint_conditioned_direction_std=float(args.pf_conditioned_direction_std),
+        endpoint_conditioned_deformation_std_m=float(args.pf_conditioned_deformation_std),
+        endpoint_conditioned_deformation_modes=int(args.pf_conditioned_deformation_modes),
+        ownership_outlier_likelihood=float(args.pf_ownership_outlier_likelihood),
+        ownership_outlier_prior=float(args.pf_ownership_outlier_prior),
+        ownership_min_responsibility=float(args.pf_ownership_min_responsibility),
+        ownership_visibility_threshold=float(args.pf_ownership_visibility_threshold),
+        robust_distance_m=float(args.pf_robust_distance),
         coverage_penalty_m=float(args.pf_coverage_penalty),
         coverage_min_fraction=float(args.pf_coverage_min_fraction),
         bend_penalty_m=float(args.pf_bend_penalty),
-        coarse_score_points=int(args.pf_coarse_score_points),
-        coarse_score_full_fraction=float(args.pf_coarse_score_full_fraction),
-        coarse_score_min_particles=int(args.pf_coarse_score_min_particles),
         global_random_particle_ratio=float(args.pf_global_random_ratio),
-        global_random_bounds_padding_m=float(args.pf_global_random_bounds_padding),
         endpoint_constraint_iterations=int(args.pf_endpoint_constraint_iterations),
         endpoint_constraint_tolerance_m=float(args.pf_endpoint_constraint_tolerance),
         min_measurement_points=int(args.pf_min_measurement_points),
         min_segment_points=int(args.pf_min_segment_points),
         occlusion_assignment_max_distance_m=float(args.pf_occlusion_gate),
-        outlier_distance_m=float(args.pf_outlier_distance),
-        resample_effective_ratio=float(args.pf_resample_effective_ratio),
         max_prediction_frames=int(args.pf_max_prediction_frames),
         max_motion_noise_scale=float(args.pf_max_motion_noise_scale),
     )
@@ -995,18 +885,34 @@ class AsyncTrackingWorker:
         )
         self.last_filter_time = frame.timestamp_s
 
-        filter_futures = [
-            self.branch_executor.submit(
-                self._process_filter_branch,
-                cable_index,
-                measurements[cable_index],
+        active_filters = self.particle_filters[:cable_count]
+        filter_results = update_cable_particle_filters(
+            active_filters,
+            measurements[:len(active_filters)],
+            dt=filter_dt,
+        )
+        if len(filter_results) < cable_count:
+            filter_results.extend([None] * (cable_count - len(filter_results)))
+        for cable_index in range(cable_count):
+            filter_result = filter_results[cable_index]
+            measurement_for_cable = measurements[cable_index]
+            estimate = filtered_cable_estimate(measurement_for_cable, filter_result)
+            if estimate is None and cable_index >= len(active_filters):
+                estimate = measurement_for_cable
+            estimates[cable_index] = estimate
+            diagnostics[cable_index] = cable_tracking_diagnostics(
+                self.last_filter_nodes_by_cable[cable_index],
+                measurement_for_cable,
+                estimate,
+                filter_result,
                 diagnostics[cable_index],
-                filter_dt,
             )
-            for cable_index in range(cable_count)
-        ]
-        for cable_index, future in enumerate(filter_futures):
-            filter_results[cable_index], estimates[cable_index], diagnostics[cable_index] = future.result()
+            if estimate is not None:
+                self.last_filter_nodes_by_cable[cable_index] = np.asarray(estimate.points_xyz, dtype=np.float32)
+            elif cable_index >= len(active_filters) or not bool(active_filters[cable_index].initialized):
+                self.last_filter_nodes_by_cable[cable_index] = None
+            if filter_result is not None:
+                self.last_filter_lost_frames_by_cable[cable_index] = int(filter_result.lost_frames)
 
         contact_observations = verify_crossing_proposals(
             crossing_proposals,
@@ -1099,36 +1005,18 @@ class AsyncTrackingWorker:
         endpoint_diag = endpoint_anchor_diagnostics(candidate_markers, args, cable_index=cable_index)
         if not bool(endpoint_diag.get("endpoint_fixed", False)):
             measurement = None
+        elif measurement is None:
+            measurement = CableEstimate3D(
+                points_xyz=np.empty((0, 3), dtype=np.float32),
+                source_points=np.empty((0, 3), dtype=np.float32),
+                residual_m=np.nan,
+                method="endpoint-only cable observation",
+            )
         measurement = attach_endpoint_markers_to_measurement(measurement, candidate_markers)
         measurement_diagnostics = {}
         measurement_diagnostics.update(endpoint_diag)
         measurement_diagnostics.update(dict(association_diagnostics or {}))
         return measurement, measurement_diagnostics
-
-    def _process_filter_branch(self, cable_index, measurement, diagnostics, filter_dt):
-        particle_filter = self.particle_filters[cable_index] if cable_index < len(self.particle_filters) else None
-        if particle_filter is not None:
-            filter_result = particle_filter.step(measurement, filter_dt)
-            estimate = filtered_cable_estimate(measurement, filter_result)
-        else:
-            filter_result = None
-            estimate = measurement
-        diagnostics = cable_tracking_diagnostics(
-            self.last_filter_nodes_by_cable[cable_index],
-            measurement,
-            estimate,
-            filter_result,
-            diagnostics,
-        )
-        if estimate is not None:
-            self.last_filter_nodes_by_cable[cable_index] = np.asarray(estimate.points_xyz, dtype=np.float32)
-        elif particle_filter is None or not bool(getattr(particle_filter, "initialized", False)):
-            self.last_filter_nodes_by_cable[cable_index] = None
-        if filter_result is not None:
-            self.last_filter_lost_frames_by_cable[cable_index] = int(filter_result.lost_frames)
-        elif estimate is not None:
-            self.last_filter_lost_frames_by_cable[cable_index] = 0
-        return filter_result, estimate, diagnostics
 
     def _measurement_from_detection(
         self,
@@ -1163,7 +1051,9 @@ def combine_cable_estimates(estimates, method="multi-cable"):
         (cable_index, getattr(estimate, "points_xyz", None))
         for cable_index, estimate in indexed_estimates
     ])
-    source_points = concatenate_point_sets([getattr(estimate, "source_points", None) for estimate in valid_estimates])
+    # Both PFs consume the same semantic cable cloud. Keep one copy for the
+    # viewer/residual path instead of duplicating every RGB-D support point.
+    source_points = concatenate_point_sets([getattr(valid_estimates[0], "source_points", None)])
     residuals = [float(getattr(estimate, "residual_m", np.nan)) for estimate in valid_estimates]
     finite_residuals = [value for value in residuals if np.isfinite(value)]
     residual = float(np.mean(finite_residuals)) if finite_residuals else 0.0
@@ -1287,15 +1177,6 @@ def combine_filter_results(filter_results):
         result for result in valid_results
         if bool(getattr(result, "measurement_used", False))
     ]
-    ransac_results = [
-        result for result in valid_results
-        if int(getattr(result, "ransac_hypothesis_count", 0) or 0) > 0
-    ]
-    ransac_error_values = [
-        float(getattr(result, "ransac_error_m", np.nan))
-        for result in valid_results
-        if np.isfinite(float(getattr(result, "ransac_error_m", np.nan)))
-    ]
     estimate_weight_values = [
         float(getattr(result, "estimate_weight_mass", np.nan))
         for result in valid_results
@@ -1353,16 +1234,19 @@ def combine_filter_results(filter_results):
         measurement_used=any(bool(getattr(result, "measurement_used", False)) for result in valid_results),
         prediction_only=all(bool(getattr(result, "prediction_only", False)) for result in valid_results),
         lost_frames=max(int(getattr(result, "lost_frames", 0)) for result in valid_results),
-        measurement_point_count=sum(int(getattr(result, "measurement_point_count", 0)) for result in valid_results),
+        measurement_point_count=max(int(getattr(result, "measurement_point_count", 0)) for result in valid_results),
         segment_length_m=finite_result_mean(valid_results, "segment_length_m"),
-        measurement_proposal_ratio=finite_result_mean(updated_results, "measurement_proposal_ratio"),
+        endpoint_conditioned_proposal_ratio=finite_result_mean(
+            updated_results,
+            "endpoint_conditioned_proposal_ratio",
+        ),
         global_random_particle_ratio=finite_result_mean(updated_results, "global_random_particle_ratio"),
-        ransac_inlier_ratio=finite_result_mean(ransac_results, "ransac_inlier_ratio"),
-        ransac_inlier_count=sum(int(getattr(result, "ransac_inlier_count", 0)) for result in valid_results),
-        ransac_error_m=float(np.mean(ransac_error_values)) if ransac_error_values else np.nan,
-        ransac_hypothesis_count=sum(int(getattr(result, "ransac_hypothesis_count", 0)) for result in valid_results),
-        coarse_score_point_count=sum(int(getattr(result, "coarse_score_point_count", 0)) for result in valid_results),
-        full_score_particle_count=sum(int(getattr(result, "full_score_particle_count", 0)) for result in valid_results),
+        mean_ownership_responsibility=finite_result_mean(updated_results, "mean_ownership_responsibility"),
+        ownership_entropy=finite_result_mean(updated_results, "ownership_entropy"),
+        ownership_effective_point_count=sum(
+            float(getattr(result, "ownership_effective_point_count", 0.0))
+            for result in updated_results
+        ),
         estimate_particle_count=int(round(np.mean([
             int(getattr(result, "estimate_particle_count", 1))
             for result in valid_results
@@ -1439,10 +1323,11 @@ def combine_tracking_diagnostics(diagnostics, candidate_count=0, cable_count=1):
             )
     for key in (
         "support_to_prior_m",
-        "proposal_ratio",
+        "conditioned_ratio",
         "global_random_ratio",
-        "ransac_inlier_ratio",
-        "ransac_error_m",
+        "ownership_responsibility",
+        "ownership_entropy",
+        "tangent_confidence",
         "estimate_weight_mass",
         "map_to_average_node_error_m",
         "mean_node_spread_m",
@@ -1454,12 +1339,14 @@ def combine_tracking_diagnostics(diagnostics, candidate_count=0, cable_count=1):
         finite = [value for value in values if np.isfinite(value)]
         if finite:
             combined[key] = float(np.mean(finite))
-    ransac_hypotheses = [int(item.get("ransac_hypotheses", 0) or 0) for item in valid]
-    if ransac_hypotheses:
-        combined["ransac_hypotheses"] = int(sum(ransac_hypotheses))
-    ransac_inliers = [int(item.get("ransac_inlier_count", 0) or 0) for item in valid]
-    if ransac_inliers:
-        combined["ransac_inlier_count"] = int(sum(ransac_inliers))
+    combined["ownership_effective_points"] = float(sum(
+        max(0.0, float(item.get("ownership_effective_points", 0.0) or 0.0))
+        for item in valid
+    ))
+    combined["tangent_support_count"] = int(sum(
+        max(0, int(item.get("tangent_support_count", 0) or 0))
+        for item in valid
+    ))
     estimate_counts = [
         int(item.get("estimate_particle_count", 0) or 0)
         for item in valid
@@ -1983,8 +1870,8 @@ def cable_tracking_diagnostics(previous_filter_nodes, measurement, estimate, fil
     )
     diagnostics["raw_residual_m"] = float(getattr(measurement, "residual_m", np.nan)) if measurement is not None else np.nan
     diagnostics["filtered_residual_m"] = float(getattr(estimate, "residual_m", np.nan)) if estimate is not None else np.nan
-    diagnostics["proposal_ratio"] = (
-        float(getattr(filter_result, "measurement_proposal_ratio", np.nan))
+    diagnostics["conditioned_ratio"] = (
+        float(getattr(filter_result, "endpoint_conditioned_proposal_ratio", np.nan))
         if filter_result is not None and measurement_used
         else np.nan
     )
@@ -1993,37 +1880,35 @@ def cable_tracking_diagnostics(previous_filter_nodes, measurement, estimate, fil
         if filter_result is not None and measurement_used
         else np.nan
     )
-    ransac_hypothesis_count = (
-        int(getattr(filter_result, "ransac_hypothesis_count", 0))
-        if filter_result is not None
-        else 0
-    )
-    diagnostics["ransac_inlier_ratio"] = (
-        float(getattr(filter_result, "ransac_inlier_ratio", np.nan))
-        if filter_result is not None and ransac_hypothesis_count > 0
+    diagnostics["ownership_responsibility"] = (
+        float(getattr(filter_result, "mean_ownership_responsibility", np.nan))
+        if filter_result is not None and measurement_used
         else np.nan
     )
-    diagnostics["ransac_inlier_count"] = (
-        int(getattr(filter_result, "ransac_inlier_count", 0))
-        if filter_result is not None
-        else 0
-    )
-    diagnostics["ransac_error_m"] = (
-        float(getattr(filter_result, "ransac_error_m", np.nan))
-        if filter_result is not None and ransac_hypothesis_count > 0
+    diagnostics["ownership_entropy"] = (
+        float(getattr(filter_result, "ownership_entropy", np.nan))
+        if filter_result is not None and measurement_used
         else np.nan
     )
-    diagnostics["ransac_hypotheses"] = ransac_hypothesis_count
-    diagnostics["coarse_score_points"] = (
-        int(getattr(filter_result, "coarse_score_point_count", 0))
-        if filter_result is not None
-        else 0
+    diagnostics["ownership_effective_points"] = (
+        float(getattr(filter_result, "ownership_effective_point_count", np.nan))
+        if filter_result is not None and measurement_used
+        else np.nan
     )
-    diagnostics["full_score_particles"] = (
-        int(getattr(filter_result, "full_score_particle_count", 0))
-        if filter_result is not None
-        else 0
+    tangent_confidence = np.asarray(
+        getattr(filter_result, "endpoint_tangent_confidence", (np.nan, np.nan)),
+        dtype=np.float32,
+    ).reshape(-1)
+    diagnostics["tangent_confidence"] = (
+        float(np.mean(tangent_confidence[np.isfinite(tangent_confidence)]))
+        if np.any(np.isfinite(tangent_confidence))
+        else np.nan
     )
+    tangent_support = np.asarray(
+        getattr(filter_result, "endpoint_tangent_support_count", (0, 0)),
+        dtype=np.int32,
+    ).reshape(-1)
+    diagnostics["tangent_support_count"] = int(np.sum(tangent_support))
     diagnostics["estimate_particle_count"] = (
         int(getattr(filter_result, "estimate_particle_count", 0))
         if filter_result is not None
@@ -2264,9 +2149,9 @@ def format_tracking_diagnostics(diagnostics):
         if depth_order:
             crossing_text += f" {depth_order.replace(' ', '_')}"
         parts.append(crossing_text)
-    proposal_ratio = diagnostics.get("proposal_ratio", np.nan)
-    if np.isfinite(proposal_ratio):
-        parts.append(f"prop={proposal_ratio:.2f}")
+    conditioned_ratio = diagnostics.get("conditioned_ratio", np.nan)
+    if np.isfinite(conditioned_ratio):
+        parts.append(f"conditioned={conditioned_ratio:.2f}")
     random_ratio = diagnostics.get("global_random_ratio", np.nan)
     if np.isfinite(random_ratio):
         parts.append(f"rand={random_ratio:.2f}")
@@ -2293,26 +2178,23 @@ def format_tracking_diagnostics(diagnostics):
         start_text = f"{start_direction_delta:.1f}" if np.isfinite(start_direction_delta) else "nan"
         end_text = f"{end_direction_delta:.1f}" if np.isfinite(end_direction_delta) else "nan"
         parts.append(f"MAP-AVG-dir={start_text}/{end_text}deg")
-    ransac_inlier_ratio = diagnostics.get("ransac_inlier_ratio", np.nan)
-    ransac_inlier_count = int(diagnostics.get("ransac_inlier_count", 0) or 0)
-    ransac_error = diagnostics.get("ransac_error_m", np.nan)
-    ransac_hypotheses = int(diagnostics.get("ransac_hypotheses", 0) or 0)
-    if ransac_inlier_count > 0 or ransac_hypotheses > 0:
-        text = f"ransac={ransac_inlier_count}pts"
-        if np.isfinite(ransac_inlier_ratio):
-            text += f"/{ransac_inlier_ratio:.2f}"
-        if ransac_hypotheses > 0:
-            text += f" hyp={ransac_hypotheses}"
-        if np.isfinite(ransac_error):
-            text += f" err={format_mm(ransac_error)}"
+    ownership = float(diagnostics.get("ownership_responsibility", np.nan))
+    ownership_entropy = float(diagnostics.get("ownership_entropy", np.nan))
+    ownership_points = float(diagnostics.get("ownership_effective_points", np.nan))
+    if np.isfinite(ownership):
+        text = f"own={ownership:.2f}"
+        if np.isfinite(ownership_entropy):
+            text += f" H={ownership_entropy:.2f}"
+        if np.isfinite(ownership_points):
+            text += f" Neff={ownership_points:.0f}"
         parts.append(text)
+    tangent_confidence = float(diagnostics.get("tangent_confidence", np.nan))
+    tangent_support = int(diagnostics.get("tangent_support_count", 0) or 0)
+    if np.isfinite(tangent_confidence):
+        parts.append(f"tangent={tangent_confidence:.2f}/{tangent_support}pts")
     mean_node_speed = diagnostics.get("mean_node_speed_mps", np.nan)
     if np.isfinite(mean_node_speed):
         parts.append(f"v={mean_node_speed:.2f}m/s")
-    coarse_points = int(diagnostics.get("coarse_score_points", 0) or 0)
-    full_particles = int(diagnostics.get("full_score_particles", 0) or 0)
-    if coarse_points > 0 and full_particles > 0:
-        parts.append(f"score={coarse_points}c/{full_particles}f")
     pf_stage_ms = diagnostics.get("pf_stage_ms", None)
     if isinstance(pf_stage_ms, dict):
         stage_text = format_pf_stage_ms(pf_stage_ms)
@@ -2324,18 +2206,11 @@ def format_tracking_diagnostics(diagnostics):
 def format_pf_stage_ms(stage_ms):
     labels = (
         ("prepare", "prep"),
+        ("tangent", "tan"),
         ("initialize", "init"),
         ("predict", "pred"),
-        ("measurement", "meas"),
-        ("velocity", "vel"),
-        ("proposal", "propms"),
-        ("associate", "assoc"),
-        ("ransac", "ransacms"),
-        ("random", "randms"),
-        ("score", "scorems"),
-        ("weight", "w"),
+        ("consensus", "cons"),
         ("estimate", "est"),
-        ("resample", "resamp"),
     )
     parts = []
     for key, label in labels:

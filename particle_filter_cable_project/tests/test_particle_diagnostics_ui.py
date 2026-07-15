@@ -25,6 +25,13 @@ class ParticleDiagnosticsUiTests(unittest.TestCase):
             mean_node_spread_m=0.01,
             max_node_spread_m=0.01,
             endpoint_direction_delta_deg=np.asarray([2.0, 3.0], dtype=np.float32),
+            endpoint_tangents_xyz=np.asarray([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=np.float32),
+            endpoint_tangent_confidence=np.asarray([0.8, 0.9], dtype=np.float32),
+            endpoint_tangent_support_count=np.asarray([12, 14], dtype=np.int32),
+            mean_ownership_responsibility=0.46,
+            ownership_entropy=0.22,
+            visible_segment_fraction=0.75,
+            endpoint_conditioned_proposal_ratio=0.25,
         )
 
         prepared = ZedDepthGLViewer._prepare_particle_diagnostics(((1, diagnostics),))
@@ -36,8 +43,10 @@ class ParticleDiagnosticsUiTests(unittest.TestCase):
         self.assertEqual(group["top_line_vertices"].shape, (8, 3))
         self.assertEqual(group["map_line_vertices"].shape, (4, 3))
         self.assertEqual(group["spread_line_vertices"].shape, (6, 3))
+        self.assertEqual(group["tangent_line_vertices"].shape, (4, 3))
         self.assertIn("PF2 TOP=2", group["label"])
         self.assertIn("MAP-AVG=10.0mm", group["label"])
+        self.assertIn("own=0.46", group["label"])
 
 
 if __name__ == "__main__":

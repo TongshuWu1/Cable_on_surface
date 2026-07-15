@@ -50,12 +50,22 @@ diameters are configured and the 3D gap is within the contact tolerance. This
 observation is diagnostic only; it does not impose a PF contact constraint.
 
 Deterministic mask indices are sampled directly from the ZED GPU depth buffer
-into one compact shared 3D support cloud. Each PF selects support reachable from its own
-endpoints, uses constrained RANSAC to reject support from the other cable, and
-scores its particles by point-to-polyline distance on CUDA. Every accepted PF
-update replaces a fixed 10% of the population with globally sampled,
-endpoint-constrained chains. There is no separate recovery mode or recovery
-trigger; this persistent exploration budget handles reacquisition continuously.
+into one compact shared 3D support cloud. The cloud is never hard-split or
+deleted before filtering. A fused CUDA kernel evaluates every shared point
+against both predicted particle populations. The posterior populations define
+soft `cable1`, `cable2`, and `outlier` responsibilities, which remain ambiguous
+at genuine image crossings instead of forcing a premature ownership decision.
+
+For point `p_n` and predicted particle `Q_i^k`, the cable compatibility is
+
+```text
+L_i,n = sum_k w_i,k exp(-d(p_n, Q_i^k)^2 / (2 sigma^2)).
+```
+
+Normalizing the two cable compatibilities together with an explicit outlier
+component gives the responsibility used by the robust, bounded measurement
+cost. Each PF is weighted once from its predicted weights; there is no
+preliminary likelihood multiplication and no RANSAC-selected support subset.
 
 ## Cable Model
 
@@ -84,16 +94,34 @@ direction disagreement are reported per PF. Press `P` to toggle this diagnostic
 layer; the fixed 10% global recovery population and all PF calculations remain
 unchanged.
 
+The same layer draws the two measured inward endpoint tangents. Its label also
+reports tangent confidence/support, mean cable ownership, ownership entropy,
+visible segment fraction, and the active endpoint-conditioned proposal ratio.
+
+On measurement frames the transition is the explicit mixture
+
+```text
+0.65 posterior-local motion
++ 0.25 endpoint/tangent-conditioned deformation
++ 0.10 globally random endpoint-constrained recovery.
+```
+
+The conditioned component perturbs a few low-frequency sine deformation modes,
+not every node independently. Its scale increases with cable slack, so a loose
+loop receives broader shape proposals than a nearly taut cable. Endpoint-only
+frames constrain and predict the cable while correctly reporting that the
+interior shape is occluded. Complete occlusion cannot uniquely determine the
+hidden shape; particle spread is the corresponding uncertainty diagnostic.
+
 ## Runtime Pipeline
 
 1. A dedicated capture thread acquires RGB plus rotating ZED GPU depth buffers.
 2. The detector stage runs PIDNet once for cable, endpoints_cable1,
    endpoints_cable2, and crossing masks.
-3. The tracker lifts each cable's two endpoints into 3D and sends them directly
-   to the correspondingly indexed PF before parallel measurement work.
-4. Two independent CUDA streams update the endpoint-constrained particle
-   filters, including fused RANSAC, the fixed 10% global-particle mixture,
-   constraints, scoring, velocity, and resampling.
+3. The tracker lifts both endpoint groups and shared cable support in parallel.
+4. Each PF predicts its endpoint-constrained transition population. One fused
+   CUDA distance pass then computes shared ownership, robust costs, coverage,
+   likelihoods, visibility, and posterior diagnostics for both cables.
 5. The main thread renders the latest complete result without blocking capture
    or estimation.
 
@@ -135,7 +163,7 @@ datasets/two_cable_pidnet/
 
 - `main.py`: independent ZED capture, detector, tracker, and live viewer stages
 - `cable_cuda.py`: strict CUDA runtime and fused-kernel launch interface
-- `cable_cuda_kernels.cu`: fused constraints, RANSAC construction, and ZED sampling
+- `cable_cuda_kernels.cu`: fused constraints, two-cable distances, and ZED sampling
 - `cable_crossing.py`: RGB crossing proposals and continuous 3D contact observations
 - `cable_pidnet.py`: strict four-channel PIDNet inference
 - `cable_detection.py`: 2D mask cleanup and 3D measurement construction
