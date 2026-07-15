@@ -24,13 +24,21 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 from cable_detection import remove_small_components
+from pidnet_schema import (
+    CROSSING_CHANNEL,
+    OUTPUT_CHANNEL_COUNT,
+    PIDNET_LABEL_MODE,
+    crossing_label_value,
+    endpoint_label_value,
+    label_bit,
+    max_label_value,
+)
 
 DEFAULT_DATASET_DIR = PROJECT_DIR / "datasets/two_cable_pidnet"
 DEFAULT_MODEL_PATH = PROJECT_DIR / "models/pidnet_two_cable_best.pt"
 DEFAULT_IMAGE_SIZE = "1280x720"
 DEFAULT_PARAMS_PATH = PROJECT_DIR / "pidnet_two_cable_training_params.json"
 DEFAULT_CONFIG_PATH = PROJECT_DIR / "config.toml"
-CAPTURE_DIR = DEFAULT_DATASET_DIR / "captures"
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
 LABEL_COLORS_BGR = (
     (40, 255, 40),     # cable body
@@ -42,6 +50,7 @@ LABEL_COLORS_BGR = (
     (80, 80, 255),     # endpoints_3
     (0, 220, 255),     # endpoints_4
 )
+CROSSING_COLOR_BGR = (0, 255, 255)
 
 
 def label_color_bgr(label, cable_count=None):
@@ -49,6 +58,8 @@ def label_color_bgr(label, cable_count=None):
     if cable_count is None:
         return LABEL_COLORS_BGR[(label - 1) % len(LABEL_COLORS_BGR)]
     cable_count = max(1, int(cable_count))
+    if label == crossing_label_value(cable_count):
+        return CROSSING_COLOR_BGR
     if label <= cable_count:
         return LABEL_COLORS_BGR[(label - 1) % 4]
     endpoint_index = label - cable_count - 1
@@ -72,9 +83,9 @@ def parse_args():
     parser.add_argument("--cable-count", type=int, default=2, help="Number of cable endpoint groups to label and train.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--boundary-weight", type=float, default=0.20)
+    parser.add_argument("--crossing-weight", type=float, default=1.0)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resolution", choices=resolution_names(), default="HD720")
@@ -99,7 +110,14 @@ def zed_resolution(name):
     }[name]
 
 
-def make_frame_item(bgr, path=None, split="train", dataset_dir=DEFAULT_DATASET_DIR, cable_count=1):
+def make_frame_item(
+    bgr,
+    path=None,
+    split="train",
+    dataset_dir=DEFAULT_DATASET_DIR,
+    cable_count=1,
+    search_other_splits=True,
+):
     bgr = np.asarray(bgr, dtype=np.uint8)
     item = {
         "path": str(Path(path).expanduser().resolve()) if path is not None else None,
@@ -110,49 +128,88 @@ def make_frame_item(bgr, path=None, split="train", dataset_dir=DEFAULT_DATASET_D
         "split": split,
         "saved_image_path": None,
         "saved_mask_path": None,
+        "saved_layer_path": None,
+        "dirty": False,
     }
-    existing_mask, existing_split = find_existing_mask(path, dataset_dir, cable_count=cable_count) if path is not None else (None, None)
+    existing_mask, existing_split, existing_mask_path = (
+        find_existing_mask(
+            path,
+            dataset_dir,
+            cable_count=cable_count,
+            preferred_split=split,
+            search_other_splits=search_other_splits,
+        )
+        if path is not None
+        else (None, None, None)
+    )
     if existing_mask is not None:
         item["mask"] = existing_mask
         item["split"] = existing_split
+        item["saved_mask_path"] = str(existing_mask_path)
+        layer_path = layered_mask_path_from_mask_path(existing_mask_path)
+        item["saved_layer_path"] = str(layer_path) if layer_path.exists() else None
+
+    if path is not None:
+        source_path = Path(path).expanduser().resolve()
+        images_root = (Path(dataset_dir).expanduser().resolve() / "images")
+        if path_is_within(source_path, images_root):
+            item["saved_image_path"] = str(source_path)
     return item
 
 
-def find_existing_mask(image_path, dataset_dir, cable_count=1):
+def find_existing_mask(
+    image_path,
+    dataset_dir,
+    cable_count=1,
+    preferred_split=None,
+    search_other_splits=True,
+):
     stem = sanitize_stem(Path(image_path).stem)
-    for split in ("train", "val"):
+    preferred_split = str(preferred_split or "").strip().lower()
+    splits = [preferred_split] if preferred_split in ("train", "val") else []
+    if search_other_splits:
+        splits.extend(split for split in ("train", "val") if split not in splits)
+    for split in splits:
         mask_path = Path(dataset_dir) / "masks" / split / f"{stem}.png"
         layer_path = layered_mask_path_from_mask_path(mask_path)
         if layer_path.exists():
-            return read_layered_mask(layer_path, cable_count), split
+            return read_layered_mask(layer_path, cable_count), split, mask_path
         if mask_path.exists():
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if mask is not None:
-                return label_mask_to_bitmask(normalize_label_mask(mask, cable_count), cable_count), split
-    return None, None
+                return label_mask_to_bitmask(normalize_label_mask(mask, cable_count), cable_count), split, mask_path
+            raise ValueError(f"Could not read mask: {mask_path}")
+    return None, None, None
+
+
+def path_is_within(path, root):
+    return Path(path).expanduser().resolve().is_relative_to(Path(root).expanduser().resolve())
+
+
+def item_mask_state(item):
+    if item is None:
+        return "no frame"
+    if bool(item.get("dirty")):
+        return "unsaved changes"
+    mask_path = item.get("saved_mask_path")
+    layer_path = item.get("saved_layer_path")
+    if (mask_path and Path(mask_path).exists()) or (layer_path and Path(layer_path).exists()):
+        return "saved mask"
+    if np.any(np.asarray(item["mask"], dtype=np.uint16)):
+        return "unsaved mask"
+    return "MASK MISSING"
 
 
 def normalize_label_mask(mask, cable_count):
     cable_count = max(1, int(cable_count))
     mask = np.asarray(mask, dtype=np.uint8)
     labels = np.zeros(mask.shape[:2], dtype=np.uint8)
-    max_label = 2 * cable_count
+    max_label = max_label_value(cable_count)
     for label in range(1, max_label + 1):
         labels[mask == label] = label
     if not np.any(labels) and np.any(mask > 127):
         labels[mask > 127] = 1
     return labels
-
-
-def max_label_value(cable_count):
-    return 2 * max(1, int(cable_count))
-
-
-def label_bit(label):
-    label = int(label)
-    if label <= 0:
-        return np.uint16(0)
-    return np.uint16(1 << (label - 1))
 
 
 def label_mask_to_bitmask(mask, cable_count):
@@ -191,15 +248,13 @@ def read_layered_mask(path, cable_count):
     return np.ascontiguousarray(mask & valid_bits, dtype=np.uint16)
 
 
-def endpoint_label_value(cable_index, cable_count):
-    return max(1, int(cable_count)) + int(cable_index)
-
-
 def label_display_name(label, cable_count):
     label = int(label)
     cable_count = max(1, int(cable_count))
     if label <= 0:
         return "background"
+    if label == crossing_label_value(cable_count):
+        return "crossing"
     if label <= cable_count:
         return "cable" if label == 1 else f"cable_body_layer{label}"
     endpoint_index = label - cable_count
@@ -233,6 +288,10 @@ def layered_mask_path_from_mask_path(mask_path):
 
 
 def save_label_pair(item, dataset_dir, index=0):
+    split = str(item.get("split") or "train").strip().lower()
+    if split not in ("train", "val"):
+        raise ValueError(f"Unsupported dataset split: {split!r}")
+    item["split"] = split
     image_path, mask_path = label_paths_for_item(item, dataset_dir, index=index)
     layer_path = layered_mask_path_from_mask_path(mask_path)
     image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,8 +304,16 @@ def save_label_pair(item, dataset_dir, index=0):
     if not cv2.imwrite(str(mask_path), preview_mask):
         raise IOError(f"Could not write mask: {mask_path}")
     np.savez_compressed(str(layer_path), mask=mask, cable_count=max(1, int(item.get("cable_count", 2))))
+    other_split = "val" if split == "train" else "train"
+    other_image = dataset_dir / "images" / other_split / image_path.name
+    other_mask = dataset_dir / "masks" / other_split / mask_path.name
+    other_layer = dataset_dir / "masks_layers" / other_split / layer_path.name
+    for duplicate_path in (other_image, other_mask, other_layer):
+        duplicate_path.unlink(missing_ok=True)
     item["saved_image_path"] = str(image_path)
     item["saved_mask_path"] = str(mask_path)
+    item["saved_layer_path"] = str(layer_path)
+    item["dirty"] = False
     return image_path, mask_path
 
 
@@ -322,6 +389,15 @@ def endpoint_label_mask(mask, cable_count, multilabel=False):
     for label in range(1, cable_count + 1):
         endpoint |= label_pixels(labels, endpoint_label_value(label, cable_count), cable_count, multilabel=multilabel)
     return endpoint
+
+
+def crossing_label_mask(mask, cable_count, multilabel=False):
+    return label_pixels(
+        np.asarray(mask),
+        crossing_label_value(cable_count),
+        cable_count,
+        multilabel=multilabel,
+    )
 
 
 def apply_binary_cleanup(mask, params):
@@ -438,22 +514,8 @@ def toml_scalar(value):
     return json.dumps(str(value))
 
 
-def generic_cable_endpoint_label_mode(label_mode):
-    return str(label_mode).strip().lower() in {
-        "generic",
-        "cable_with_endpoints",
-        "cable_with_separate_endpoints",
-        "cable_endpoint",
-        "binary_with_endpoints",
-    }
-
-
-def endpoint_component_count(mask):
-    mask = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8)
-    if mask.ndim != 2 or not np.any(mask):
-        return 0
-    num_labels, _labels = cv2.connectedComponents(mask, connectivity=8)
-    return max(0, int(num_labels) - 1)
+def crossing_prediction_label_mode(label_mode):
+    return str(label_mode).strip().lower() == PIDNET_LABEL_MODE
 
 
 class PidNetTrainingApp:
@@ -469,7 +531,9 @@ class PidNetTrainingApp:
         self.frames = []
         self.selected_frame_idx = -1
         self.latest_bgr = None
-        self.cable_count_var = tk.IntVar(value=max(1, int(args.cable_count)))
+        if int(args.cable_count) != 2:
+            raise ValueError(f"This project labels exactly two cables; got cable_count={args.cable_count}.")
+        self.cable_count_var = tk.IntVar(value=2)
         self.mode_var = tk.StringVar(value="paint_1")
         self.split_var = tk.StringVar(value="train")
         self.brush_radius_var = tk.IntVar(value=4)
@@ -480,9 +544,9 @@ class PidNetTrainingApp:
         self.base_channels_var = tk.IntVar(value=int(args.base_channels))
         self.lr_var = tk.DoubleVar(value=float(args.lr))
         self.weight_decay_var = tk.DoubleVar(value=float(args.weight_decay))
-        self.val_split_var = tk.DoubleVar(value=float(args.val_split))
         self.num_workers_var = tk.IntVar(value=int(args.num_workers))
         self.boundary_weight_var = tk.DoubleVar(value=float(args.boundary_weight))
+        self.crossing_weight_var = tk.DoubleVar(value=float(args.crossing_weight))
         self.amp_var = tk.BooleanVar(value=bool(args.amp))
         self.device_var = tk.StringVar(value=str(args.device or "cuda"))
         self.test_threshold_var = tk.DoubleVar(value=float(pidnet_config.get("threshold", 0.50)))
@@ -547,7 +611,7 @@ class PidNetTrainingApp:
         ).pack(side=tk.TOP, fill=tk.X)
         tk.Label(
             instructions,
-            text="Paint generic cable body and endpoint masks, train at 1280x720, then test the checkpoint before using it live.",
+            text="Paint cable, endpoint, and crossing masks, train at 1280x720, then test the checkpoint before using it live.",
             bg="#f4f4f4",
             anchor="w",
             justify=tk.LEFT,
@@ -565,26 +629,32 @@ class PidNetTrainingApp:
         self.paint_mode_frame.pack(side=tk.LEFT)
         self.rebuild_paint_mode_buttons()
 
-        tk.Label(toolbar, text="  Legacy groups").pack(side=tk.LEFT, padx=(8, 0))
-        tk.Spinbox(toolbar, from_=1, to=4, width=3, textvariable=self.cable_count_var, command=self.on_cable_count_changed).pack(side=tk.LEFT, padx=3)
+        label_bar = tk.Frame(self.root, padx=8, pady=4)
+        label_bar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(label_bar, text="Endpoint groups").pack(side=tk.LEFT)
+        tk.Spinbox(label_bar, from_=2, to=2, width=3, textvariable=self.cable_count_var, state="readonly").pack(side=tk.LEFT, padx=3)
 
-        tk.Label(toolbar, text="  Split").pack(side=tk.LEFT)
+        tk.Label(label_bar, text="  Split").pack(side=tk.LEFT)
         for text, value in (("Train", "train"), ("Val", "val")):
-            tk.Radiobutton(toolbar, text=text, variable=self.split_var, value=value, command=self.set_active_split).pack(side=tk.LEFT)
+            tk.Radiobutton(label_bar, text=text, variable=self.split_var, value=value, command=self.set_active_split).pack(side=tk.LEFT)
 
-        tk.Label(toolbar, text="  Brush").pack(side=tk.LEFT)
-        tk.Scale(toolbar, from_=1, to=40, orient=tk.HORIZONTAL, variable=self.brush_radius_var, length=110).pack(side=tk.LEFT)
-        tk.Checkbutton(toolbar, text="Draw while zoomed", variable=self.draw_when_zoomed_var).pack(side=tk.LEFT, padx=8)
-        tk.Button(toolbar, text="Save Current Mask", command=self.save_current_label).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Save All Painted Masks", command=self.save_all_labels).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Clear Mask", command=self.clear_current_mask).pack(side=tk.LEFT, padx=3)
-        tk.Label(toolbar, text="  Label cleanup").pack(side=tk.LEFT)
-        tk.Spinbox(toolbar, from_=1, to=41, increment=2, width=4, textvariable=self.morph_kernel_var).pack(side=tk.LEFT, padx=3)
-        tk.Label(toolbar, text="Iter").pack(side=tk.LEFT)
-        tk.Spinbox(toolbar, from_=1, to=8, width=3, textvariable=self.morph_iterations_var).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Label Open", command=lambda: self.apply_mask_morph("open")).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Label Close", command=lambda: self.apply_mask_morph("close")).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Reset View", command=self.reset_view).pack(side=tk.LEFT, padx=3)
+        tk.Label(label_bar, text="  Brush").pack(side=tk.LEFT)
+        tk.Scale(label_bar, from_=1, to=40, orient=tk.HORIZONTAL, variable=self.brush_radius_var, length=110).pack(side=tk.LEFT)
+        tk.Checkbutton(label_bar, text="Draw while zoomed", variable=self.draw_when_zoomed_var).pack(side=tk.LEFT, padx=8)
+        tk.Button(label_bar, text="Save Current Mask", command=self.save_current_label).pack(side=tk.LEFT, padx=3)
+        tk.Button(label_bar, text="Save All Painted Masks", command=self.save_all_labels).pack(side=tk.LEFT, padx=3)
+        tk.Button(label_bar, text="Clear Mask", command=self.clear_current_mask).pack(side=tk.LEFT, padx=3)
+
+        mask_tools_bar = tk.Frame(self.root, padx=8, pady=4)
+        mask_tools_bar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(mask_tools_bar, text="Mask cleanup").pack(side=tk.LEFT)
+        tk.Label(mask_tools_bar, text="Kernel").pack(side=tk.LEFT, padx=(8, 0))
+        tk.Spinbox(mask_tools_bar, from_=1, to=41, increment=2, width=4, textvariable=self.morph_kernel_var).pack(side=tk.LEFT, padx=3)
+        tk.Label(mask_tools_bar, text="Iterations").pack(side=tk.LEFT)
+        tk.Spinbox(mask_tools_bar, from_=1, to=8, width=3, textvariable=self.morph_iterations_var).pack(side=tk.LEFT, padx=3)
+        tk.Button(mask_tools_bar, text="Label Open", command=lambda: self.apply_mask_morph("open")).pack(side=tk.LEFT, padx=3)
+        tk.Button(mask_tools_bar, text="Label Close", command=lambda: self.apply_mask_morph("close")).pack(side=tk.LEFT, padx=3)
+        tk.Button(mask_tools_bar, text="Reset View", command=self.reset_view).pack(side=tk.LEFT, padx=(12, 3))
 
         paths = tk.Frame(self.root, padx=8, pady=4)
         paths.pack(side=tk.TOP, fill=tk.X)
@@ -597,6 +667,19 @@ class PidNetTrainingApp:
         tk.Button(paths, text="Load Model", command=self.load_model_from_button).pack(side=tk.LEFT, padx=3)
         tk.Label(paths, textvariable=self.model_status_var, fg="#444").pack(side=tk.LEFT, padx=8)
 
+        review_bar = tk.Frame(self.root, padx=8, pady=4)
+        review_bar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(review_bar, text="Review dataset").pack(side=tk.LEFT)
+        tk.Button(review_bar, text="Open Train Folder", command=lambda: self.open_dataset_split("train")).pack(side=tk.LEFT, padx=3)
+        tk.Button(review_bar, text="Open Val Folder", command=lambda: self.open_dataset_split("val")).pack(side=tk.LEFT, padx=3)
+        tk.Button(review_bar, text="Open Captures", command=self.open_capture_folder).pack(side=tk.LEFT, padx=3)
+        tk.Button(review_bar, text="Delete Current Item", command=self.delete_current_item, fg="#a00000").pack(side=tk.LEFT, padx=(14, 3))
+        tk.Label(
+            review_bar,
+            text="Train/Val loads every image, including images with no mask.",
+            fg="#555",
+        ).pack(side=tk.LEFT, padx=10)
+
         train_bar = tk.Frame(self.root, padx=8, pady=4)
         train_bar.pack(side=tk.TOP, fill=tk.X)
         for label, var, width in (
@@ -606,7 +689,7 @@ class PidNetTrainingApp:
         ):
             tk.Label(train_bar, text=label).pack(side=tk.LEFT)
             tk.Spinbox(train_bar, from_=1, to=4096, width=width, textvariable=var, command=self.refresh_command_text).pack(side=tk.LEFT, padx=3)
-        tk.Label(train_bar, text="Target: cable + endpoints").pack(side=tk.LEFT, padx=(8, 8))
+        tk.Label(train_bar, text="Target: cable + endpoints + crossing").pack(side=tk.LEFT, padx=(8, 8))
         tk.Label(train_bar, text="Image WxH").pack(side=tk.LEFT)
         image_entry = tk.Entry(train_bar, textvariable=self.imgsz_var, width=10)
         image_entry.pack(side=tk.LEFT, padx=3)
@@ -623,8 +706,8 @@ class PidNetTrainingApp:
         for label, var, width in (
             ("LR", self.lr_var, 9),
             ("Weight Decay", self.weight_decay_var, 9),
-            ("Val Split", self.val_split_var, 6),
             ("Boundary", self.boundary_weight_var, 6),
+            ("Crossing", self.crossing_weight_var, 6),
         ):
             tk.Label(tune_bar, text=label).pack(side=tk.LEFT, padx=(10, 0))
             entry = tk.Entry(tune_bar, textvariable=var, width=width)
@@ -710,7 +793,7 @@ class PidNetTrainingApp:
         body.columnconfigure(1, weight=2)
         body.columnconfigure(2, weight=1)
         body.rowconfigure(1, weight=1)
-        titles = ["RGB + cable foreground", "Model test / training mask"]
+        titles = ["Captured RGB image", "Painted mask / model test"]
         self.canvases = []
         for column, title in enumerate(titles):
             tk.Label(body, text=title, font=("TkDefaultFont", 11, "bold")).grid(row=0, column=column, sticky="ew")
@@ -747,7 +830,8 @@ class PidNetTrainingApp:
         tk.Label(
             footer,
             text=(
-                "Keys: p capture, 1 cable, 2 endpoint, e erase, s save current, a save all, t train, "
+                "Keys: p capture, 1 cable, 2 endpoint, x crossing, c erase crossing, e erase all, "
+                "s save current, a save all, t train, "
                 "r test current/start live, [/] brush, z reset view. Unpainted pixels train as background. "
                 "Mouse wheel zooms; left-drag pans when zoomed unless Draw while zoomed is enabled."
             ),
@@ -785,7 +869,21 @@ class PidNetTrainingApp:
             ).pack(side=tk.LEFT)
         tk.Radiobutton(
             self.paint_mode_frame,
-            text="Erase",
+            text="crossing",
+            variable=self.mode_var,
+            value="crossing",
+            command=self.refresh,
+        ).pack(side=tk.LEFT)
+        tk.Radiobutton(
+            self.paint_mode_frame,
+            text="Erase crossing",
+            variable=self.mode_var,
+            value="erase_crossing",
+            command=self.refresh,
+        ).pack(side=tk.LEFT)
+        tk.Radiobutton(
+            self.paint_mode_frame,
+            text="Erase all",
             variable=self.mode_var,
             value="erase",
             command=self.refresh,
@@ -797,6 +895,8 @@ class PidNetTrainingApp:
         self.root.bind("3", lambda _event: self.set_mode("endpoint_2"))
         self.root.bind("4", lambda _event: self.set_mode("endpoint_3"))
         self.root.bind("5", lambda _event: self.set_mode("endpoint_4"))
+        self.root.bind("x", lambda _event: self.set_mode("crossing"))
+        self.root.bind("c", lambda _event: self.set_mode("erase_crossing"))
         self.root.bind("e", lambda _event: self.set_mode("erase"))
         self.root.bind("s", lambda _event: self.save_current_label())
         self.root.bind("a", lambda _event: self.save_all_labels())
@@ -845,23 +945,17 @@ class PidNetTrainingApp:
             label = int(np.clip(label, 1, max(1, int(self.cable_count_var.get()))))
             mode = f"endpoint_{label}"
         self.mode_var.set(mode)
-        label_value = self.active_label_value()
-        mode_name = "erase" if label_value <= 0 else label_display_name(label_value, self.cable_count_var.get())
+        mode_name = self.active_mode_name()
         self.status_var.set(f"Paint mode: {mode_name}.")
         self.refresh()
-
-    def on_cable_count_changed(self):
-        count = max(1, safe_int(self.cable_count_var, 2, min_value=1, max_value=4))
-        self.cable_count_var.set(count)
-        self.clear_prediction()
-        self.rebuild_paint_mode_buttons()
-        self.set_mode(self.mode_var.get())
 
     def active_label_value(self):
         mode = str(self.mode_var.get())
         if mode == "erase":
             return 0
         cable_count = max(1, int(self.cable_count_var.get()))
+        if mode in ("crossing", "erase_crossing"):
+            return crossing_label_value(cable_count)
         if mode.startswith("paint_"):
             try:
                 return int(np.clip(int(mode.split("_", 1)[1]), 1, cable_count))
@@ -875,10 +969,21 @@ class PidNetTrainingApp:
             return endpoint_label_value(cable_index, cable_count)
         return 1
 
+    def active_mode_name(self):
+        mode = str(self.mode_var.get())
+        if mode == "erase":
+            return "erase all"
+        if mode == "erase_crossing":
+            return "erase crossing"
+        return label_display_name(self.active_label_value(), self.cable_count_var.get())
+
     def set_active_split(self):
         item = self.active_item()
         if item is not None:
-            item["split"] = self.split_var.get()
+            new_split = self.split_var.get()
+            if item.get("split") != new_split:
+                item["split"] = new_split
+                item["dirty"] = True
         self.refresh()
 
     def on_threshold_change(self, _value=None):
@@ -1002,6 +1107,7 @@ class PidNetTrainingApp:
                     f"/{getattr(self.segmenter, 'input_mode', '?')}"
                     f" in={getattr(self.segmenter, 'input_channels', '?')}"
                     f" out={getattr(self.segmenter, 'output_channels', '?')}"
+                    f" crossing_ch={getattr(self.segmenter, 'crossing_channel', None)}"
                 )
             self.model_status_var.set(f"model {loaded}: {checkpoint_path.name} ({size_mb:.1f} MB){detail}")
         else:
@@ -1024,6 +1130,151 @@ class PidNetTrainingApp:
         )
         self.add_image_frames(paths)
         self.refresh()
+
+    def confirm_discard_unsaved(self, action):
+        dirty_count = sum(bool(item.get("dirty")) for item in self.frames)
+        if dirty_count == 0:
+            return True
+        return messagebox.askyesno(
+            "Unsaved mask edits",
+            f"{dirty_count} frame(s) have unsaved mask edits. Discard them and {action}?",
+        )
+
+    def open_dataset_split(self, split):
+        split = str(split).strip().lower()
+        if split not in ("train", "val"):
+            raise ValueError(f"Unsupported dataset split: {split}")
+        dataset_dir = Path(self.dataset_var.get()).expanduser().resolve()
+        self.load_review_folder(
+            dataset_dir / "images" / split,
+            split=split,
+            search_other_splits=False,
+            description=f"{split} folder",
+        )
+
+    def open_capture_folder(self):
+        dataset_dir = Path(self.dataset_var.get()).expanduser().resolve()
+        self.load_review_folder(
+            dataset_dir / "captures",
+            split=self.split_var.get(),
+            search_other_splits=True,
+            description="capture folder",
+        )
+
+    def load_review_folder(self, image_dir, split, search_other_splits, description):
+        image_dir = Path(image_dir).expanduser().resolve()
+        if not image_dir.is_dir():
+            messagebox.showerror("Dataset folder missing", f"Folder does not exist:\n{image_dir}")
+            return False
+        image_paths = sorted(
+            path for path in image_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if not image_paths:
+            messagebox.showerror("Dataset folder empty", f"No supported images found in:\n{image_dir}")
+            return False
+        if not self.confirm_discard_unsaved(f"open the {description}"):
+            return False
+
+        dataset_dir = Path(self.dataset_var.get()).expanduser().resolve()
+        loaded = []
+        for image_path in image_paths:
+            bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if bgr is None:
+                messagebox.showerror("Unreadable image", f"Could not read dataset image:\n{image_path}")
+                return False
+            loaded.append(
+                make_frame_item(
+                    bgr,
+                    path=image_path,
+                    split=split,
+                    dataset_dir=dataset_dir,
+                    cable_count=max(1, int(self.cable_count_var.get())),
+                    search_other_splits=search_other_splits,
+                )
+            )
+
+        self.frames = loaded
+        self.selected_frame_idx = 0
+        self.live_test_var.set(False)
+        self.prediction_probability = None
+        self.prediction_frame_key = None
+        self.prediction_summary = ""
+        self.sync_split_from_active()
+        self.reset_view()
+        missing_count = sum(item_mask_state(item) == "MASK MISSING" for item in loaded)
+        self.status_var.set(
+            f"Opened {len(loaded)} image(s) from {description}; {missing_count} have no saved mask."
+        )
+        self.refresh()
+        return True
+
+    def delete_current_item(self):
+        item = self.active_item()
+        if item is None or not item.get("path"):
+            messagebox.showerror("Cannot delete item", "Select a saved dataset or capture image first.")
+            return False
+
+        dataset_dir = Path(self.dataset_var.get()).expanduser().resolve()
+        source_path = Path(item["path"]).expanduser().resolve()
+        if not path_is_within(source_path, dataset_dir):
+            messagebox.showerror(
+                "Delete refused",
+                f"This image is outside the active dataset and will not be deleted:\n{source_path}",
+            )
+            return False
+
+        image_path, mask_path = label_paths_for_item(item, dataset_dir, index=self.selected_frame_idx)
+        candidate_paths = [
+            source_path,
+            image_path,
+            mask_path,
+            layered_mask_path_from_mask_path(mask_path),
+        ]
+        for key in ("saved_image_path", "saved_mask_path", "saved_layer_path"):
+            if item.get(key):
+                candidate_paths.append(Path(item[key]))
+
+        resolved_paths = []
+        seen = set()
+        for path in candidate_paths:
+            resolved = Path(path).expanduser().resolve()
+            if not path_is_within(resolved, dataset_dir):
+                messagebox.showerror("Delete refused", f"A related file is outside the active dataset:\n{resolved}")
+                return False
+            key = str(resolved).lower()
+            if key not in seen and resolved.exists():
+                seen.add(key)
+                resolved_paths.append(resolved)
+
+        if not resolved_paths:
+            messagebox.showerror("Nothing to delete", "No files for the selected item exist on disk.")
+            return False
+        if not messagebox.askyesno(
+            "Delete dataset item",
+            f"Delete {source_path.name} and {len(resolved_paths) - 1} related file(s)?\n"
+            f"Mask state: {item_mask_state(item)}\n\nThis cannot be undone.",
+        ):
+            return False
+
+        try:
+            for path in resolved_paths:
+                path.unlink()
+        except OSError as exc:
+            messagebox.showerror("Delete failed", f"Dataset deletion failed:\n{exc}")
+            raise
+
+        removed_name = source_path.name
+        self.frames.pop(self.selected_frame_idx)
+        self.selected_frame_idx = min(self.selected_frame_idx, len(self.frames) - 1) if self.frames else -1
+        self.prediction_probability = None
+        self.prediction_frame_key = None
+        self.prediction_summary = ""
+        self.sync_split_from_active()
+        self.reset_view()
+        self.status_var.set(f"Deleted dataset item {removed_name} ({len(resolved_paths)} file(s)).")
+        self.refresh()
+        return True
 
     def add_image_frames(self, paths):
         added = 0
@@ -1087,9 +1338,11 @@ class PidNetTrainingApp:
         if self.latest_bgr is None:
             self.status_var.set("No live ZED frame available. Use Open Images or wait for camera preview.")
             return
-        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
-        filename = CAPTURE_DIR / f"cable_frame_{time.strftime('%Y%m%d_%H%M%S')}_{len(self.frames):04d}.png"
-        cv2.imwrite(str(filename), self.latest_bgr)
+        capture_dir = Path(self.dataset_var.get()).expanduser().resolve() / "captures"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        filename = capture_dir / f"cable_frame_{time.strftime('%Y%m%d_%H%M%S')}_{len(self.frames):04d}.png"
+        if not cv2.imwrite(str(filename), self.latest_bgr):
+            raise IOError(f"Could not write captured image: {filename}")
         self.frames.append(
             make_frame_item(
                 self.latest_bgr,
@@ -1101,7 +1354,10 @@ class PidNetTrainingApp:
         )
         self.selected_frame_idx = len(self.frames) - 1
         self.reset_view()
-        self.status_var.set(f"Captured {filename.name}. Paint cable bodies and endpoints; the rest is background.")
+        self.status_var.set(
+            f"Captured {filename.name}. Paint cable, endpoints, and the independent crossing layer; "
+            "the rest is background."
+        )
         self.refresh()
 
     def previous_frame(self):
@@ -1127,6 +1383,8 @@ class PidNetTrainingApp:
         item = self.active_item()
         if item is None:
             return
+        if np.any(item["mask"]):
+            item["dirty"] = True
         item["mask"].fill(0)
         self.status_var.set("Cleared current mask.")
         self.refresh()
@@ -1154,12 +1412,15 @@ class PidNetTrainingApp:
             return
         before = int(np.count_nonzero(label_pixels(item["mask"], label, self.cable_count_var.get(), multilabel=True)))
         binary = label_pixels(item["mask"], label, self.cable_count_var.get(), multilabel=True).astype(np.uint8) * 255
+        original_binary = binary.copy()
         binary = cv2.morphologyEx(binary, op_map[operation], kernel, iterations=iterations)
         bit = label_bit(label)
         active_pixels = (item["mask"] & bit) != 0
         item["mask"][active_pixels] = item["mask"][active_pixels] & np.uint16(~int(bit) & 0xFFFF)
         item["mask"][binary > 127] |= bit
         after = int(np.count_nonzero(label_pixels(item["mask"], label, self.cable_count_var.get(), multilabel=True)))
+        if not np.array_equal(original_binary, binary):
+            item["dirty"] = True
         self.status_var.set(
             f"Applied mask {operation} to {label_display_name(label, self.cable_count_var.get())}: "
             f"px {before} -> {after}."
@@ -1217,9 +1478,9 @@ class PidNetTrainingApp:
             "device": str(self.device_var.get() or "cuda"),
             "lr": safe_float(self.lr_var, 1e-3, min_value=1e-8),
             "weight_decay": safe_float(self.weight_decay_var, 1e-4, min_value=0.0),
-            "val_split": safe_float(self.val_split_var, 0.15, min_value=0.0, max_value=0.8),
             "num_workers": safe_int(self.num_workers_var, 4, min_value=0),
             "boundary_weight": safe_float(self.boundary_weight_var, 0.20, min_value=0.0),
+            "crossing_weight": safe_float(self.crossing_weight_var, 1.0, min_value=0.0),
             "amp": bool(self.amp_var.get()),
             "test_threshold": safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
             "config": str(Path(self.config_var.get() or DEFAULT_CONFIG_PATH)),
@@ -1251,8 +1512,8 @@ class PidNetTrainingApp:
         for key, var in (
             ("lr", self.lr_var),
             ("weight_decay", self.weight_decay_var),
-            ("val_split", self.val_split_var),
             ("boundary_weight", self.boundary_weight_var),
+            ("crossing_weight", self.crossing_weight_var),
             ("test_threshold", self.test_threshold_var),
         ):
             if key in params:
@@ -1286,19 +1547,12 @@ class PidNetTrainingApp:
         self.refresh_command_text()
 
     def save_pidnet_params(self):
-        path = filedialog.asksaveasfilename(
-            title="Save PIDNet training parameters",
-            initialfile=DEFAULT_PARAMS_PATH.name,
-            initialdir=str(PROJECT_DIR),
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        output_path = Path(path)
+        output_path = DEFAULT_PARAMS_PATH
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(self.current_pidnet_params(), indent=2) + "\n", encoding="utf-8")
-        self.status_var.set(f"Saved PIDNet parameters: {output_path.name}")
+        temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+        temporary_path.write_text(json.dumps(self.current_pidnet_params(), indent=2) + "\n", encoding="utf-8")
+        temporary_path.replace(output_path)
+        self.status_var.set(f"Saved PIDNet parameters automatically: {output_path}")
 
     def load_pidnet_params(self):
         path = filedialog.askopenfilename(
@@ -1324,9 +1578,11 @@ class PidNetTrainingApp:
         total_empty = 0
         total_heavy = 0
         total_shape_mismatch = 0
+        split_stems = {}
         for split in ("train", "val"):
             image_dir = dataset_dir / "images" / split
             mask_dir = dataset_dir / "masks" / split
+            layer_dir = dataset_dir / "masks_layers" / split
             pairs = dataset_image_mask_pairs(dataset_dir, split)
             total_pairs += len(pairs)
             image_stems = set()
@@ -1335,12 +1591,19 @@ class PidNetTrainingApp:
                 image_stems = {path.stem for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
             if mask_dir.exists():
                 mask_stems = {path.stem for path in mask_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
+            layer_stems = set()
+            if layer_dir.exists():
+                layer_stems = {path.stem for path in layer_dir.iterdir() if path.suffix.lower() == ".npz"}
+            split_stems[split] = image_stems
             missing_masks = len(image_stems - mask_stems)
             missing_images = len(mask_stems - image_stems)
+            missing_layers = len(image_stems - layer_stems)
+            orphan_layers = len(layer_stems - image_stems)
             empty = 0
             heavy = 0
             shape_mismatch = 0
             overlap_pixels = 0
+            crossing_pixels = 0
             for image_path, mask_path in pairs:
                 image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if image is None:
@@ -1360,17 +1623,29 @@ class PidNetTrainingApp:
                 if mask_is_multilabel:
                     bit_counts = np.unpackbits(mask.astype(np.uint16).view(np.uint8), axis=None).reshape(mask.size, 2, 8).sum(axis=(1, 2))
                     overlap_pixels += int(np.count_nonzero(bit_counts > 1))
+                    crossing_pixels += int(
+                        np.count_nonzero(
+                            label_pixels(
+                                mask,
+                                crossing_label_value(max(1, int(self.cable_count_var.get()))),
+                                max(1, int(self.cable_count_var.get())),
+                                multilabel=True,
+                            )
+                        )
+                    )
             total_empty += empty
             total_heavy += heavy
             total_shape_mismatch += shape_mismatch
             lines.append(
                 f"{split}: pairs={len(pairs)} missing_masks={missing_masks} missing_images={missing_images} "
-                f"empty={empty} very_large_masks={heavy} shape_mismatch={shape_mismatch} overlap_px={overlap_pixels}"
+                f"missing_layers={missing_layers} orphan_layers={orphan_layers} "
+                f"empty={empty} very_large_masks={heavy} shape_mismatch={shape_mismatch} "
+                f"overlap_px={overlap_pixels} crossing_px={crossing_pixels}"
             )
+        split_overlap = sorted(split_stems.get("train", set()) & split_stems.get("val", set()))
+        lines.append(f"train_val_overlap={len(split_overlap)} {split_overlap}")
         if total_pairs == 0:
             lines.append("Need saved image/mask pairs before training.")
-        if total_pairs > 0 and count_labeled_pairs(dataset_dir)["val"] == 0:
-            lines.append("No saved val split found; trainer will split train pairs automatically.")
         report = "\n".join(lines) + "\n"
         self.output_text.insert(tk.END, report)
         self.output_text.see(tk.END)
@@ -1404,12 +1679,12 @@ class PidNetTrainingApp:
             f"{safe_float(self.lr_var, 1e-3, min_value=1e-8):.8g}",
             "--weight-decay",
             f"{safe_float(self.weight_decay_var, 1e-4, min_value=0.0):.8g}",
-            "--val-split",
-            f"{safe_float(self.val_split_var, 0.15, min_value=0.0, max_value=0.8):.8g}",
             "--num-workers",
             str(safe_int(self.num_workers_var, 4, min_value=0)),
             "--boundary-weight",
             f"{safe_float(self.boundary_weight_var, 0.20, min_value=0.0):.8g}",
+            "--crossing-weight",
+            f"{safe_float(self.crossing_weight_var, 1.0, min_value=0.0):.8g}",
         ]
         command.append("--amp" if bool(self.amp_var.get()) else "--no-amp")
         return command
@@ -1423,12 +1698,13 @@ class PidNetTrainingApp:
         convention = (
             "Mask labels: 0=background, labels 1.."
             f"{cable_count}=cable body layers merged as cable, labels {cable_count + 1}.."
-            f"{2 * cable_count}=separate endpoint layers endpoints_1..endpoints_{cable_count}."
+            f"{2 * cable_count}=separate endpoint layers endpoints_1..endpoints_{cable_count}, "
+            f"label {crossing_label_value(cable_count)}=crossing."
         )
         text = (
             f"Dataset: train={counts['train']} val={counts['val']}\n"
-            f"{convention} Crossing pixels are stored in masks_layers/*.npz as independent label bits; masks/*.png is the flat preview mask. Old 255 masks load as cable.\n"
-            "Training target: RGB -> cable mask + separated endpoint masks. Cable-body identity is not trained in the neural network.\n"
+            f"{convention} All layers are stored as independent bits in masks_layers/*.npz; masks/*.png is the flat preview mask. Old 255 masks load as cable.\n"
+            "Training target: RGB -> cable mask + separated endpoint masks + crossing mask. Crossing uses its own class-balanced loss.\n"
             f"Checkpoint: {Path(self.output_var.get())}\n"
             f"Live cleanup preview: threshold={cleanup_params['threshold']:.2f}, min_area={cleanup_params['min_area_px']}, "
             f"open={cleanup_params['open_kernel']}, close={cleanup_params['close_kernel']}\n"
@@ -1549,120 +1825,84 @@ class PidNetTrainingApp:
     def cleaned_prediction_label_mask(self, probability, include_endpoints=True):
         params = self.live_cleanup_params()
         probability = np.asarray(probability, dtype=np.float32)
-        if probability.ndim != 3:
-            predicted, raw_predicted, component_count = self.cleaned_prediction_mask(probability)
-            labels = np.zeros(predicted.shape[:2], dtype=np.uint8)
-            raw_labels = np.zeros(predicted.shape[:2], dtype=np.uint8)
-            labels[predicted] = 1
-            raw_labels[raw_predicted] = 1
-            return labels, raw_labels, component_count
-
         configured_cable_count = max(1, int(self.cable_count_var.get()))
-        label_mode = str(self.prediction_label_mode).strip().lower()
+        expected_channels = OUTPUT_CHANNEL_COUNT
+        if probability.ndim != 3 or probability.shape[2] != expected_channels:
+            raise ValueError(
+                f"PIDNet prediction must have shape HxWx{expected_channels}; got {probability.shape}."
+            )
+        if not crossing_prediction_label_mode(self.prediction_label_mode):
+            raise ValueError(f"Unsupported PIDNet label mode: {self.prediction_label_mode!r}")
         labels = np.zeros(probability.shape[:2], dtype=np.uint8)
         raw_labels = np.zeros(probability.shape[:2], dtype=np.uint8)
-        component_count = 0
-        if generic_cable_endpoint_label_mode(label_mode) and probability.shape[2] >= 2:
-            raw = (probability[:, :, 0] >= params["threshold"]).astype(np.uint8) * 255
-            cleaned, component_count = apply_binary_cleanup(raw, params)
-            raw_labels[raw > 0] = 1
-            labels[cleaned > 0] = 1
-            if bool(include_endpoints):
-                endpoint_count = min(configured_cable_count, max(0, probability.shape[2] - 1))
-                for endpoint_index in range(endpoint_count):
-                    endpoint_raw = probability[:, :, 1 + endpoint_index] >= params["threshold"]
-                    if not np.any(endpoint_raw):
-                        continue
-                    endpoint_label = endpoint_label_value(endpoint_index + 1, configured_cable_count)
-                    raw_labels[endpoint_raw] = endpoint_label
-                    labels[endpoint_raw] = endpoint_label
-            return labels, raw_labels, component_count
-
-        body_channel_count = min(configured_cable_count, probability.shape[2])
-        if label_mode == "endpoints":
-            endpoint_channel_count = 1 if probability.shape[2] == 1 else body_channel_count
-            for channel in range(endpoint_channel_count):
-                raw = (probability[:, :, channel] >= params["threshold"]).astype(np.uint8) * 255
-                cleaned, channel_components = apply_binary_cleanup(raw, params)
-                label = endpoint_label_value(min(channel + 1, configured_cable_count), configured_cable_count)
-                raw_labels[raw > 0] = label
-                labels[cleaned > 0] = label
-                component_count += int(channel_components)
-            return labels, raw_labels, component_count
-
-        for channel in range(body_channel_count):
-            raw = (probability[:, :, channel] >= params["threshold"]).astype(np.uint8) * 255
-            cleaned, channel_components = apply_binary_cleanup(raw, params)
-            label = channel + 1
-            raw_labels[raw > 0] = label
-            labels[cleaned > 0] = label
-            component_count += int(channel_components)
-
-        if bool(include_endpoints) and probability.shape[2] >= 2 * configured_cable_count:
-            for cable_index in range(configured_cable_count):
-                endpoint = probability[:, :, configured_cable_count + cable_index] >= params["threshold"]
-                if np.any(endpoint):
-                    labels[endpoint] = endpoint_label_value(cable_index + 1, configured_cable_count)
-
+        raw = (probability[:, :, 0] >= params["threshold"]).astype(np.uint8) * 255
+        cleaned, component_count = apply_binary_cleanup(raw, params)
+        raw_labels[raw > 0] = 1
+        labels[cleaned > 0] = 1
+        if bool(include_endpoints):
+            for endpoint_index in range(configured_cable_count):
+                endpoint_raw = probability[:, :, 1 + endpoint_index] >= params["threshold"]
+                endpoint_label = endpoint_label_value(endpoint_index + 1, configured_cable_count)
+                raw_labels[endpoint_raw] = endpoint_label
+                labels[endpoint_raw] = endpoint_label
+        crossing_channel = CROSSING_CHANNEL
+        crossing_raw = probability[:, :, crossing_channel] >= params["threshold"]
+        crossing_label = crossing_label_value(configured_cable_count)
+        raw_labels[crossing_raw] = crossing_label
+        labels[crossing_raw] = crossing_label
         return labels, raw_labels, component_count
 
     def cable_probability_union(self, probability):
         probability = np.asarray(probability, dtype=np.float32)
-        if probability.ndim == 3:
-            if generic_cable_endpoint_label_mode(self.prediction_label_mode):
-                return np.ascontiguousarray(probability[:, :, 0], dtype=np.float32)
-            cable_count = min(max(1, int(self.cable_count_var.get())), probability.shape[2])
-            probability = np.max(probability[:, :, :cable_count], axis=2)
-        return np.ascontiguousarray(probability, dtype=np.float32)
+        if probability.ndim != 3:
+            raise ValueError(f"PIDNet prediction must be HxWxC; got {probability.shape}.")
+        return np.ascontiguousarray(probability[:, :, 0], dtype=np.float32)
 
     def endpoint_probability_union(self, probability):
         probability = np.asarray(probability, dtype=np.float32)
-        if probability.ndim != 3:
-            return np.zeros(probability.shape[:2], dtype=np.float32)
         cable_count = max(1, int(self.cable_count_var.get()))
-        label_mode = str(self.prediction_label_mode).strip().lower()
-        if generic_cable_endpoint_label_mode(label_mode) and probability.shape[2] >= 2:
-            endpoint_count = min(cable_count, max(0, probability.shape[2] - 1))
-            if endpoint_count <= 0:
-                return np.zeros(probability.shape[:2], dtype=np.float32)
-            return np.ascontiguousarray(
-                np.max(probability[:, :, 1:1 + endpoint_count], axis=2),
-                dtype=np.float32,
-            )
-        if label_mode == "endpoints":
-            if probability.shape[2] == 1:
-                return np.ascontiguousarray(probability[:, :, 0], dtype=np.float32)
-            if probability.shape[2] < cable_count:
-                return np.zeros(probability.shape[:2], dtype=np.float32)
-            return np.ascontiguousarray(
-                np.max(probability[:, :, :cable_count], axis=2),
-                dtype=np.float32,
-            )
-        if probability.shape[2] < 2 * cable_count:
-            return np.zeros(probability.shape[:2], dtype=np.float32)
+        if probability.ndim != 3 or probability.shape[2] != OUTPUT_CHANNEL_COUNT:
+            raise ValueError(f"PIDNet prediction must have {OUTPUT_CHANNEL_COUNT} channels; got {probability.shape}.")
         return np.ascontiguousarray(
-            np.max(probability[:, :, cable_count:2 * cable_count], axis=2),
+            np.max(probability[:, :, 1:1 + cable_count], axis=2),
             dtype=np.float32,
         )
 
+    def crossing_probability(self, probability):
+        probability = np.asarray(probability, dtype=np.float32)
+        if not crossing_prediction_label_mode(self.prediction_label_mode):
+            raise ValueError(f"Unsupported PIDNet label mode: {self.prediction_label_mode!r}")
+        crossing_channel = CROSSING_CHANNEL
+        if probability.ndim != 3 or probability.shape[2] != crossing_channel + 1:
+            raise ValueError(f"PIDNet crossing prediction is missing from shape {probability.shape}.")
+        return np.ascontiguousarray(probability[:, :, crossing_channel], dtype=np.float32)
+
     def labeled_probability_union(self, probability):
-        label_mode = str(self.prediction_label_mode).strip().lower()
-        if label_mode == "endpoints":
-            endpoint = self.endpoint_probability_union(probability)
-            return endpoint
         cable = self.cable_probability_union(probability)
         endpoint = self.endpoint_probability_union(probability)
         if endpoint.shape == cable.shape and np.any(endpoint):
-            return np.maximum(cable, endpoint)
+            cable = np.maximum(cable, endpoint)
+        crossing = self.crossing_probability(probability)
+        if crossing.shape == cable.shape and np.any(crossing):
+            cable = np.maximum(cable, crossing)
         return cable
 
     def segmenter_probability(self, segmenter, bgr, mask=None, mask_is_multilabel=False):
         probability = segmenter.probability_maps(bgr)
-        expected_channels = 1 + max(1, int(self.cable_count_var.get()))
-        if probability.ndim != 3 or probability.shape[2] < expected_channels:
+        cable_count = max(1, int(self.cable_count_var.get()))
+        expected_channels = OUTPUT_CHANNEL_COUNT
+        expected_crossing_channel = CROSSING_CHANNEL
+        if probability.ndim != 3 or probability.shape[2] != expected_channels:
             raise RuntimeError(
                 f"The selected checkpoint must output {expected_channels} channels: "
-                f"cable plus endpoints_1..endpoints_{expected_channels - 1}."
+                f"cable, endpoints_1..endpoints_{cable_count}, and crossing."
+            )
+        if not bool(getattr(segmenter, "crossing_channels", False)):
+            raise RuntimeError("The selected checkpoint does not declare a crossing prediction channel. Retrain it.")
+        if int(getattr(segmenter, "crossing_channel", -1)) != expected_crossing_channel:
+            raise RuntimeError(
+                f"Checkpoint crossing channel is {getattr(segmenter, 'crossing_channel', None)}; "
+                f"expected {expected_crossing_channel}."
             )
         return probability
 
@@ -1673,7 +1913,6 @@ class PidNetTrainingApp:
         key = (
             self.checkpoint_signature(checkpoint_path),
             str(self.device_var.get() or "cuda"),
-            safe_int(self.base_channels_var, 24, min_value=1),
         )
         if force_reload or self.segmenter is None or self.segmenter_key != key:
             from cable_pidnet import PidNetSegmenter
@@ -1681,7 +1920,6 @@ class PidNetTrainingApp:
             self.segmenter = PidNetSegmenter(
                 checkpoint_path,
                 device=str(self.device_var.get() or "cuda"),
-                base_channels=safe_int(self.base_channels_var, 24, min_value=1),
             )
             self.segmenter_key = key
             self.prediction_probability = None
@@ -1733,11 +1971,27 @@ class PidNetTrainingApp:
                     endpoint_target,
                 )
                 endpoint_text = f" | end IoU {endpoint_metrics['iou']:.3f}"
+            crossing_target = crossing_label_mask(item["mask"], cable_count, multilabel=True)
+            crossing_probability = self.crossing_probability(probability)
+            crossing_pixels = int(np.count_nonzero(crossing_probability >= safe_float(
+                self.test_threshold_var,
+                0.50,
+                min_value=0.05,
+                max_value=0.95,
+            )))
+            crossing_text = f" | cross {crossing_pixels}px"
+            if np.any(crossing_target):
+                crossing_metrics = binary_mask_metrics(
+                    crossing_probability >= safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
+                    crossing_target,
+                )
+                crossing_text = f" | cross IoU {crossing_metrics['iou']:.3f} ({crossing_pixels}px)"
             if np.any(body_target):
                 metrics = binary_mask_metrics(predicted, body_target)
                 self.prediction_summary = (
                     f"IoU {metrics['iou']:.3f} Dice {metrics['dice']:.3f} | "
-                    f"pred {metrics['predicted']} label {metrics['target']} comp {component_count}{endpoint_text}"
+                    f"pred {metrics['predicted']} label {metrics['target']} comp {component_count}"
+                    f"{endpoint_text}{crossing_text}"
                 )
             elif np.any(endpoint_target):
                 self.prediction_summary = (
@@ -1797,7 +2051,12 @@ class PidNetTrainingApp:
         predicted, _raw_predicted, component_count = self.cleaned_prediction_mask(probability)
         endpoint_probability = self.endpoint_probability_union(probability)
         endpoint_pixels = int(np.count_nonzero(endpoint_probability >= safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95)))
-        self.prediction_summary = f"live cable pixels {int(np.count_nonzero(predicted))} endpoints {endpoint_pixels} comp {component_count}"
+        crossing_probability = self.crossing_probability(probability)
+        crossing_pixels = int(np.count_nonzero(crossing_probability >= safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95)))
+        self.prediction_summary = (
+            f"live cable pixels {int(np.count_nonzero(predicted))} endpoints {endpoint_pixels} "
+            f"crossing {crossing_pixels} comp {component_count}"
+        )
         self.live_test_last_time = now
         return True
 
@@ -1820,6 +2079,9 @@ class PidNetTrainingApp:
         endpoint_intersection = 0
         endpoint_union = 0
         endpoint_tested = 0
+        crossing_intersection = 0
+        crossing_union = 0
+        crossing_tested = 0
         tested = 0
         cable_count = max(1, int(self.cable_count_var.get()))
         for image_path, mask_path in pairs:
@@ -1848,6 +2110,13 @@ class PidNetTrainingApp:
                 endpoint_intersection += int(np.count_nonzero(endpoint_predicted & endpoint_target))
                 endpoint_union += int(np.count_nonzero(endpoint_predicted | endpoint_target))
                 endpoint_tested += 1
+            crossing_target = crossing_label_mask(mask, cable_count, multilabel=mask_is_multilabel)
+            crossing_probability = self.crossing_probability(probability)
+            if np.any(crossing_target) and crossing_probability.shape == crossing_target.shape:
+                crossing_predicted = crossing_probability >= params["threshold"]
+                crossing_intersection += int(np.count_nonzero(crossing_predicted & crossing_target))
+                crossing_union += int(np.count_nonzero(crossing_predicted | crossing_target))
+                crossing_tested += 1
             tested += 1
 
         if tested == 0:
@@ -1858,10 +2127,13 @@ class PidNetTrainingApp:
         endpoint_text = ""
         if endpoint_tested > 0:
             endpoint_text = f" | endpoint IoU {endpoint_intersection / max(endpoint_union, 1):.4f}"
+        crossing_text = ""
+        if crossing_tested > 0:
+            crossing_text = f" | crossing IoU {crossing_intersection / max(crossing_union, 1):.4f}"
         line = (
             f"{split} test: {tested} images | threshold {params['threshold']:.2f} "
             f"open {params['open_kernel']} close {params['close_kernel']} min_area {params['min_area_px']} "
-            f"| body IoU {iou:.4f} | Dice {dice:.4f}{endpoint_text}\n"
+            f"| body IoU {iou:.4f} | Dice {dice:.4f}{endpoint_text}{crossing_text}\n"
         )
         self.output_text.insert(tk.END, line)
         self.output_text.see(tk.END)
@@ -1912,14 +2184,47 @@ class PidNetTrainingApp:
 
     def make_overlay_panel(self, bgr, mask):
         panel = bgr.copy()
-        draw_label_mask(panel, mask, alpha=0.55, cable_count=max(1, int(self.cable_count_var.get())), multilabel=True)
+        draw_label_mask(
+            panel,
+            mask,
+            alpha=0.55,
+            cable_count=max(1, int(self.cable_count_var.get())),
+            multilabel=True,
+        )
+        item = self.active_item()
+        if item is not None:
+            state = item_mask_state(item)
+            state_color = (40, 80, 255) if state == "MASK MISSING" else (60, 220, 255) if state.startswith("unsaved") else (80, 230, 80)
+            title = f"{Path(item['path']).name if item.get('path') else 'unsaved frame'} | {state}"
+            overlay = panel.copy()
+            cv2.rectangle(overlay, (0, 0), (panel.shape[1], 44), (0, 0, 0), -1)
+            panel = cv2.addWeighted(overlay, 0.72, panel, 0.28, 0.0)
+            cv2.putText(panel, title[:110], (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.72, state_color, 2, cv2.LINE_AA)
         return panel
 
     def make_mask_panel(self, bgr, mask):
         panel = np.full_like(bgr, 18)
         draw_label_mask(panel, mask, alpha=1.0, cable_count=max(1, int(self.cable_count_var.get())), multilabel=True)
         if not np.any(mask):
-            cv2.putText(panel, "Paint cable and endpoint labels", (28, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+            state = item_mask_state(self.active_item())
+            if state == "MASK MISSING":
+                cv2.putText(panel, "MASK MISSING", (28, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (40, 80, 255), 3, cv2.LINE_AA)
+                cv2.putText(
+                    panel,
+                    "Paint the mask, then use Save Current Mask - or delete this item.",
+                    (28, 112),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            elif state == "unsaved changes":
+                cv2.putText(panel, "EMPTY MASK - UNSAVED", (28, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (60, 220, 255), 2, cv2.LINE_AA)
+            elif state == "saved mask":
+                cv2.putText(panel, "SAVED BACKGROUND-ONLY MASK", (28, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (80, 230, 80), 2, cv2.LINE_AA)
+            else:
+                cv2.putText(panel, "Paint cable, endpoints, and crossing labels", (28, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         return panel
 
     def make_prediction_panel(self, bgr, mask, probability):
@@ -1930,14 +2235,8 @@ class PidNetTrainingApp:
         threshold = params["threshold"]
         cable_count = max(1, int(self.cable_count_var.get()))
         predicted_labels, raw_predicted_labels, component_count = self.cleaned_prediction_label_mask(probability)
-        predicted = body_label_mask(predicted_labels, cable_count)
-        raw_predicted = body_label_mask(raw_predicted_labels, cable_count)
+        predicted, raw_predicted, _cable_component_count = self.cleaned_prediction_mask(probability)
         label = body_label_mask(mask, cable_count, multilabel=True)
-        endpoint_preview = str(self.prediction_label_mode).strip().lower() == "endpoints"
-        if endpoint_preview:
-            predicted = endpoint_label_mask(predicted_labels, cable_count)
-            raw_predicted = endpoint_label_mask(raw_predicted_labels, cable_count)
-            label = endpoint_label_mask(mask, cable_count, multilabel=True)
         if label.shape != predicted.shape:
             label = cv2.resize(label.astype(np.uint8), (predicted.shape[1], predicted.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
 
@@ -1945,16 +2244,23 @@ class PidNetTrainingApp:
         heat = cv2.applyColorMap(np.clip(probability_union * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
         panel = cv2.addWeighted(bgr, 0.72, heat, 0.28, 0.0)
         draw_label_mask(panel, predicted_labels, alpha=0.94, cable_count=cable_count, outline=True)
+        crossing_predicted = self.crossing_probability(probability) >= threshold
+        crossing_target = crossing_label_mask(mask, cable_count, multilabel=True)
         if np.any(label):
             false_positive = predicted & ~label
             false_negative = ~predicted & label
             draw_mask_contours(panel, false_positive.astype(np.uint8) * 255, (40, 40, 255), thickness=2)
             draw_mask_contours(panel, false_negative.astype(np.uint8) * 255, (255, 80, 40), thickness=2)
-            legend = "endpoint magenta | red extra | blue missed" if endpoint_preview else "cable green | endpoint magenta | red extra | blue missed"
+            if np.any(crossing_target):
+                crossing_extra = crossing_predicted & ~crossing_target
+                crossing_missed = ~crossing_predicted & crossing_target
+                draw_mask_contours(panel, crossing_extra.astype(np.uint8) * 255, (40, 40, 255), thickness=3)
+                draw_mask_contours(panel, crossing_missed.astype(np.uint8) * 255, (255, 80, 40), thickness=3)
+            legend = "cable green | endpoints magenta/cyan | crossing yellow | red extra | blue missed"
         else:
             removed = raw_predicted & ~predicted
             draw_stroke_mask(panel, removed.astype(np.uint8) * 255, (64, 64, 180), alpha=0.42)
-            legend = "endpoint magenta | dim red removed" if endpoint_preview else "cable green | endpoint magenta | dim red removed"
+            legend = "cable green | endpoints magenta/cyan | crossing yellow | dim red removed"
         cv2.putText(
             panel,
             f"thr {threshold:.2f} open {params['open_kernel']} close {params['close_kernel']} min {params['min_area_px']}",
@@ -1987,6 +2293,7 @@ class PidNetTrainingApp:
             mask_count = int(np.count_nonzero(item["mask"]))
             background_count = int(item["mask"].size - mask_count)
             split = item.get("split") or "train"
+        mask_state_text = item_mask_state(item)
         label_counts = ""
         if item is not None:
             cable_count = max(1, int(self.cable_count_var.get()))
@@ -1997,6 +2304,9 @@ class PidNetTrainingApp:
                 f"endpoints_{index}={int(np.count_nonzero(label_pixels(item['mask'], endpoint_label_value(index, cable_count), cable_count, multilabel=True)))}"
                 for index in range(1, cable_count + 1)
             )
+            counts.append(
+                f"crossing={int(np.count_nonzero(label_pixels(item['mask'], crossing_label_value(cable_count), cable_count, multilabel=True)))}"
+            )
             label_counts = " | " + " ".join(counts)
         drag_mode = "draw" if self.draw_when_zoomed_var.get() else "pan"
         test_text = ""
@@ -2006,10 +2316,9 @@ class PidNetTrainingApp:
                 test_text += f" | {self.prediction_summary}"
         elif self.prediction_summary:
             test_text = f" | {self.prediction_summary}"
-        label_value = self.active_label_value()
-        mode_name = "erase" if label_value <= 0 else label_display_name(label_value, self.cable_count_var.get())
+        mode_name = self.active_mode_name()
         self.status_var.set(
-            f"{frame_text} | split {split} | mode {mode_name} | brush {self.brush_radius_var.get()} px | "
+            f"{frame_text} | split {split} | mask {mask_state_text} | mode {mode_name} | brush {self.brush_radius_var.get()} px | "
             f"zoom {self.view_zoom:.1f}x ({drag_mode} while zoomed) | labeled px {mask_count} | background px {background_count}"
             f"{label_counts}{test_text}"
         )
@@ -2216,13 +2525,9 @@ class PidNetTrainingApp:
             self.status_var.set("Open or capture a frame before painting labels.")
             return
         radius = int(self.brush_radius_var.get())
-        color = self.active_label_value()
         brush = np.zeros(item["mask"].shape[:2], dtype=np.uint8)
         cv2.circle(brush, (x, y), radius, 255, -1, cv2.LINE_8)
-        if color <= 0:
-            item["mask"][brush > 0] = 0
-        else:
-            item["mask"][brush > 0] |= label_bit(color)
+        self.apply_brush(item, brush)
         self.refresh()
 
     def paint_line(self, start_xy, end_xy):
@@ -2234,14 +2539,30 @@ class PidNetTrainingApp:
             self.status_var.set("Open or capture a frame before painting labels.")
             return
         thickness = max(1, 2 * int(self.brush_radius_var.get()) - 1)
-        color = self.active_label_value()
         brush = np.zeros(item["mask"].shape[:2], dtype=np.uint8)
         cv2.line(brush, start_xy, end_xy, 255, thickness, cv2.LINE_8)
-        if color <= 0:
-            item["mask"][brush > 0] = 0
-        else:
-            item["mask"][brush > 0] |= label_bit(color)
+        self.apply_brush(item, brush)
         self.refresh()
+
+    def apply_brush(self, item, brush):
+        pixels = np.asarray(brush, dtype=np.uint8) > 0
+        if not np.any(pixels):
+            return
+        mode = str(self.mode_var.get())
+        if mode == "erase":
+            item["mask"][pixels] = 0
+        elif mode == "erase_crossing":
+            bit = label_bit(crossing_label_value(self.cable_count_var.get()))
+            item["mask"][pixels] &= np.uint16(~int(bit) & 0xFFFF)
+        else:
+            item["mask"][pixels] |= label_bit(self.active_label_value())
+        item["dirty"] = True
+
+    def request_close(self):
+        if not self.confirm_discard_unsaved("close the labeling GUI"):
+            return
+        self.close()
+        self.root.destroy()
 
     def close(self):
         if self.train_process is not None and self.train_process.poll() is None:
@@ -2312,20 +2633,11 @@ def bgr_to_photo(bgr):
     return tk.PhotoImage(data=header + rgb.tobytes(), format="PPM")
 
 
-def shell_quote(value):
-    value = str(value)
-    if not value:
-        return "''"
-    if re.search(r"[^A-Za-z0-9_./:=+-]", value):
-        return "'" + value.replace("'", "'\\''") + "'"
-    return value
-
-
 def main():
     args = parse_args()
     root = tk.Tk()
     app = PidNetTrainingApp(root, args)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app.close(), root.destroy()))
+    root.protocol("WM_DELETE_WINDOW", app.request_close)
     try:
         root.mainloop()
     finally:

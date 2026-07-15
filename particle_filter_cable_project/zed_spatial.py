@@ -20,20 +20,6 @@ DEPTH_MODES = {
     "PERFORMANCE": sl.DEPTH_MODE.PERFORMANCE,
 }
 
-MAPPING_RESOLUTIONS = {
-    "LOW": sl.MAPPING_RESOLUTION.LOW,
-    "MEDIUM": sl.MAPPING_RESOLUTION.MEDIUM,
-    "HIGH": sl.MAPPING_RESOLUTION.HIGH,
-}
-
-MAPPING_RANGES = {
-    "SHORT": sl.MAPPING_RANGE.SHORT,
-    "MEDIUM": sl.MAPPING_RANGE.MEDIUM,
-    "LONG": sl.MAPPING_RANGE.LONG,
-    "AUTO": sl.MAPPING_RANGE.AUTO,
-}
-
-
 def configure_input_source(init, args):
     if args.input_svo_file:
         init.set_from_svo_file(args.input_svo_file)
@@ -53,55 +39,6 @@ def configure_input_source(init, args):
         print(f"Using stream input: {ip}")
     else:
         raise ValueError(f"Invalid IP address format: {ip}")
-
-
-def make_spatial_mapping_parameters(args):
-    params = sl.SpatialMappingParameters(
-        resolution=MAPPING_RESOLUTIONS[args.mapping_resolution],
-        mapping_range=MAPPING_RANGES[args.mapping_range],
-        max_memory_usage=args.max_memory_mb,
-        save_texture=False,
-        use_chunk_only=True,
-        reverse_vertex_order=False,
-        map_type=sl.SPATIAL_MAP_TYPE.FUSED_POINT_CLOUD,
-    )
-    return params
-
-
-def fused_point_cloud_to_vertices(fused_cloud, max_points=0):
-    chunks = getattr(fused_cloud, "chunks", [])
-    if not chunks:
-        return np.empty((0, 6), dtype=np.float32)
-
-    pieces = []
-    for chunk in chunks:
-        chunk_vertices = np.asarray(chunk.vertices)
-        if chunk_vertices.ndim != 2 or chunk_vertices.shape[1] < 4 or len(chunk_vertices) == 0:
-            continue
-
-        xyz = chunk_vertices[:, :3].astype(np.float32, copy=False)
-        finite = np.all(np.isfinite(xyz), axis=1)
-        if not np.any(finite):
-            continue
-
-        rgba = chunk_vertices[:, 3]
-        rgb = decode_zed_rgba_to_rgb_float(rgba)
-
-        vertices = np.empty((np.count_nonzero(finite), 6), dtype=np.float32)
-        vertices[:, :3] = xyz[finite]
-        vertices[:, 3:] = rgb[finite]
-        pieces.append(vertices)
-
-    if not pieces:
-        return np.empty((0, 6), dtype=np.float32)
-
-    vertices = np.vstack(pieces).astype(np.float32, copy=False)
-    max_points = max(0, int(max_points))
-    if max_points > 0 and len(vertices) > max_points:
-        selected = np.linspace(0, len(vertices) - 1, max_points, dtype=np.int64)
-        vertices = vertices[selected]
-
-    return np.ascontiguousarray(vertices, dtype=np.float32)
 
 
 def live_point_cloud_to_vertices(
@@ -203,14 +140,3 @@ def configure_viewer_from_zed(zed, viewer):
         print(f"Using ZED vertical FOV: {viewer.fov_y_deg:.1f} deg")
     except Exception as exc:
         print(f"Using default OpenGL FOV ({exc})")
-
-
-def get_left_camera_intrinsics(zed):
-    info = zed.get_camera_information()
-    left_cam = info.camera_configuration.calibration_parameters.left_cam
-    return {
-        "fx": float(left_cam.fx),
-        "fy": float(left_cam.fy),
-        "cx": float(left_cam.cx),
-        "cy": float(left_cam.cy),
-    }

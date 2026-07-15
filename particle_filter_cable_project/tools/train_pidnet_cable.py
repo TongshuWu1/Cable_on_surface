@@ -18,6 +18,18 @@ from cable_pidnet import (
     require_torch,
     resolve_device,
 )
+from pidnet_schema import (
+    ANNOTATION_BODY_LAYER_COUNT,
+    CROSSING_CHANNEL,
+    ENDPOINT_SEMANTICS,
+    OUTPUT_CHANNEL_COUNT,
+    PIDNET_LABEL_MODE,
+    PIDNET_SCHEMA_VERSION,
+    crossing_label_value,
+    endpoint_label_value,
+    label_bit,
+    max_label_value,
+)
 
 require_torch()
 
@@ -46,12 +58,12 @@ def parse_args():
     parser.add_argument("--cable-count", type=int, default=2, help="Number of cable endpoint groups. Body labels are merged into one generic cable target.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True, help="Use CUDA automatic mixed precision.")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--boundary-weight", type=float, default=0.20)
+    parser.add_argument("--crossing-weight", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -82,28 +94,14 @@ class GenericCableEndpointDataset(Dataset):
         image = (image - self.mean) / self.std
         body = generic_body_mask(mask, self.cable_count, multilabel=multilabel).astype(np.float32)
         endpoint_channels = generic_endpoint_masks(mask, self.cable_count, multilabel=multilabel)
-        mask_channels = np.stack([body, *endpoint_channels], axis=0)
+        crossing = generic_crossing_mask(mask, self.cable_count, multilabel=multilabel).astype(np.float32)
+        mask_channels = np.stack([body, *endpoint_channels, crossing], axis=0)
         boundary = mask_boundary(np.any(mask_channels > 0.5, axis=0).astype(np.float32))
 
         image = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
         mask_channels = torch.from_numpy(np.ascontiguousarray(mask_channels))
         boundary = torch.from_numpy(boundary[None, :, :])
         return image, mask_channels, boundary
-
-
-def endpoint_label_value(cable_index, cable_count):
-    return max(1, int(cable_count)) + int(cable_index)
-
-
-def max_label_value(cable_count):
-    return 2 * max(1, int(cable_count))
-
-
-def label_bit(label):
-    label = int(label)
-    if label <= 0:
-        return np.uint16(0)
-    return np.uint16(1 << (label - 1))
 
 
 def layered_mask_path_from_mask_path(mask_path):
@@ -118,17 +116,24 @@ def layered_mask_path_from_mask_path(mask_path):
 
 def read_training_mask(mask_path, cable_count):
     layer_path = layered_mask_path_from_mask_path(mask_path)
-    if layer_path.exists():
-        payload = np.load(str(layer_path))
+    if not layer_path.exists():
+        raise FileNotFoundError(f"Required layered mask not found: {layer_path}")
+    with np.load(str(layer_path), allow_pickle=False) as payload:
         if "mask" not in payload:
             raise ValueError(f"Layered mask file missing 'mask' array: {layer_path}")
+        if "cable_count" not in payload:
+            raise ValueError(f"Layered mask file missing 'cable_count': {layer_path}")
         mask = np.asarray(payload["mask"], dtype=np.uint16)
-        valid_bits = np.uint16((1 << max_label_value(cable_count)) - 1)
-        return np.ascontiguousarray(mask & valid_bits, dtype=np.uint16), True
-    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    if mask is None:
-        raise ValueError(f"Could not read mask: {mask_path}")
-    return np.asarray(mask, dtype=np.uint8), False
+        stored_cable_count = int(np.asarray(payload["cable_count"]).item())
+    if mask.ndim != 2:
+        raise ValueError(f"Layered mask must be HxW; got shape {mask.shape}: {layer_path}")
+    if stored_cable_count != int(cable_count):
+        raise ValueError(
+            f"Layered mask cable_count={stored_cable_count} does not match training cable_count={cable_count}: "
+            f"{layer_path}"
+        )
+    valid_bits = np.uint16((1 << max_label_value(cable_count)) - 1)
+    return np.ascontiguousarray(mask & valid_bits, dtype=np.uint16), True
 
 
 def label_pixels(mask, label, cable_count, multilabel=False):
@@ -143,8 +148,6 @@ def generic_body_mask(mask, cable_count, multilabel=False):
     body = np.zeros(labels.shape[:2], dtype=bool)
     for label in range(1, cable_count + 1):
         body |= label_pixels(labels, label, cable_count, multilabel=multilabel)
-    if not bool(multilabel) and not np.any(body) and np.any(labels > 127):
-        body = labels > 127
     return body
 
 
@@ -157,45 +160,47 @@ def generic_endpoint_masks(mask, cable_count, multilabel=False):
     return endpoints
 
 
-def find_dataset_splits(dataset_root, val_split, seed):
+def generic_crossing_mask(mask, cable_count, multilabel=False):
+    return label_pixels(
+        np.asarray(mask),
+        crossing_label_value(cable_count),
+        cable_count,
+        multilabel=multilabel,
+    )
+
+
+def find_dataset_splits(dataset_root):
     dataset_root = Path(dataset_root)
-    train_image_dir = dataset_root / "images" / "train"
-    train_mask_dir = dataset_root / "masks" / "train"
-    val_image_dir = dataset_root / "images" / "val"
-    val_mask_dir = dataset_root / "masks" / "val"
-    if train_image_dir.exists() and train_mask_dir.exists():
-        train_pairs = match_image_mask_pairs(train_image_dir, train_mask_dir)
-        val_pairs = []
-        if val_image_dir.exists() and val_mask_dir.exists():
-            val_pairs = match_image_mask_pairs(val_image_dir, val_mask_dir)
-        if not val_pairs:
-            train_pairs, val_pairs = split_pairs(train_pairs, val_split, seed)
-        return train_pairs, val_pairs
-
-    image_dir = dataset_root / "images"
-    mask_dir = dataset_root / "masks"
-    if image_dir.exists() and mask_dir.exists():
-        return split_pairs(match_image_mask_pairs(image_dir, mask_dir), val_split, seed)
-    raise FileNotFoundError("Expected dataset/images and dataset/masks folders.")
+    train_pairs = strict_split_pairs(dataset_root, "train")
+    val_pairs = strict_split_pairs(dataset_root, "val")
+    overlap = sorted({image.stem for image, _mask in train_pairs} & {image.stem for image, _mask in val_pairs})
+    if overlap:
+        raise ValueError(f"Train/validation filename overlap: {', '.join(overlap)}")
+    return train_pairs, val_pairs
 
 
-def match_image_mask_pairs(image_dir, mask_dir):
-    images = [path for path in Path(image_dir).iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS]
-    mask_by_stem = {path.stem: path for path in Path(mask_dir).iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
-    pairs = []
-    for image_path in sorted(images):
-        mask_path = mask_by_stem.get(image_path.stem)
-        if mask_path is not None:
-            pairs.append((image_path, mask_path))
-    return pairs
+def strict_split_pairs(dataset_root, split):
+    image_dir = Path(dataset_root) / "images" / split
+    mask_dir = Path(dataset_root) / "masks" / split
+    layer_dir = Path(dataset_root) / "masks_layers" / split
+    for directory in (image_dir, mask_dir, layer_dir):
+        if not directory.is_dir():
+            raise FileNotFoundError(f"Required dataset directory not found: {directory}")
 
-
-def split_pairs(pairs, val_split, seed):
-    pairs = list(pairs)
-    random.Random(int(seed)).shuffle(pairs)
-    val_count = int(round(len(pairs) * float(np.clip(val_split, 0.0, 0.8))))
-    val_count = min(max(1 if len(pairs) > 1 else 0, val_count), max(0, len(pairs) - 1))
-    return pairs[val_count:], pairs[:val_count]
+    images = {path.stem: path for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
+    masks = {path.stem: path for path in mask_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
+    layers = {path.stem: path for path in layer_dir.iterdir() if path.suffix.lower() == ".npz"}
+    if not images:
+        raise ValueError(f"No images found in {image_dir}")
+    if set(images) != set(masks) or set(images) != set(layers):
+        raise ValueError(
+            f"Incomplete {split} dataset: "
+            f"images_without_masks={sorted(set(images) - set(masks))}, "
+            f"images_without_layers={sorted(set(images) - set(layers))}, "
+            f"masks_without_images={sorted(set(masks) - set(images))}, "
+            f"layers_without_images={sorted(set(layers) - set(images))}"
+        )
+    return [(images[stem], masks[stem]) for stem in sorted(images)]
 
 
 def parse_image_size(value):
@@ -285,41 +290,75 @@ def dice_loss(logits, target, eps=1e-6):
 def foreground_balanced_bce(logits, target, max_pos_weight=40.0):
     positive = torch.sum(target)
     negative = torch.sum(1.0 - target)
-    if float(positive.detach().cpu()) <= 0.0:
-        pos_weight = torch.ones((), dtype=logits.dtype, device=logits.device)
-    else:
-        pos_weight = torch.clamp(negative / torch.clamp(positive, min=1.0), min=1.0, max=float(max_pos_weight))
+    balanced = torch.clamp(
+        negative / torch.clamp(positive, min=1.0),
+        min=1.0,
+        max=float(max_pos_weight),
+    )
+    pos_weight = torch.where(positive > 0.0, balanced, torch.ones_like(balanced))
     return F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight)
 
 
-def segmentation_loss(outputs, mask, boundary, boundary_weight):
+def segmentation_loss(outputs, mask, boundary, boundary_weight, crossing_weight):
     seg_logits = outputs["seg"]
     boundary_logits = outputs["boundary"]
-    bce = foreground_balanced_bce(seg_logits, mask)
-    dice = dice_loss(seg_logits, mask)
+    if seg_logits.shape[1] < 2 or mask.shape[1] != seg_logits.shape[1]:
+        raise ValueError(
+            f"Segmentation logits/target channel mismatch: logits={tuple(seg_logits.shape)} target={tuple(mask.shape)}"
+        )
+    semantic_logits = seg_logits[:, :-1]
+    semantic_target = mask[:, :-1]
+    crossing_logits = seg_logits[:, -1:]
+    crossing_target = mask[:, -1:]
+    semantic_loss = foreground_balanced_bce(semantic_logits, semantic_target) + dice_loss(semantic_logits, semantic_target)
+    crossing_bce = foreground_balanced_bce(crossing_logits, crossing_target, max_pos_weight=200.0)
+    crossing_present = (torch.sum(crossing_target) > 0.5).to(dtype=crossing_logits.dtype)
+    crossing_dice = crossing_present * dice_loss(crossing_logits, crossing_target)
     boundary_bce = foreground_balanced_bce(boundary_logits, boundary)
-    return bce + dice + float(boundary_weight) * boundary_bce
+    return (
+        semantic_loss
+        + float(crossing_weight) * (crossing_bce + crossing_dice)
+        + float(boundary_weight) * boundary_bce
+    )
 
 
 @torch.inference_mode()
 def evaluate(model, loader, device):
     model.eval()
-    intersection = 0.0
-    union = 0.0
-    dice_num = 0.0
-    dice_den = 0.0
+    intersection = None
+    union = None
+    dice_den = None
     for image, mask, _boundary in loader:
         image = image.to(device)
         mask = mask.to(device)
         pred = torch.sigmoid(model(image)["seg"]) > 0.5
         target = mask > 0.5
-        intersection += torch.sum(pred & target).item()
-        union += torch.sum(pred | target).item()
-        dice_num += 2.0 * torch.sum(pred & target).item()
-        dice_den += torch.sum(pred).item() + torch.sum(target).item()
+        batch_intersection = torch.sum(pred & target, dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64)
+        batch_union = torch.sum(pred | target, dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64)
+        batch_dice_den = (
+            torch.sum(pred, dim=(0, 2, 3)) + torch.sum(target, dim=(0, 2, 3))
+        ).detach().cpu().numpy().astype(np.float64)
+        if intersection is None:
+            intersection = np.zeros_like(batch_intersection)
+            union = np.zeros_like(batch_union)
+            dice_den = np.zeros_like(batch_dice_den)
+        intersection += batch_intersection
+        union += batch_union
+        dice_den += batch_dice_den
+
+    if intersection is None:
+        raise ValueError("Validation loader produced no batches.")
+    valid_iou = union > 0.0
+    valid_dice = dice_den > 0.0
+    channel_iou = np.divide(intersection, np.maximum(union, 1.0))
+    channel_dice = np.divide(2.0 * intersection, np.maximum(dice_den, 1.0))
+    endpoint_iou = channel_iou[1:-1]
     return {
-        "iou": intersection / max(union, 1.0),
-        "dice": dice_num / max(dice_den, 1.0),
+        "iou": float(np.mean(channel_iou[valid_iou])) if np.any(valid_iou) else 0.0,
+        "dice": float(np.mean(channel_dice[valid_dice])) if np.any(valid_dice) else 0.0,
+        "body_iou": float(channel_iou[0]),
+        "endpoint_iou": float(np.mean(endpoint_iou)) if endpoint_iou.size else 0.0,
+        "crossing_iou": float(channel_iou[-1]),
     }
 
 
@@ -330,17 +369,15 @@ def train(args):
     device = resolve_device(args.device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    train_pairs, val_pairs = find_dataset_splits(args.dataset, args.val_split, args.seed)
-    if not train_pairs:
-        raise ValueError("Need at least one training image/mask pair.")
-    if not val_pairs:
-        val_pairs = train_pairs[:]
+    train_pairs, val_pairs = find_dataset_splits(args.dataset)
 
-    cable_count = max(1, int(args.cable_count))
-    output_channels = 1 + cable_count
+    cable_count = int(args.cable_count)
+    if cable_count != 2:
+        raise ValueError(f"This project trains exactly two cables; got cable_count={cable_count}.")
+    output_channels = OUTPUT_CHANNEL_COUNT
     input_channels = 3
     input_mode = "rgb"
-    label_mode = "cable_with_separate_endpoints"
+    label_mode = PIDNET_LABEL_MODE
     train_dataset = GenericCableEndpointDataset(train_pairs, args.imgsz, augment=True, cable_count=cable_count)
     val_dataset = GenericCableEndpointDataset(val_pairs, args.imgsz, augment=False, cable_count=cable_count)
 
@@ -350,6 +387,7 @@ def train(args):
         shuffle=True,
         num_workers=int(args.num_workers),
         pin_memory=device.type == "cuda",
+        persistent_workers=int(args.num_workers) > 0,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -357,6 +395,7 @@ def train(args):
         shuffle=False,
         num_workers=int(args.num_workers),
         pin_memory=device.type == "cuda",
+        persistent_workers=int(args.num_workers) > 0,
     )
 
     model = PIDNetSmallBinary(
@@ -375,7 +414,7 @@ def train(args):
         f"Training on {len(train_pairs)} images/{len(train_dataset)} samples, "
         f"validating on {len(val_pairs)} images/{len(val_dataset)} samples, "
         f"imgsz={image_size_text(args.imgsz)}, cables={cable_count}, "
-        f"target=cable+separate_endpoints, input={input_mode}, inputs={input_channels}, outputs={output_channels}, "
+        f"target=cable+separate_endpoints+crossing, input={input_mode}, inputs={input_channels}, outputs={output_channels}, "
         f"device={device_name}, amp={use_amp}"
     )
     for epoch in range(1, int(args.epochs) + 1):
@@ -388,7 +427,13 @@ def train(args):
             boundary = boundary.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
-                loss = segmentation_loss(model(image), mask, boundary, args.boundary_weight)
+                loss = segmentation_loss(
+                    model(image),
+                    mask,
+                    boundary,
+                    args.boundary_weight,
+                    args.crossing_weight,
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -399,6 +444,7 @@ def train(args):
         print(
             f"epoch {epoch:03d}/{args.epochs} loss {train_loss:.4f} "
             f"val_iou {metrics['iou']:.4f} val_dice {metrics['dice']:.4f} "
+            f"crossing_iou {metrics['crossing_iou']:.4f} "
             f"time {time.time() - start:.1f}s"
         )
         if metrics["iou"] > best_iou:
@@ -413,20 +459,24 @@ def train(args):
                         "input_mode": str(input_mode),
                         "output_channels": int(output_channels),
                         "label_mode": str(label_mode),
-                        "cable_count": int(cable_count),
+                        "observation_schema_version": PIDNET_SCHEMA_VERSION,
+                        "endpoint_semantics": ENDPOINT_SEMANTICS,
+                        "annotation_body_layer_count": ANNOTATION_BODY_LAYER_COUNT,
                         "endpoint_channels": True,
-                        "endpoint_channel_count": int(cable_count),
+                        "endpoint_channel_count": 2,
+                        "crossing_channels": True,
+                        "crossing_channel": CROSSING_CHANNEL,
                         "imgsz": image_size_text(args.imgsz),
                     },
                     "training": {
-                        "target": "cable+separate_endpoints",
+                        "target": "cable+separate_endpoints+crossing",
                         "epochs": int(args.epochs),
                         "batch_size": int(args.batch_size),
                         "lr": float(args.lr),
                         "weight_decay": float(args.weight_decay),
-                        "val_split": float(args.val_split),
                         "num_workers": int(args.num_workers),
                         "boundary_weight": float(args.boundary_weight),
+                        "crossing_weight": float(args.crossing_weight),
                         "amp": bool(use_amp),
                         "seed": int(args.seed),
                     },

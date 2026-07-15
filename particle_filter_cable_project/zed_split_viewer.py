@@ -56,7 +56,11 @@ UI_ACCENT_2 = (0.250, 0.780, 0.520)
 VISIBLE_COLOR = (0.25, 1.00, 0.48)
 EXTENDED_COLOR = (1.00, 0.82, 0.16)
 OCCLUDED_COLOR = (1.00, 0.18, 0.20)
+CROSSING_ONLY_COLOR = (0.10, 0.78, 1.00)
+CONTACT_COLOR = (0.20, 1.00, 0.35)
 CABLE_SAMPLE_COLOR = (1.00, 0.58, 0.08)
+PARTICLE_MAP_COLOR = (1.00, 1.00, 1.00)
+PARTICLE_SPREAD_COLOR = (0.80, 0.52, 1.00)
 START_NODE_COLOR = (0.00, 0.78, 1.00)
 END_NODE_COLOR = (1.00, 0.25, 0.92)
 ENDPOINT_GROUP_COLORS = (
@@ -128,6 +132,10 @@ class ZedDepthGLViewer:
         self.pending_cable_valid = None
         self.pending_cable_visible = None
         self.pending_cable_extended_visible = None
+        self.pending_cable_runs = None
+        self.pending_cable_runs_update = False
+        self.pending_contact_observations = None
+        self.pending_particle_diagnostics = None
         self.pending_coordinate_frame = None
         self.rgb_image = None
         self.vertices = np.empty((0, 6), dtype=np.float32)
@@ -137,6 +145,10 @@ class ZedDepthGLViewer:
         self.cable_valid = np.empty(0, dtype=bool)
         self.cable_visible = np.empty(0, dtype=bool)
         self.cable_extended_visible = np.empty(0, dtype=bool)
+        self.cable_runs = None
+        self.contact_observations = tuple()
+        self.particle_diagnostics = tuple()
+        self.show_particle_diagnostics = True
         self.coordinate_frame = "camera"
         self.status = "waiting for frames"
 
@@ -304,6 +316,9 @@ class ZedDepthGLViewer:
         valid_nodes,
         visible_nodes=None,
         extended_visible_nodes=None,
+        cable_runs=None,
+        contact_observations=(),
+        particle_diagnostics=(),
         coordinate_frame="camera",
     ):
         cable_points = self._as_points(cable_points)
@@ -312,6 +327,8 @@ class ZedDepthGLViewer:
         visible_nodes = self._as_node_mask(visible_nodes, len(cable_nodes), valid_nodes)
         extended_visible_nodes = self._as_node_mask(extended_visible_nodes, len(cable_nodes), visible_nodes)
         extended_visible_nodes = extended_visible_nodes | visible_nodes
+        cable_runs = self._as_cable_runs(cable_runs, len(cable_nodes))
+        particle_diagnostics = self._prepare_particle_diagnostics(particle_diagnostics)
 
         with self.lock:
             self.pending_cable_points = cable_points
@@ -319,6 +336,10 @@ class ZedDepthGLViewer:
             self.pending_cable_valid = valid_nodes
             self.pending_cable_visible = visible_nodes
             self.pending_cable_extended_visible = extended_visible_nodes
+            self.pending_cable_runs = cable_runs
+            self.pending_cable_runs_update = True
+            self.pending_contact_observations = tuple(contact_observations or ())
+            self.pending_particle_diagnostics = particle_diagnostics
             self.pending_coordinate_frame = str(coordinate_frame)
 
     def reset_view(self):
@@ -364,6 +385,10 @@ class ZedDepthGLViewer:
             cable_valid = self.pending_cable_valid
             cable_visible = self.pending_cable_visible
             cable_extended_visible = self.pending_cable_extended_visible
+            cable_runs = self.pending_cable_runs
+            cable_runs_update = self.pending_cable_runs_update
+            contact_observations = self.pending_contact_observations
+            particle_diagnostics = self.pending_particle_diagnostics
             coordinate_frame = self.pending_coordinate_frame
             self.pending_rgb_image = None
             self.pending_vertices = None
@@ -372,6 +397,10 @@ class ZedDepthGLViewer:
             self.pending_cable_valid = None
             self.pending_cable_visible = None
             self.pending_cable_extended_visible = None
+            self.pending_cable_runs = None
+            self.pending_cable_runs_update = False
+            self.pending_contact_observations = None
+            self.pending_particle_diagnostics = None
             self.pending_coordinate_frame = None
 
         if rgb_image is not None:
@@ -386,6 +415,12 @@ class ZedDepthGLViewer:
             self.cable_visible = cable_visible
         if cable_extended_visible is not None:
             self.cable_extended_visible = cable_extended_visible
+        if cable_runs_update:
+            self.cable_runs = cable_runs
+        if contact_observations is not None:
+            self.contact_observations = contact_observations
+        if particle_diagnostics is not None:
+            self.particle_diagnostics = particle_diagnostics
         if coordinate_frame is not None:
             self.coordinate_frame = coordinate_frame
 
@@ -578,14 +613,17 @@ class ZedDepthGLViewer:
         if len(self.cable_points) > 0:
             glPointSize(7.0)
             glColor3f(*CABLE_SAMPLE_COLOR)
-            glBegin(GL_POINTS)
-            for point in self.cable_points:
-                glVertex3f(float(point[0]), float(point[1]), float(point[2]))
-            glEnd()
+            glEnableClientState(GL_VERTEX_ARRAY)
+            glVertexPointer(3, GL_FLOAT, 0, np.ascontiguousarray(self.cable_points, dtype=np.float32))
+            glDrawArrays(GL_POINTS, 0, len(self.cable_points))
+            glDisableClientState(GL_VERTEX_ARRAY)
+
+        if self.show_particle_diagnostics:
+            self._draw_particle_diagnostics()
 
         if self._has_cable_node_state():
             endpoint_runs = self._valid_endpoint_runs()
-            endpoint_roles = self._endpoint_role_map(endpoint_runs)
+            endpoint_colors = self._endpoint_color_map(endpoint_runs)
             glLineWidth(8.0)
             glBegin(GL_LINES)
             for idx in range(len(self.cable_nodes) - 1):
@@ -606,39 +644,111 @@ class ZedDepthGLViewer:
             glBegin(GL_POINTS)
             for idx, point in enumerate(self.cable_nodes):
                 if self.cable_valid[idx] and np.all(np.isfinite(point)):
-                    glColor3f(*self._node_color(idx, endpoint_roles))
+                    glColor3f(*self._node_color(idx, endpoint_colors))
                     glVertex3f(float(point[0]), float(point[1]), float(point[2]))
             glEnd()
 
             self._draw_endpoint_markers(endpoint_runs)
 
+        self._draw_contact_observations()
+
         glEnable(GL_DEPTH_TEST)
 
-    def _draw_point_set(self, points, color, point_size=5.0, max_points=900):
-        points = np.asarray(points, dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
+    def _draw_particle_diagnostics(self):
+        if not self.particle_diagnostics:
             return
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        for group in self.particle_diagnostics:
+            color = group["color"]
+            self._draw_line_vertices(
+                group["top_line_vertices"],
+                color,
+                alpha=0.10,
+                line_width=1.0,
+            )
+            self._draw_line_vertices(
+                group["spread_line_vertices"],
+                PARTICLE_SPREAD_COLOR,
+                alpha=0.90,
+                line_width=2.0,
+            )
+            self._draw_line_vertices(
+                group["map_line_vertices"],
+                PARTICLE_MAP_COLOR,
+                alpha=0.95,
+                line_width=3.0,
+            )
+        glDisable(GL_BLEND)
 
-        max_points = max(1, int(max_points))
-        step = max(1, len(points) // max_points)
-        glPointSize(float(point_size))
-        glColor3f(float(color[0]), float(color[1]), float(color[2]))
-        glBegin(GL_POINTS)
-        for point in points[::step]:
-            glVertex3f(float(point[0]), float(point[1]), float(point[2]))
-        glEnd()
+        for group in self.particle_diagnostics:
+            anchor = group["label_anchor"]
+            if np.all(np.isfinite(anchor)):
+                self._draw_text_3d(
+                    anchor[0],
+                    anchor[1],
+                    anchor[2],
+                    group["label"],
+                    group["color"],
+                    GLUT_BITMAP_HELVETICA_12,
+                )
+
+    @staticmethod
+    def _draw_line_vertices(vertices, color, alpha=1.0, line_width=1.0):
+        if len(vertices) == 0:
+            return
+        glLineWidth(float(line_width))
+        glColor4f(float(color[0]), float(color[1]), float(color[2]), float(alpha))
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glVertexPointer(3, GL_FLOAT, 0, vertices)
+        glDrawArrays(GL_LINES, 0, len(vertices))
+        glDisableClientState(GL_VERTEX_ARRAY)
+
+    def _draw_contact_observations(self):
+        for observation in self.contact_observations:
+            q1 = np.asarray(getattr(observation, "q1_xyz", ()), dtype=np.float32).reshape(-1)
+            q2 = np.asarray(getattr(observation, "q2_xyz", ()), dtype=np.float32).reshape(-1)
+            if len(q1) < 3 or len(q2) < 3 or not np.all(np.isfinite((q1[:3], q2[:3]))):
+                continue
+            color = CONTACT_COLOR if bool(getattr(observation, "verified_contact", False)) else CROSSING_ONLY_COLOR
+            glLineWidth(5.0)
+            glColor3f(*color)
+            glBegin(GL_LINES)
+            glVertex3f(float(q1[0]), float(q1[1]), float(q1[2]))
+            glVertex3f(float(q2[0]), float(q2[1]), float(q2[2]))
+            glEnd()
+            glPointSize(18.0)
+            glBegin(GL_POINTS)
+            glVertex3f(float(q1[0]), float(q1[1]), float(q1[2]))
+            glVertex3f(float(q2[0]), float(q2[1]), float(q2[2]))
+            glEnd()
+            midpoint = 0.5 * (q1[:3] + q2[:3])
+            calibrated = bool(getattr(observation, "diameter_calibrated", False))
+            value = float(getattr(
+                observation,
+                "gap_m" if calibrated else "centerline_distance_m",
+                np.nan,
+            ))
+            quantity = "gap" if calibrated else "center"
+            state = "CONTACT" if bool(getattr(observation, "verified_contact", False)) else "RGB CROSSING"
+            text = (
+                f"{state} {quantity}={1000.0 * value:.1f}mm "
+                f"s=({getattr(observation, 's1_m', np.nan):.3f},"
+                f"{getattr(observation, 's2_m', np.nan):.3f})m"
+            )
+            self._draw_text_3d(
+                midpoint[0], midpoint[1], midpoint[2], text, color, GLUT_BITMAP_HELVETICA_12
+            )
 
     def _draw_endpoint_markers(self, endpoint_runs):
         if not endpoint_runs:
             return
 
         endpoints = []
-        multi = len(endpoint_runs) > 1
-        for cable_index, (start_idx, end_idx) in enumerate(endpoint_runs, start=1):
-            suffix = f" {cable_index}" if multi else ""
-            color = endpoint_group_color(cable_index - 1)
-            endpoints.append((start_idx, f"START{suffix}", color, 1.0))
-            endpoints.append((end_idx, f"END{suffix}", color, -1.0))
+        for cable_id, start_idx, end_idx in endpoint_runs:
+            color = endpoint_group_color(cable_id)
+            endpoints.append((start_idx, f"PF{int(cable_id) + 1} start", color, 1.0))
+            endpoints.append((end_idx, f"PF{int(cable_id) + 1} end", color, -1.0))
 
         glPointSize(22.0)
         glBegin(GL_POINTS)
@@ -816,16 +926,23 @@ class ZedDepthGLViewer:
         metric_x = 18
         metric_x = self._draw_metric(metric_x, metric_y, "POINTS", self.vertex_count, UI_ACCENT)
         if width >= 500:
-            cable_value = f"{max(0, len(self.cable_nodes) - 1)} seg" if self._has_cable_node_state() else "none"
+            endpoint_runs = self._valid_endpoint_runs()
+            segment_count = sum(max(0, int(end_idx) - int(start_idx)) for _cable_id, start_idx, end_idx in endpoint_runs)
+            cable_value = f"{segment_count} seg" if endpoint_runs else "none"
             metric_x = self._draw_metric(metric_x, metric_y, "CABLE", cable_value, UI_ACCENT_2)
         if width >= 660:
-            self._draw_metric(metric_x, metric_y, "ZOOM", f"{self.zoom:.2f}x", (0.95, 0.73, 0.24))
+            metric_x = self._draw_metric(metric_x, metric_y, "ZOOM", f"{self.zoom:.2f}x", (0.95, 0.73, 0.24))
+        if width >= 860 and self.particle_diagnostics:
+            top_count = sum(int(group["top_particle_count"]) for group in self.particle_diagnostics)
+            state = str(top_count) if self.show_particle_diagnostics else "off"
+            self._draw_metric(metric_x, metric_y, "TOP SET", state, PARTICLE_SPREAD_COLOR)
 
         footer_h = 34
         self._draw_rect_2d(0, 0, width, footer_h, (0.018, 0.021, 0.025))
         self._draw_rect_2d(0, footer_h - 1, width, 1, UI_STROKE)
         footer = (
             f"Orbit: drag right panel    Zoom: wheel    Reset: R    "
+            f"Particles: P ({'on' if self.show_particle_diagnostics else 'off'})    "
             f"Point size: +/- ({self.point_size:.1f})    Depth max: {self.depth_max_m:.1f}m"
         )
         self._draw_text_2d(18, 13, self._compact_status(footer, width), UI_MUTED, GLUT_BITMAP_HELVETICA_12)
@@ -916,18 +1033,18 @@ class ZedDepthGLViewer:
             return "(nan,nan,nan)"
         return f"({point[0]:+.3f},{point[1]:+.3f},{point[2]:+.3f})"
 
-    def _valid_endpoint_indices(self):
-        runs = self._valid_endpoint_runs()
-        if not runs:
-            return None, None
-        return int(runs[0][0]), int(runs[-1][1])
-
     def _valid_endpoint_runs(self):
         if not self._has_cable_node_state():
             return []
 
         finite = np.all(np.isfinite(self.cable_nodes), axis=1)
         usable = self.cable_valid & finite
+        if self.cable_runs is not None:
+            return [
+                (int(cable_id), int(start_idx), int(end_idx))
+                for cable_id, start_idx, end_idx in self.cable_runs
+                if usable[int(start_idx)] and usable[int(end_idx)]
+            ]
         runs = []
         start = None
         for index, is_usable in enumerate(usable):
@@ -936,20 +1053,20 @@ class ZedDepthGLViewer:
             elif not is_usable and start is not None:
                 end = int(index - 1)
                 if end >= start:
-                    runs.append((start, end))
+                    runs.append((len(runs), start, end))
                 start = None
         if start is not None:
-            runs.append((start, len(usable) - 1))
+            runs.append((len(runs), start, len(usable) - 1))
         return runs
 
     @staticmethod
-    def _endpoint_role_map(endpoint_runs):
-        roles = {}
-        for cable_index, (start_idx, end_idx) in enumerate(endpoint_runs):
-            color = endpoint_group_color(cable_index)
-            roles[int(start_idx)] = color
-            roles[int(end_idx)] = color
-        return roles
+    def _endpoint_color_map(endpoint_runs):
+        colors = {}
+        for cable_id, start_idx, end_idx in endpoint_runs:
+            color = endpoint_group_color(cable_id)
+            colors[int(start_idx)] = color
+            colors[int(end_idx)] = color
+        return colors
 
     def _endpoint_label_position(self, point, direction):
         point = np.asarray(point, dtype=np.float32).reshape(3)
@@ -993,8 +1110,10 @@ class ZedDepthGLViewer:
         if key in (b"q", b"\x1b"):
             self.close()
             return
-        if key == b"r":
+        if key in (b"r", b"R"):
             self.reset_view()
+        elif key in (b"p", b"P"):
+            self.show_particle_diagnostics = not self.show_particle_diagnostics
         elif key in (b"+", b"="):
             self.point_size = min(8.0, self.point_size + 0.5)
         elif key in (b"-", b"_"):
@@ -1086,9 +1205,9 @@ class ZedDepthGLViewer:
             and len(self.cable_extended_visible) == count
         )
 
-    def _node_color(self, idx, endpoint_roles=None):
-        role = {} if endpoint_roles is None else endpoint_roles
-        endpoint_color = role.get(int(idx))
+    def _node_color(self, idx, endpoint_colors=None):
+        endpoint_colors = {} if endpoint_colors is None else endpoint_colors
+        endpoint_color = endpoint_colors.get(int(idx))
         if endpoint_color is not None:
             return endpoint_color
         if self.cable_visible[idx]:
@@ -1109,6 +1228,90 @@ class ZedDepthGLViewer:
             return 1.0, 0.74, 0.12
         return OCCLUDED_COLOR
 
+    @classmethod
+    def _prepare_particle_diagnostics(cls, diagnostics):
+        if diagnostics is None:
+            return tuple()
+        if hasattr(diagnostics, "top_particle_points_xyz"):
+            diagnostics = ((0, diagnostics),)
+        output = []
+        for fallback_id, item in enumerate(diagnostics or ()):
+            if isinstance(item, tuple) and len(item) == 2:
+                cable_id, values = item
+            else:
+                cable_id, values = fallback_id, item
+            try:
+                cable_id = int(cable_id)
+            except (TypeError, ValueError):
+                cable_id = int(fallback_id)
+            average = np.asarray(getattr(values, "average_points_xyz", ()), dtype=np.float32)
+            map_nodes = np.asarray(getattr(values, "map_points_xyz", ()), dtype=np.float32)
+            top_particles = np.asarray(getattr(values, "top_particle_points_xyz", ()), dtype=np.float32)
+            principal_std = np.asarray(getattr(values, "node_principal_std_xyz", ()), dtype=np.float32)
+            if (
+                average.ndim != 2
+                or average.shape[1] < 3
+                or map_nodes.shape != average.shape
+                or top_particles.ndim != 3
+                or top_particles.shape[1:] != average.shape
+                or principal_std.shape != average.shape
+            ):
+                continue
+            average = np.ascontiguousarray(average[:, :3], dtype=np.float32)
+            map_nodes = np.ascontiguousarray(map_nodes[:, :3], dtype=np.float32)
+            top_particles = np.ascontiguousarray(top_particles[:, :, :3], dtype=np.float32)
+            principal_std = np.ascontiguousarray(principal_std[:, :3], dtype=np.float32)
+            if len(top_particles) == 0:
+                continue
+
+            spread_axis = 2.0 * principal_std
+            spread_segments = np.stack((average - spread_axis, average + spread_axis), axis=1)
+            direction_delta = np.asarray(
+                getattr(values, "endpoint_direction_delta_deg", (np.nan, np.nan)),
+                dtype=np.float32,
+            ).reshape(-1)
+            start_delta = float(direction_delta[0]) if len(direction_delta) > 0 else np.nan
+            end_delta = float(direction_delta[1]) if len(direction_delta) > 1 else np.nan
+            map_error = float(getattr(values, "map_to_average_node_error_m", np.nan))
+            mean_spread = float(getattr(values, "mean_node_spread_m", np.nan))
+            max_spread = float(getattr(values, "max_node_spread_m", np.nan))
+            label = (
+                f"PF{cable_id + 1} TOP={len(top_particles)} "
+                f"MAP-AVG={cls._format_mm_compact(map_error)} "
+                f"spread={cls._format_mm_compact(mean_spread)}/{cls._format_mm_compact(max_spread)} "
+                f"dir={cls._format_angle_compact(start_delta)}/{cls._format_angle_compact(end_delta)}"
+            )
+            anchor = average[len(average) // 2].copy()
+            anchor[1] += 0.018
+            output.append({
+                "cable_id": cable_id,
+                "color": endpoint_group_color(cable_id),
+                "top_particle_count": int(len(top_particles)),
+                "top_line_vertices": cls._chain_line_vertices(top_particles),
+                "map_line_vertices": cls._chain_line_vertices(map_nodes[None, :, :]),
+                "spread_line_vertices": np.ascontiguousarray(spread_segments.reshape(-1, 3), dtype=np.float32),
+                "label_anchor": np.ascontiguousarray(anchor, dtype=np.float32),
+                "label": label,
+            })
+        return tuple(output)
+
+    @staticmethod
+    def _chain_line_vertices(chains):
+        chains = np.asarray(chains, dtype=np.float32)
+        if chains.ndim != 3 or chains.shape[1] < 2 or chains.shape[2] < 3:
+            return np.empty((0, 3), dtype=np.float32)
+        segments = np.stack((chains[:, :-1, :3], chains[:, 1:, :3]), axis=2).reshape(-1, 2, 3)
+        segments = segments[np.all(np.isfinite(segments), axis=(1, 2))]
+        return np.ascontiguousarray(segments.reshape(-1, 3), dtype=np.float32)
+
+    @staticmethod
+    def _format_mm_compact(value):
+        return f"{1000.0 * float(value):.1f}mm" if np.isfinite(float(value)) else "nan"
+
+    @staticmethod
+    def _format_angle_compact(value):
+        return f"{float(value):.1f}deg" if np.isfinite(float(value)) else "nan"
+
     @staticmethod
     def _as_points(points):
         points = np.asarray(points, dtype=np.float32)
@@ -1118,12 +1321,6 @@ class ZedDepthGLViewer:
         points = points[:, :3]
         valid = np.all(np.isfinite(points), axis=1)
         return np.ascontiguousarray(points[valid], dtype=np.float32)
-
-    @classmethod
-    def _as_points_or_empty(cls, points):
-        if points is None:
-            return np.empty((0, 3), dtype=np.float32)
-        return cls._as_points(points)
 
     @staticmethod
     def _as_node_points(points):
@@ -1152,3 +1349,19 @@ class ZedDepthGLViewer:
         if len(mask) != node_count:
             return default_mask
         return mask.copy()
+
+    @staticmethod
+    def _as_cable_runs(runs, node_count):
+        if runs is None:
+            return None
+        output = []
+        node_count = int(max(0, node_count))
+        for run in runs:
+            try:
+                cable_id, start_idx, end_idx = (int(value) for value in run)
+            except (TypeError, ValueError):
+                continue
+            if cable_id < 0 or start_idx < 0 or end_idx < start_idx or end_idx >= node_count:
+                continue
+            output.append((cable_id, start_idx, end_idx))
+        return tuple(output)

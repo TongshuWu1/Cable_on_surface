@@ -1,11 +1,9 @@
 # Cable particle filter live-tracking defaults.
 #
 # Normal run:
-#   ../.venv/bin/python main.py
+#   ..\.venv\Scripts\python.exe main.py
 #
-# This file is the main tuning surface. Command-line flags still override these
-# values when you need a temporary experiment:
-#   ../.venv/bin/python main.py --cable-segments 3
+# This file is the single runtime tuning surface.
 
 [camera]
 # Leave both input fields empty for the local ZED camera.
@@ -27,6 +25,7 @@ texture_confidence = 100
 fill = true
 
 [viewer]
+update_every = 2
 # Left panel is RGB/segmentation, right panel is the 3D point cloud.
 rgb_width = 620
 cloud_width = 1180
@@ -38,13 +37,12 @@ rgb_view = "segmentation"
 
 [pidnet]
 # Relative paths are resolved from this config file.
-# One RGB checkpoint predicts: generic cable body plus separated endpoint masks.
-# For two cables this is cable, endpoints_1, endpoints_2. Cable-body identity is
-# handled by endpoint pairing and the particle filters, not by separate cable classes.
+# One RGB checkpoint predicts exactly cable, endpoints_cable1,
+# endpoints_cable2, and crossing. Each endpoint channel contains both ends of
+# its physical cable and maps directly to the PF with the same index.
 checkpoint = "models/pidnet_two_cable_best.pt"
 device = "cuda"
-threshold = 0.25
-base_channels = 24
+threshold = 0.5
 amp = true
 channels_last = true
 
@@ -54,24 +52,46 @@ min_points = 8
 open_kernel = 3
 close_kernel = 5
 max_points_per_marker = 256
-max_count = 4
 tape_lengths_m = [0.03, 0.03]
 offset_to_tips = false
+
+# Each endpoint channel should normally produce two connected components: both
+# ends of that channel's cable. Component order is stabilized against the PF.
+
+[endpoint_association]
+# If a channel has extra components, select its best same-channel pair using
+# cable length, raw cable support, and the previous PF chain. Endpoint channels
+# are never paired with each other or swapped between PFs.
+ambiguity_margin_m = 0.015
+support_weight = 0.35
+support_clip_m = 0.080
+
+[crossing]
+# The NN proposes image crossings only. Physical contact is verified from the
+# two reconstructed PF chains and never fed back as a PF constraint here.
+threshold = 0.50
+min_area_px = 12
+max_proposals = 8
+association_sigma_px = 18.0
+contact_tolerance_m = 0.002
+
+# Measure these physical diameters before enabling contact declarations. Zeros
+# intentionally keep every proposal in the "RGB crossing only" state.
+cable_diameters_m = [0.0, 0.0]
 
 [detector]
 # The current checkpoint was trained at full ZED HD720. Full-scale inference
 # keeps the live mask close to the labeled data; reduce this only for speed.
 scale = 1.0
 
-# Run RGB segmentation + 3D measurement every N frames. Skipped frames use the
-# particle filter prediction and do not count as lost tracking. 2 gives a 30 Hz
-# measurement path on a 60 FPS camera and keeps the UI smoother.
-update_every = 2
+# Submit segmentation and tracking whenever the worker is free. The async
+# worker still prevents detection from blocking ZED capture or rendering.
+update_every = 1
 
 # Binary mask cleanup after the selected detector. Increase min_area_px to ignore
 # small noise; increase close_kernel to bridge tiny mask gaps.
 min_area_px = 80
-open_kernel = 7
+open_kernel = 5
 close_kernel = 1
 
 [point_cloud]
@@ -86,42 +106,33 @@ cloud_update_every = 3
 confidence_update_every = 2
 
 [cable]
-# Number of separate cables to reconstruct. With instance PIDNet masks, each
-# cable gets its own PF and endpoint anchors from its endpoint channel.
+# Number of separate PF cable tracks. endpoints_cable1 anchors PF1 and
+# endpoints_cable2 anchors PF2; the cable body remains one shared mask.
 count = 2
 
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
 segments = 12
 
 # Physical cable lengths in meters, one value per cable.
-lengths_m = [0.52, 0.52]
+lengths_m = [0.515, 0.515]
 
 # Maximum raw support points drawn in the 3D viewer.
 max_visual_points = 6000
 
 [measurement]
-# Smooth fitted 3D measurement nodes before proposal injection. The PIDNet path
-# now builds an ordered 3D centerline from the orange cloud, so this stays off
-# and the particle filter handles temporal smoothing.
-smoothing = false
-smoothing_alpha = 0.30
-smoothing_gate_m = 0.040
-
-# Before fitting helper chains, keep support points near the previous filtered
-# cable until reacquisition is needed.
-prediction_gate_m = 0.05
-
-# After this many prediction-only frames, prediction gating is disabled so the
-# tracker can reacquire from the full RGB segmentation.
-gate_reacquire_after = 4
-
 # ZED confidence max for accepted cable depth samples. Use a negative value to
 # disable confidence filtering.
 confidence_max = 85.0
 
 [particle_filter]
 enabled = true
-particles = 500
+# RTX 4080 profile: more hypotheses than the original 500 while keeping the
+# CPU endpoint projection and resampling stages bounded.
+particles = 768
+
+# Estimate the cable as the arithmetic mean of the highest-weight particles,
+# then project that mean back onto the fixed-length endpoint constraints.
+estimate_top_particles = 32
 
 # Initial spread when the first valid cable measurement initializes particles.
 initial_node_std_m = 0.05
@@ -140,27 +151,30 @@ velocity_measurement_blend = 0.10
 velocity_process_std_mps = 0.004
 max_node_speed_mps = 1.0
 
-# Direction smoothing is off because the ordered orange-cloud centerline is now
-# the main shape measurement. Re-enable only if the green chain becomes noisy.
+# Direction smoothing is off so the fixed-length PF can follow tight bends.
 direction_smooth_passes = 0
 
-# Measurement likelihood width, in meters. The ordered measured centerline lets
-# the PF trust current cable geometry more directly.
+# Standard deviation for particles proposed around the fitted helper chain.
 measurement_node_std_m = 0.025
 
-# Maximum masked ZED cable points used to score particles by point-to-segment
-# distance. This is the main particle-score cost knob.
-measurement_points = 500
+# Bound the shared support cloud before per-cable association. RANSAC hypothesis
+# construction, endpoint projection, inlier distances, and PF scoring run on
+# CUDA; only the selected support returns to the CPU measurement code.
+measurement_points = 1000
 
-# Particle scoring uses tensor parallelism on CUDA when available.
-scoring_backend = "auto"
+# Persistent particles, weights, node velocities, RANSAC, constraints, and
+# scoring are required to run on CUDA. A missing CUDA runtime fails immediately.
+scoring_backend = "cuda"
+
+# Benchmarked on the local RTX 4080. A 512-point chunk was faster than 1024 or
+# 2048 for this 12-segment, roughly 1000-particle workload.
 score_chunk_points = 512
 
-# Fast scoring first ranks particles on a small point subset, then fully scores
-# only the best hypotheses. The status line reports this as score=128c/80f.
-coarse_score_points = 128
-coarse_score_full_fraction = 0.15
-coarse_score_min_particles = 80
+# Score every particle against the full support cloud on CUDA. This removes the
+# coarse CPU/GPU dispatch and uses the available RTX 4080 compute directly.
+coarse_score_points = 0
+coarse_score_full_fraction = 1.0
+coarse_score_min_particles = 768
 
 # During PF initialization/reacquisition, order the masked 3D cloud by
 # estimating cable endpoints on a k-nearest-neighbor graph. The raw unordered
@@ -175,13 +189,13 @@ endpoint_refresh_interval = 0
 
 # After initialization, order new masked points by projection onto the current
 # filtered chain. This avoids rebuilding the expensive endpoint graph every
-# frame and keeps start/end identity stable.
+# frame and preserves the PF chain's existing start/end orientation.
 reference_ordering = true
 reference_ordering_gate_m = 0.08
 
 # Fit the ordered helper chain every N healthy PF updates. Skipped frames still
 # score the raw mask support points, but avoid proposal/velocity work based on a
-# newly fitted centerline.
+# newly fitted helper chain.
 measurement_fit_interval = 3
 
 # Keep the particle start/end close to the current measured endpoints. This is
@@ -208,10 +222,10 @@ measurement_proposal_direction_std = 0.015
 # hypothesis with the largest inlier set and lowest inlier RMS error, then gives
 # only that inlier subset to the PF.
 ransac_inlier_selection = true
-ransac_hypotheses = 16
-ransac_subset_points = 2
+ransac_hypotheses = 64
+ransac_subset_points = 12
 ransac_inlier_distance_m = 0.018
-ransac_min_points = 24
+ransac_min_points = 32
 
 # Robust scoring keeps this fraction of the lowest point-to-segment distances,
 # so a few bad depth points do not dominate the weight.
@@ -222,23 +236,22 @@ score_keep_fraction = 0.90
 coverage_penalty_m = 0.025
 coverage_min_fraction = 0.05
 
-# Bend penalty is off so tight measured cable bends can be followed. The measured
-# centerline and raw support cloud now provide the shape constraint.
+# Bend penalty is off so tight measured cable bends can be followed. Fixed
+# segment lengths, endpoints, and raw support points provide the constraints.
 bend_penalty_m = 0.0
 
-# Display estimate is always the weighted average of the best particles.
-top_particles = 80
+# The display, endpoint association, and crossing geometry use the constrained
+# top-particle mean configured above rather than a single MAP particle.
 
-# Keep a fixed exploration budget as globally random chain hypotheses within the
-# current measured support-cloud bounds.
-global_random_particle_ratio = 0.03
-global_random_effective_ratio = 0.35
+# On every valid PF update, replace this fixed fraction of the population with
+# globally random endpoint-constrained chains sampled across the current support.
+global_random_particle_ratio = 0.10
 global_random_bounds_padding_m = 0.10
 
 # Known endpoints define a constrained fixed-length chain. Internally each
 # particle is projected so node 0 and node N match the detected/drone endpoints
 # while every segment keeps the fixed cable length.
-endpoint_constraint_iterations = 4
+endpoint_constraint_iterations = 128
 endpoint_constraint_tolerance_m = 0.0001
 
 # Minimum support required before a measurement update is trusted.

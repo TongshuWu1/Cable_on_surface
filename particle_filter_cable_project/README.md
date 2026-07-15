@@ -1,111 +1,150 @@
-# Particle Filter Cable Project
+# Two-Cable Particle Filter Tracker
 
-Particle-filter 3D cable reconstruction and tracking from a PIDNet cable mask
-and ZED point cloud.
+Real-time 3D reconstruction of two cables from a ZED camera, a PIDNet-S
+segmentation model, and one particle filter per cable.
 
-Run the live tracker with no arguments:
+## Run
 
-```bash
-../.venv/bin/python main.py
+Start the ZED 3D viewer and tracker:
+
+```powershell
+..\.venv\Scripts\python.exe main.py
 ```
 
-Runtime tuning lives in `config.toml`. Command-line flags are still available
-for temporary overrides, but normal tuning should go into that file so each run
-starts from the same known settings.
+`main.py` is only the live tracking application. Runtime settings live in
+`config.toml`; a missing setting is an error.
 
-The cable model intentionally ignores the physical outline of the cable. The
-particle filter represents it as connected fixed-length 3D segments:
+Start the labeling and training GUI separately:
+
+```powershell
+..\.venv\Scripts\python.exe tools\pidnet_training_gui.py
+```
+
+The active experiment uses:
+
+- Dataset: `datasets/two_cable_pidnet`
+- Checkpoint: `models/pidnet_two_cable_best.pt`
+- Training parameters: `pidnet_two_cable_training_params.json`
+
+## Measurement Model
+
+PIDNet outputs four independent channels in this exact order:
+
+1. Generic cable body
+2. `endpoints_cable1`, containing both ends of Cable 1
+3. `endpoints_cable2`, containing both ends of Cable 2
+4. Cable crossing
+
+The cable body is shared, but endpoint-channel identity is physical cable
+identity: `endpoints_cable1` always anchors PF1 and `endpoints_cable2` always
+anchors PF2. The two components within a channel are the two ends of that same
+cable; their component order is aligned to the previous PF chain so a connected
+component reorder cannot flip the chain. Crossing is an independent multilabel
+channel, so marking a crossing does not erase cable or endpoint annotations.
+
+The crossing head is only an RGB proposal. Each connected proposal is matched
+to one segment on each PF chain, producing arc lengths, closest 3D points,
+centerline distance, cable-surface gap, depth order, covariance, and confidence.
+The viewer labels proposals as `RGB CROSSING` until both physical cable
+diameters are configured and the 3D gap is within the contact tolerance. This
+observation is diagnostic only; it does not impose a PF contact constraint.
+
+Deterministic mask indices are sampled directly from the ZED GPU depth buffer
+into one compact shared 3D support cloud. Each PF selects support reachable from its own
+endpoints, uses constrained RANSAC to reject support from the other cable, and
+scores its particles by point-to-polyline distance on CUDA. Every accepted PF
+update replaces a fixed 10% of the population with globally sampled,
+endpoint-constrained chains. There is no separate recovery mode or recovery
+trigger; this persistent exploration budget handles reacquisition continuously.
+
+## Cable Model
+
+Each cable is a fixed-length polygonal chain:
 
 ```text
 P0 -- P1 -- P2 -- ... -- PN
 ```
 
-`cable.segments = N` means each estimate has `N + 1` connected control points.
-Each cable has its own fixed segment length derived from
-`cable.lengths_m[cable_index] / cable.segments`.
+`cable.segments = N` creates `N + 1` nodes. Cable `i` uses the physical length
+in `cable.lengths_m[i]`, so every segment has length
+`cable.lengths_m[i] / N`. Both endpoints are fixed to the detected 3D endpoint
+positions to the configured tolerance. The PF estimates the middle-node
+configuration and velocity while preserving segment lengths. The live estimate
+is the arithmetic mean of the configured number of highest-weight particles;
+that mean is projected back onto the fixed segment lengths and detected
+endpoints before it is displayed or used by downstream geometry.
 
-Current pipeline:
+The 3D viewer exposes estimator diagnostics without changing the PF state:
+translucent magenta/cyan lines are the exact particles included in the
+arithmetic mean, the white chain is the single MAP particle, the normal
+green/yellow/red chain is the constrained top-particle average, and purple
+two-standard-deviation bars show node-wise spread along each node's principal
+uncertainty axis. `MAP-AVG`, mean/max spread, and start/end MAP-to-average
+direction disagreement are reported per PF. Press `P` to toggle this diagnostic
+layer; the fixed 10% global recovery population and all PF calculations remain
+unchanged.
 
-1. Segment RGB with the PIDNet-S checkpoint trained for one generic cable mask
-   plus one endpoint channel per cable.
-2. For each cable, use its endpoint channel to build fixed endpoint anchors.
-3. Lift the shared cable mask into ZED 3D support points.
-4. Each cable has its own particle filter, fixed physical length, endpoint tape
-   length, and endpoint-constrained particle set.
-5. Before scoring, each PF keeps only support points physically reachable from
-   that cable's endpoints.
-6. Use endpoint-constrained RANSAC to select the inlier support subset for each
-   cable.
-7. Score particles by point-to-polyline distance using CUDA tensor scoring when
-   available.
-8. Track through occlusion with velocity prediction, visible-segment assignment,
-   and resampling.
+## Runtime Pipeline
 
-Label masks and train the PIDNet-S detector on CUDA:
+1. A dedicated capture thread acquires RGB plus rotating ZED GPU depth buffers.
+2. The detector stage runs PIDNet once for cable, endpoints_cable1,
+   endpoints_cable2, and crossing masks.
+3. The tracker lifts each cable's two endpoints into 3D and sends them directly
+   to the correspondingly indexed PF before parallel measurement work.
+4. Two independent CUDA streams update the endpoint-constrained particle
+   filters, including fused RANSAC, the fixed 10% global-particle mixture,
+   constraints, scoring, velocity, and resampling.
+5. The main thread renders the latest complete result without blocking capture
+   or estimation.
 
-```bash
-../.venv/bin/python tools/pidnet_training_gui.py --device cuda
+Detection for frame `t + 1` overlaps tracking for frame `t`. Strict
+backpressure keeps at most one detected frame waiting, so GPU time is not spent
+on stale frames. Runtime output reports GUI, camera capture, and completed
+tracking FPS separately.
+
+## Label And Train
+
+In the training GUI, paint the generic cable body, the two endpoint classes,
+and the small crossing region. Save overlap-preserving annotations in
+`masks_layers`; the rendered PNG masks are previews, not the source of truth for
+multilabel crossings.
+
+The GUI can browse train, validation, and capture folders, identify missing
+masks, delete bad frames, check dataset integrity, train on CUDA, and preview
+the current model.
+
+Headless training is also available:
+
+```powershell
+..\.venv\Scripts\python.exe tools\train_pidnet_cable.py --dataset datasets\two_cable_pidnet --output models\pidnet_two_cable_best.pt --device cuda
 ```
 
-The GUI workflow is:
-
-1. Open/capture RGB frames.
-2. Paint the generic cable body and the endpoint class for each cable. Every
-   unpainted pixel is background.
-3. Use `Label Open` / `Label Close` only when cleaning a hand-painted training
-   mask.
-4. Save labels to `datasets/cable_pidnet/images/...` and `datasets/cable_pidnet/masks/...`.
-5. Use `Live PIDNet cleanup` to tune the same threshold, open kernel, close
-   kernel, and min-area cleanup used by `main.py`, then save those values to
-   `config.toml`.
-6. Use `Check Dataset`, tune the PIDNet training values, and save/load those
-   values with `Save Params` / `Load Params`.
-7. Click `Train PIDNet-S on CUDA`, then test the checkpoint on current, train,
-   and validation frames.
-8. Run live tracking with the saved checkpoint.
-
-Live ZED split view:
-
-```bash
-../.venv/bin/python main.py
-```
-
-By default, live mode reads `config.toml` and expects the checkpoint named by
-`pidnet.checkpoint`. The checkpoint must output one generic cable channel plus
-one endpoint channel per cable. To use another config:
-
-```bash
-../.venv/bin/python main.py --config /path/to/config.toml
-```
-
-Headless PIDNet-S training:
-
-```bash
-../.venv/bin/python tools/train_pidnet_cable.py --dataset /path/to/cable_dataset --output models/pidnet_cable_best.pt --epochs 80 --batch-size 8 --imgsz 1280x720 --device cuda
-```
-
-Dataset layout:
+The required split layout is:
 
 ```text
-cable_dataset/
-  images/train/frame_0001.png
-  masks/train/frame_0001.png
-  images/val/frame_0101.png
-  masks/val/frame_0101.png
+datasets/two_cable_pidnet/
+  images/train/*.png
+  images/val/*.png
+  masks/train/*.png
+  masks/val/*.png
+  masks_layers/train/*.npz
+  masks_layers/val/*.npz
 ```
 
-The `val` split is optional. A flat `images/` and `masks/` layout also works,
-and the trainer will create a validation split by filename stem. Masks use one
-generic cable-body class plus one endpoint class per cable. You do not paint
-background explicitly. The PIDNet path feeds the downstream tracker as endpoint
-anchors, masked ZED cable points, then particle-filter segment scoring.
+## Code Layout
 
-The live UI shows RGB on the left and the ZED point cloud on the right. The
-cable model is controlled by `cable.segments`; `N` segments means `N + 1`
-connected 3D nodes. Important tuning sections:
+- `main.py`: independent ZED capture, detector, tracker, and live viewer stages
+- `cable_cuda.py`: strict CUDA runtime and fused-kernel launch interface
+- `cable_cuda_kernels.cu`: fused constraints, RANSAC construction, and ZED sampling
+- `cable_crossing.py`: RGB crossing proposals and continuous 3D contact observations
+- `cable_pidnet.py`: strict four-channel PIDNet inference
+- `cable_detection.py`: 2D mask cleanup and 3D measurement construction
+- `cable_particle_filter.py`: endpoint-constrained two-cable PF
+- `zed_spatial.py`: ZED point-cloud conversion
+- `zed_split_viewer.py`: RGB and 3D rendering
+- `tools/pidnet_training_gui.py`: labeling, dataset inspection, and training UI
+- `tools/train_pidnet_cable.py`: PIDNet training and evaluation
 
-- `pidnet`: model checkpoint, CUDA device, probability threshold.
-- `detector`: PIDNet inference scale, mask cleanup, and update cadence.
-- `measurement`: masked ZED point selection, depth rejection, prediction gating.
-- `particle_filter`: particle count, process noise, scoring, occlusion.
-- `point_cloud`: viewer point-cloud sampling and confidence-map cadence.
+There are no legacy single-cable model paths or automatic model/config
+fallbacks. Incompatible checkpoints, missing configuration, unavailable CUDA,
+or invalid measurements fail explicitly.
