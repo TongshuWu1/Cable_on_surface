@@ -114,7 +114,7 @@ count = 2
 segments = 12
 
 # Physical cable lengths in meters, one value per cable.
-lengths_m = [0.515, 0.515]
+lengths_m = [0.510, 0.515]
 
 # Maximum raw support points drawn in the 3D viewer.
 max_visual_points = 6000
@@ -128,16 +128,16 @@ confidence_max = 85.0
 enabled = true
 # RTX 4080 profile. Both cable populations are evaluated together by one fused
 # point-to-polyline CUDA kernel.
-particles = 768
+particles = 800
 
 # Estimate the cable as the arithmetic mean of the highest-weight particles,
 # then project that mean back onto the fixed-length endpoint constraints.
-estimate_top_particles = 32
+estimate_top_particles = 50
 
 # Local transition noise. The endpoint-conditioned proposal population below is
 # responsible for larger, fast interior deformations.
-process_node_std_m = 0.005
-process_direction_std = 0.012
+process_node_std_m = 0.01
+process_direction_std = 0.02
 
 # Constant-velocity prediction. Each particle stores one 3D velocity per cable
 # node. Prediction moves nodes by v*dt, then reapplies fixed segment length and
