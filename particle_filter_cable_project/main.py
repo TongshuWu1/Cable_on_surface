@@ -16,15 +16,16 @@ from cable_cuda import CudaPointCloudView
 from cable_detection import (
     CableEstimate3D,
     attach_endpoint_markers_to_measurement,
-    cable_measurement_from_mask_points,
     cable_measurement_from_support_points,
     endpoint_group_observations_from_mask,
     polyline_residual,
+    sampled_masked_point_cloud_point_sets,
 )
 from cable_crossing import (
     CameraIntrinsics,
+    assign_crossing_targets,
+    estimate_crossing_axes,
     extract_crossing_proposals,
-    verify_crossing_proposals,
 )
 from cable_particle_filter import (
     CableParticleFilter,
@@ -42,7 +43,16 @@ from zed_spatial import (
     live_point_cloud_to_vertices,
 )
 from zed_split_viewer import ZedDepthGLViewer
-from pidnet_schema import CROSSING_CHANNEL, OUTPUT_CHANNEL_COUNT
+from pidnet_schema import CROSSING_CHANNEL, ENDPOINT_CHANNELS, OUTPUT_CHANNEL_COUNT
+from pf_ablation import (
+    AblationControlPanel,
+    ExperimentRecorder,
+    RuntimeFeatureController,
+    apply_feature_state_to_args,
+    feature_state_from_args,
+    file_sha256,
+    validate_feature_state,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -143,9 +153,32 @@ def parse_args():
         default=config_value(config, "viewer", "rgb_view", "segmentation"),
         help="Left RGB panel visualization. Segmentation shows the live PIDNet mask clearly.",
     )
+    parser.add_argument(
+        "--ablation-control-ui",
+        action=argparse.BooleanOptionalAction,
+        default=config_value(config, "viewer", "ablation_control_ui", True),
+    )
+    parser.add_argument(
+        "--experiment-output-directory",
+        type=Path,
+        default=config_value(
+            config,
+            "experiment",
+            "output_directory",
+            PROJECT_DIR / "experiments",
+            config_base_dir,
+        ),
+    )
     parser.add_argument("--neural-detector-checkpoint", type=Path, default=config_value(config, "pidnet", "checkpoint", DEFAULT_PIDNET_CHECKPOINT, config_base_dir), help="PIDNet cable segmentation checkpoint.")
     parser.add_argument("--neural-detector-device", default=config_value(config, "pidnet", "device", "cuda"), help="PyTorch device for PIDNet detector. Default: cuda.")
     parser.add_argument("--neural-detector-threshold", type=float, default=config_value(config, "pidnet", "threshold", 0.50), help="PIDNet probability threshold for the binary cable mask.")
+    parser.add_argument(
+        "--neural-detector-endpoint-thresholds",
+        type=float,
+        nargs="+",
+        default=config_value(config, "pidnet", "endpoint_thresholds", None),
+        help="Per-cable thresholds for the endpoints_cable1 and endpoints_cable2 heads.",
+    )
     parser.add_argument("--neural-detector-amp", action=argparse.BooleanOptionalAction, default=config_value(config, "pidnet", "amp", True), help="Use CUDA automatic mixed precision for PIDNet inference.")
     parser.add_argument("--neural-detector-channels-last", action=argparse.BooleanOptionalAction, default=config_value(config, "pidnet", "channels_last", True), help="Use channels-last CUDA tensors for PIDNet inference.")
     parser.add_argument("--endpoint-marker-min-area", type=int, default=config_value(config, "endpoint_markers", "min_area_px", 50))
@@ -158,12 +191,24 @@ def parse_args():
     parser.add_argument("--endpoint-association-ambiguity-margin", type=float, default=config_value(config, "endpoint_association", "ambiguity_margin_m", 0.015))
     parser.add_argument("--endpoint-association-support-weight", type=float, default=config_value(config, "endpoint_association", "support_weight", 0.35))
     parser.add_argument("--endpoint-association-support-clip", type=float, default=config_value(config, "endpoint_association", "support_clip_m", 0.080))
+    parser.add_argument("--endpoint-association-support", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "endpoint_association_support", True))
+    parser.add_argument("--cable-mask-morphology", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "cable_mask_morphology", True))
+    parser.add_argument("--cable-component-filter", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "cable_component_filter", True))
+    parser.add_argument("--endpoint-mask-morphology", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "endpoint_mask_morphology", True))
+    parser.add_argument("--endpoint-component-filter", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "endpoint_component_filter", True))
+    parser.add_argument("--depth-confidence-filter", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "depth_confidence_filter", True))
     parser.add_argument("--crossing-threshold", type=float, default=config_value(config, "crossing", "threshold", 0.50))
     parser.add_argument("--crossing-min-area", type=int, default=config_value(config, "crossing", "min_area_px", 12))
-    parser.add_argument("--crossing-max-proposals", type=int, default=config_value(config, "crossing", "max_proposals", 8))
-    parser.add_argument("--cable-diameters", type=float, nargs="+", default=config_value(config, "crossing", "cable_diameters_m", None))
-    parser.add_argument("--crossing-contact-tolerance", type=float, default=config_value(config, "crossing", "contact_tolerance_m", 0.002))
-    parser.add_argument("--crossing-association-sigma", type=float, default=config_value(config, "crossing", "association_sigma_px", 18.0))
+    parser.add_argument("--crossing-max-proposals", type=int, default=config_value(config, "crossing", "max_proposals", 4))
+    parser.add_argument("--crossing-max-visual-points", type=int, default=config_value(config, "crossing", "max_visual_points", 512))
+    parser.add_argument("--crossing-axis-radius", type=float, default=config_value(config, "crossing", "axis_radius_px", 36.0))
+    parser.add_argument("--crossing-min-axis-separation", type=float, default=config_value(config, "crossing", "min_axis_separation_deg", 25.0))
+    parser.add_argument("--crossing-min-axis-support", type=int, default=config_value(config, "crossing", "min_axis_support_px", 12))
+    parser.add_argument("--crossing-position-sigma", type=float, default=config_value(config, "crossing", "position_sigma_px", 14.0))
+    parser.add_argument("--crossing-angle-sigma", type=float, default=config_value(config, "crossing", "angle_sigma_deg", 20.0))
+    parser.add_argument("--crossing-log-reward", type=float, default=config_value(config, "crossing", "log_reward", 4.0))
+    parser.add_argument("--crossing-proposals", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "crossing_proposals", True))
+    parser.add_argument("--crossing-likelihood", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "crossing_likelihood", True))
     parser.add_argument("--detector-min-area", type=int, default=config_value(config, "detector", "min_area_px", 80))
     parser.add_argument("--detector-open-kernel", type=int, default=config_value(config, "detector", "open_kernel", 3))
     parser.add_argument("--detector-close-kernel", type=int, default=config_value(config, "detector", "close_kernel", 5))
@@ -172,7 +217,7 @@ def parse_args():
     parser.add_argument("--cable-lengths", type=float, nargs="+", default=config_value(config, "cable", "lengths_m", None), help="Physical cable lengths in meters, one value per cable.")
     parser.add_argument("--cable-max-points", type=int, default=config_value(config, "cable", "max_visual_points", 1000))
     parser.add_argument("--cable-confidence-max", type=float, default=config_value(config, "measurement", "confidence_max", 85.0), help="Use <0 to disable.")
-    parser.add_argument("--particle-filter", action=argparse.BooleanOptionalAction, default=config_value(config, "particle_filter", "enabled", True))
+    parser.add_argument("--particle-filter", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "particle_filter", True))
     parser.add_argument("--pf-particles", type=int, default=config_value(config, "particle_filter", "particles", pf_defaults.particle_count))
     parser.add_argument(
         "--pf-estimate-top-particles",
@@ -183,15 +228,33 @@ def parse_args():
             "estimate_top_particles",
             pf_defaults.estimate_top_particle_count,
         ),
-        help="Display and propagate the constrained arithmetic mean of the highest-weight N particles.",
+        help="Choose a posterior-medoid representative from the highest-weight N particles.",
     )
     parser.add_argument("--pf-process-std", type=float, default=config_value(config, "particle_filter", "process_node_std_m", pf_defaults.process_node_std_m))
     parser.add_argument("--pf-process-direction-std", type=float, default=config_value(config, "particle_filter", "process_direction_std", pf_defaults.process_direction_std))
-    parser.add_argument("--pf-velocity", action=argparse.BooleanOptionalAction, default=config_value(config, "particle_filter", "velocity", pf_defaults.velocity_enabled))
+    parser.add_argument("--pf-velocity", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "velocity_prediction", pf_defaults.velocity_enabled))
+    parser.add_argument("--pf-adaptive-motion", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "adaptive_motion_noise", True))
+    parser.add_argument("--pf-occlusion-prediction", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "occlusion_prediction", True))
+    parser.add_argument("--pf-direction-smoothing", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "direction_smoothing", False))
+    parser.add_argument("--pf-posterior-medoid", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "posterior_medoid_estimate", True))
+    parser.add_argument("--pf-endpoint-tangent", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "endpoint_tangent_estimation", True))
+    parser.add_argument("--pf-endpoint-tangent-ransac", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "endpoint_tangent_ransac", True))
+    parser.add_argument("--pf-endpoint-tangent-likelihood", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "endpoint_tangent_likelihood", True))
+    parser.add_argument("--pf-conditioned-proposals", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "endpoint_conditioned_proposals", True))
+    parser.add_argument("--pf-global-random-particles", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "global_random_particles", True))
+    parser.add_argument("--pf-robust-measurement", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "robust_measurement_likelihood", True))
+    parser.add_argument("--pf-dense-path-support", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "dense_path_support", True))
+    parser.add_argument("--pf-union-coverage", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "union_coverage_selection", True))
+    parser.add_argument("--pf-bend-regularization", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "bend_regularization", False))
+    parser.add_argument("--point-support-coloring", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "point_support_coloring", True))
+    parser.add_argument("--particle-diagnostics-overlay", action=argparse.BooleanOptionalAction, default=config_value(config, "features", "particle_diagnostics_overlay", True))
     parser.add_argument("--pf-velocity-damping", type=float, default=config_value(config, "particle_filter", "velocity_damping", pf_defaults.velocity_damping))
     parser.add_argument("--pf-velocity-measurement-blend", type=float, default=config_value(config, "particle_filter", "velocity_measurement_blend", pf_defaults.velocity_measurement_blend))
     parser.add_argument("--pf-velocity-process-std", type=float, default=config_value(config, "particle_filter", "velocity_process_std_mps", pf_defaults.velocity_process_std_mps))
     parser.add_argument("--pf-max-node-speed", type=float, default=config_value(config, "particle_filter", "max_node_speed_mps", pf_defaults.max_node_speed_mps))
+    parser.add_argument("--pf-motion-speed-reference", type=float, default=config_value(config, "particle_filter", "motion_speed_reference_mps", pf_defaults.motion_speed_reference_mps))
+    parser.add_argument("--pf-motion-innovation-reference", type=float, default=config_value(config, "particle_filter", "motion_innovation_reference_m", pf_defaults.motion_innovation_reference_m))
+    parser.add_argument("--pf-motion-noise-adaptation", type=float, default=config_value(config, "particle_filter", "motion_noise_adaptation", pf_defaults.motion_noise_adaptation))
     parser.add_argument("--pf-direction-smooth-passes", type=int, default=config_value(config, "particle_filter", "direction_smooth_passes", pf_defaults.direction_smooth_passes))
     parser.add_argument("--pf-measurement-std", type=float, default=config_value(config, "particle_filter", "measurement_node_std_m", pf_defaults.measurement_node_std_m))
     parser.add_argument(
@@ -211,34 +274,29 @@ def parse_args():
     parser.add_argument("--pf-tangent-sigma", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_sigma_m", pf_defaults.endpoint_tangent_sigma_m))
     parser.add_argument("--pf-tangent-min-points", type=int, default=config_value(config, "particle_filter", "endpoint_tangent_min_points", pf_defaults.endpoint_tangent_min_points))
     parser.add_argument("--pf-tangent-min-confidence", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_min_confidence", pf_defaults.endpoint_tangent_min_confidence))
+    parser.add_argument("--pf-tangent-ransac-inlier", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_ransac_inlier_m", pf_defaults.endpoint_tangent_ransac_inlier_m))
+    parser.add_argument("--pf-tangent-max-hypotheses", type=int, default=config_value(config, "particle_filter", "endpoint_tangent_max_hypotheses", pf_defaults.endpoint_tangent_max_hypotheses))
+    parser.add_argument("--pf-tangent-reference-weight", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_reference_weight", pf_defaults.endpoint_tangent_reference_weight))
+    parser.add_argument("--pf-tangent-likelihood-scale", type=float, default=config_value(config, "particle_filter", "endpoint_tangent_likelihood_scale_m", pf_defaults.endpoint_tangent_likelihood_scale_m))
+    parser.add_argument("--pf-local-proposal-ratio", type=float, default=config_value(config, "particle_filter", "local_proposal_ratio", pf_defaults.local_proposal_ratio))
     parser.add_argument("--pf-conditioned-proposal-ratio", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_proposal_ratio", pf_defaults.endpoint_conditioned_proposal_ratio))
     parser.add_argument("--pf-conditioned-direction-std", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_direction_std", pf_defaults.endpoint_conditioned_direction_std))
     parser.add_argument("--pf-conditioned-deformation-std", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_deformation_std_m", pf_defaults.endpoint_conditioned_deformation_std_m))
+    parser.add_argument("--pf-conditioned-slack-gain", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_slack_gain", pf_defaults.endpoint_conditioned_slack_gain))
+    parser.add_argument("--pf-conditioned-max-deformation", type=float, default=config_value(config, "particle_filter", "endpoint_conditioned_max_deformation_m", pf_defaults.endpoint_conditioned_max_deformation_m))
     parser.add_argument("--pf-conditioned-deformation-modes", type=int, default=config_value(config, "particle_filter", "endpoint_conditioned_deformation_modes", pf_defaults.endpoint_conditioned_deformation_modes))
-    parser.add_argument("--pf-ownership-outlier-likelihood", type=float, default=config_value(config, "particle_filter", "ownership_outlier_likelihood", pf_defaults.ownership_outlier_likelihood))
-    parser.add_argument("--pf-ownership-outlier-prior", type=float, default=config_value(config, "particle_filter", "ownership_outlier_prior", pf_defaults.ownership_outlier_prior))
-    parser.add_argument("--pf-ownership-min-responsibility", type=float, default=config_value(config, "particle_filter", "ownership_min_responsibility", pf_defaults.ownership_min_responsibility))
-    parser.add_argument("--pf-ownership-visibility-threshold", type=float, default=config_value(config, "particle_filter", "ownership_visibility_threshold", pf_defaults.ownership_visibility_threshold))
     parser.add_argument("--pf-robust-distance", type=float, default=config_value(config, "particle_filter", "robust_distance_m", pf_defaults.robust_distance_m))
-    parser.add_argument(
-        "--pf-coverage-penalty",
-        type=float,
-        default=config_value(config, "particle_filter", "coverage_penalty_m", pf_defaults.coverage_penalty_m),
-        help="Penalty scale in meters when expected visible segments do not own enough points. Use 0 to disable.",
-    )
-    parser.add_argument(
-        "--pf-coverage-min-fraction",
-        type=float,
-        default=config_value(config, "particle_filter", "coverage_min_fraction", pf_defaults.coverage_min_fraction),
-        help="Minimum fraction of support points each expected visible segment should own.",
-    )
+    parser.add_argument("--pf-path-support-weight", type=float, default=config_value(config, "particle_filter", "path_support_weight", pf_defaults.path_support_weight))
+    parser.add_argument("--pf-path-support-samples", type=int, default=config_value(config, "particle_filter", "path_support_samples_per_segment", pf_defaults.path_support_samples_per_segment))
+    parser.add_argument("--pf-union-coverage-top-particles", type=int, default=config_value(config, "particle_filter", "union_coverage_top_particles", pf_defaults.union_coverage_top_particle_count))
+    parser.add_argument("--pf-union-coverage-weight", type=float, default=config_value(config, "particle_filter", "union_coverage_weight", pf_defaults.union_coverage_weight))
     parser.add_argument("--pf-bend-penalty", type=float, default=config_value(config, "particle_filter", "bend_penalty_m", pf_defaults.bend_penalty_m))
     parser.add_argument("--pf-global-random-ratio", type=float, default=config_value(config, "particle_filter", "global_random_particle_ratio", pf_defaults.global_random_particle_ratio))
     parser.add_argument("--pf-endpoint-constraint-iterations", type=int, default=config_value(config, "particle_filter", "endpoint_constraint_iterations", pf_defaults.endpoint_constraint_iterations))
     parser.add_argument("--pf-endpoint-constraint-tolerance", type=float, default=config_value(config, "particle_filter", "endpoint_constraint_tolerance_m", pf_defaults.endpoint_constraint_tolerance_m))
     parser.add_argument("--pf-min-measurement-points", type=int, default=config_value(config, "particle_filter", "min_measurement_points", pf_defaults.min_measurement_points))
-    parser.add_argument("--pf-min-segment-points", type=int, default=config_value(config, "particle_filter", "min_segment_points", pf_defaults.min_segment_points))
-    parser.add_argument("--pf-occlusion-gate", type=float, default=config_value(config, "particle_filter", "occlusion_gate_m", pf_defaults.occlusion_assignment_max_distance_m))
+    parser.add_argument("--pf-min-segment-support-samples", type=int, default=config_value(config, "particle_filter", "min_segment_support_samples", pf_defaults.min_segment_support_samples))
+    parser.add_argument("--pf-support-visibility-distance", type=float, default=config_value(config, "particle_filter", "support_visibility_distance_m", pf_defaults.support_visibility_distance_m))
     parser.add_argument("--pf-max-prediction-frames", type=int, default=config_value(config, "particle_filter", "max_prediction_frames", pf_defaults.max_prediction_frames))
     parser.add_argument("--pf-max-motion-noise-scale", type=float, default=config_value(config, "particle_filter", "max_motion_noise_scale", pf_defaults.max_motion_noise_scale))
     args = parser.parse_args()
@@ -246,8 +304,8 @@ def parse_args():
         raise ValueError("Specify only one input source: --input-svo-file or --ip-address.")
     args.cable_segments = max(1, int(args.cable_segments))
     args.cable_count = int(args.cable_count)
-    if args.cable_count != 2:
-        raise ValueError(f"The live endpoint associator requires exactly two physical cables; got {args.cable_count}.")
+    if args.cable_count not in (1, 2):
+        raise ValueError(f"The live tracker supports one or two physical cables; got {args.cable_count}.")
     args.cable_lengths_m = required_per_cable_float_values(
         args.cable_lengths,
         args.cable_count,
@@ -259,6 +317,17 @@ def parse_args():
     args.confidence_update_every = max(0, int(args.confidence_update_every))
     args.detector_scale = float(np.clip(args.detector_scale, 0.10, 1.0))
     args.detector_update_every = max(1, int(args.detector_update_every))
+    args.neural_detector_threshold = float(np.clip(args.neural_detector_threshold, 0.0, 1.0))
+    args.neural_detector_endpoint_thresholds = required_per_cable_float_values(
+        args.neural_detector_endpoint_thresholds,
+        len(ENDPOINT_CHANNELS),
+        "pidnet.endpoint_thresholds",
+        minimum=0.0,
+    )
+    args.neural_detector_endpoint_thresholds = [
+        float(np.clip(value, 0.0, 1.0))
+        for value in args.neural_detector_endpoint_thresholds
+    ]
     args.endpoint_marker_min_area = max(1, int(args.endpoint_marker_min_area))
     args.endpoint_marker_min_points = max(1, int(args.endpoint_marker_min_points))
     args.endpoint_marker_open_kernel = max(0, int(args.endpoint_marker_open_kernel))
@@ -276,14 +345,13 @@ def parse_args():
     args.crossing_threshold = float(np.clip(args.crossing_threshold, 0.0, 1.0))
     args.crossing_min_area = max(1, int(args.crossing_min_area))
     args.crossing_max_proposals = max(1, int(args.crossing_max_proposals))
-    args.cable_diameters_m = required_per_cable_float_values(
-        args.cable_diameters,
-        args.cable_count,
-        "crossing.cable_diameters_m",
-        minimum=0.0,
-    )
-    args.crossing_contact_tolerance = max(0.0, float(args.crossing_contact_tolerance))
-    args.crossing_association_sigma = max(1e-3, float(args.crossing_association_sigma))
+    args.crossing_max_visual_points = max(1, int(args.crossing_max_visual_points))
+    args.crossing_axis_radius = max(4.0, float(args.crossing_axis_radius))
+    args.crossing_min_axis_separation = float(np.clip(args.crossing_min_axis_separation, 1.0, 89.0))
+    args.crossing_min_axis_support = max(2, int(args.crossing_min_axis_support))
+    args.crossing_position_sigma = max(1e-3, float(args.crossing_position_sigma))
+    args.crossing_angle_sigma = max(1e-3, float(args.crossing_angle_sigma))
+    args.crossing_log_reward = max(0.0, float(args.crossing_log_reward))
     args.derived_segment_lengths_m = [
         length_m / max(args.cable_segments, 1)
         for length_m in args.cable_lengths_m
@@ -298,27 +366,58 @@ def parse_args():
     args.pf_velocity_measurement_blend = float(np.clip(args.pf_velocity_measurement_blend, 0.0, 1.0))
     args.pf_velocity_process_std = max(0.0, float(args.pf_velocity_process_std))
     args.pf_max_node_speed = max(0.0, float(args.pf_max_node_speed))
+    args.pf_motion_speed_reference = max(1e-4, float(args.pf_motion_speed_reference))
+    args.pf_motion_innovation_reference = max(1e-5, float(args.pf_motion_innovation_reference))
+    args.pf_motion_noise_adaptation = float(np.clip(args.pf_motion_noise_adaptation, 0.0, 1.0))
     args.pf_tangent_min_radius = max(0.0, float(args.pf_tangent_min_radius))
     args.pf_tangent_radius = max(args.pf_tangent_min_radius + 1e-4, float(args.pf_tangent_radius))
     args.pf_tangent_sigma = max(1e-4, float(args.pf_tangent_sigma))
     args.pf_tangent_min_points = max(2, int(args.pf_tangent_min_points))
     args.pf_tangent_min_confidence = float(np.clip(args.pf_tangent_min_confidence, 0.0, 1.0))
-    args.pf_global_random_ratio = float(np.clip(args.pf_global_random_ratio, 0.0, 0.95))
-    args.pf_conditioned_proposal_ratio = float(np.clip(
+    args.pf_tangent_ransac_inlier = max(1e-4, float(args.pf_tangent_ransac_inlier))
+    args.pf_tangent_max_hypotheses = max(4, int(args.pf_tangent_max_hypotheses))
+    args.pf_tangent_reference_weight = max(0.0, float(args.pf_tangent_reference_weight))
+    args.pf_tangent_likelihood_scale = max(0.0, float(args.pf_tangent_likelihood_scale))
+    proposal_ratios = np.asarray((
+        args.pf_local_proposal_ratio,
         args.pf_conditioned_proposal_ratio,
-        0.0,
-        1.0 - args.pf_global_random_ratio,
-    ))
+        args.pf_global_random_ratio,
+    ), dtype=np.float64)
+    if not np.all(np.isfinite(proposal_ratios)) or np.any(proposal_ratios < 0.0):
+        raise ValueError("PF proposal ratios must be finite and non-negative.")
+    if not np.isclose(float(np.sum(proposal_ratios)), 1.0, rtol=0.0, atol=1e-8):
+        raise ValueError(
+            "particle_filter local_proposal_ratio, endpoint_conditioned_proposal_ratio, "
+            "and global_random_particle_ratio must sum to 1."
+        )
+    args.pf_local_proposal_ratio = float(proposal_ratios[0])
+    args.pf_conditioned_proposal_ratio = float(proposal_ratios[1])
+    args.pf_global_random_ratio = float(proposal_ratios[2])
     args.pf_conditioned_direction_std = max(0.0, float(args.pf_conditioned_direction_std))
     args.pf_conditioned_deformation_std = max(0.0, float(args.pf_conditioned_deformation_std))
+    args.pf_conditioned_slack_gain = max(0.0, float(args.pf_conditioned_slack_gain))
+    args.pf_conditioned_max_deformation = max(1e-4, float(args.pf_conditioned_max_deformation))
     args.pf_conditioned_deformation_modes = max(1, int(args.pf_conditioned_deformation_modes))
-    args.pf_ownership_outlier_likelihood = float(np.clip(args.pf_ownership_outlier_likelihood, 1e-6, 1.0))
-    args.pf_ownership_outlier_prior = float(np.clip(args.pf_ownership_outlier_prior, 1e-4, 0.95))
-    args.pf_ownership_min_responsibility = float(np.clip(args.pf_ownership_min_responsibility, 0.0, 0.25))
-    args.pf_ownership_visibility_threshold = float(np.clip(args.pf_ownership_visibility_threshold, 0.0, 1.0))
     args.pf_robust_distance = max(1e-4, float(args.pf_robust_distance))
+    args.pf_path_support_weight = max(0.0, float(args.pf_path_support_weight))
+    args.pf_path_support_samples = max(1, int(args.pf_path_support_samples))
+    args.pf_union_coverage_top_particles = int(np.clip(
+        args.pf_union_coverage_top_particles,
+        1,
+        args.pf_particles,
+    ))
+    args.pf_union_coverage_weight = max(0.0, float(args.pf_union_coverage_weight))
+    args.pf_min_segment_support_samples = max(
+        1,
+        min(int(args.pf_min_segment_support_samples), args.pf_path_support_samples),
+    )
+    args.pf_support_visibility_distance = max(
+        1e-4,
+        float(args.pf_support_visibility_distance),
+    )
     args.pf_endpoint_constraint_iterations = max(1, int(args.pf_endpoint_constraint_iterations))
     args.pf_endpoint_constraint_tolerance = max(0.0, float(args.pf_endpoint_constraint_tolerance))
+    validate_feature_contract(args)
     return args
 
 
@@ -360,6 +459,7 @@ def camera_intrinsics_from_zed(zed):
         cx=float(left.cx),
         cy=float(left.cy),
         y_axis_up=True,
+        z_axis_forward=False,
     )
     if not all(np.isfinite((intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy))):
         raise RuntimeError("ZED returned non-finite left-camera intrinsics.")
@@ -380,9 +480,9 @@ def load_cable_detector(args):
         checkpoint_path,
         device=args.neural_detector_device,
         threshold=float(args.neural_detector_threshold),
-        min_area=int(args.detector_min_area),
-        open_kernel=int(args.detector_open_kernel),
-        close_kernel=int(args.detector_close_kernel),
+        min_area=int(args.detector_min_area) if bool(args.cable_component_filter) else 1,
+        open_kernel=int(args.detector_open_kernel) if bool(args.cable_mask_morphology) else 1,
+        close_kernel=int(args.detector_close_kernel) if bool(args.cable_mask_morphology) else 1,
         amp=bool(args.neural_detector_amp),
         channels_last=bool(args.neural_detector_channels_last),
     )
@@ -409,7 +509,13 @@ def load_cable_detector(args):
 
 
 def detector_description(args):
-    return f"PIDNet mask threshold {float(args.neural_detector_threshold):.2f}"
+    endpoint_text = ",".join(
+        f"{float(value):.2f}" for value in args.neural_detector_endpoint_thresholds
+    )
+    return (
+        f"PIDNet thresholds body={float(args.neural_detector_threshold):.2f} "
+        f"endpoints={endpoint_text} crossing={float(args.crossing_threshold):.2f}"
+    )
 
 
 def detect_cable_endpoint_markers(
@@ -425,17 +531,23 @@ def detect_cable_endpoint_markers(
     return endpoint_group_observations_from_mask(
         endpoint_mask,
         point_cloud,
-        open_kernel=args.endpoint_marker_open_kernel,
-        close_kernel=args.endpoint_marker_close_kernel,
+        open_kernel=(args.endpoint_marker_open_kernel if bool(args.endpoint_mask_morphology) else 0),
+        close_kernel=(args.endpoint_marker_close_kernel if bool(args.endpoint_mask_morphology) else 0),
         depth_min=args.depth_min,
         depth_max=args.depth_max,
         confidence_map=confidence_measure,
-        max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
-        min_area_px=args.endpoint_marker_min_area,
-        min_points_per_component=args.endpoint_marker_min_points,
+        max_confidence=effective_cable_confidence_max(args),
+        min_area_px=(args.endpoint_marker_min_area if bool(args.endpoint_component_filter) else 1),
+        min_points_per_component=(args.endpoint_marker_min_points if bool(args.endpoint_component_filter) else 1),
         max_points_per_component=args.endpoint_marker_points,
         max_components=2,
     )
+
+
+def effective_cable_confidence_max(args):
+    if not bool(args.depth_confidence_filter) or float(args.cable_confidence_max) < 0.0:
+        return None
+    return float(args.cable_confidence_max)
 
 
 def endpoint_anchor_diagnostics(markers, args, cable_index=0):
@@ -475,9 +587,27 @@ def endpoint_anchor_diagnostics(markers, args, cable_index=0):
 
 
 def make_particle_filter_config(args, cable_index=0):
+    endpoint_ratio = (
+        float(args.pf_conditioned_proposal_ratio)
+        if bool(args.pf_conditioned_proposals)
+        else 0.0
+    )
+    random_ratio = (
+        float(args.pf_global_random_ratio)
+        if bool(args.pf_global_random_particles)
+        else 0.0
+    )
+    # A disabled proposal component transfers only its mass to the local
+    # posterior transition.  The other optional component keeps its configured
+    # mass, so a single-feature ablation has one documented effect.
+    local_ratio = 1.0 - endpoint_ratio - random_ratio
     return CableParticleFilterConfig(
         particle_count=int(args.pf_particles),
-        estimate_top_particle_count=int(args.pf_estimate_top_particles),
+        estimate_top_particle_count=(
+            int(args.pf_estimate_top_particles)
+            if bool(args.pf_posterior_medoid)
+            else 1
+        ),
         segment_length_m=cable_segment_length_m(args, cable_index),
         process_node_std_m=float(args.pf_process_std),
         process_direction_std=float(args.pf_process_direction_std),
@@ -486,7 +616,15 @@ def make_particle_filter_config(args, cable_index=0):
         velocity_measurement_blend=float(args.pf_velocity_measurement_blend),
         velocity_process_std_mps=float(args.pf_velocity_process_std),
         max_node_speed_mps=float(args.pf_max_node_speed),
-        direction_smooth_passes=int(args.pf_direction_smooth_passes),
+        adaptive_motion_noise_enabled=bool(args.pf_adaptive_motion),
+        motion_speed_reference_mps=float(args.pf_motion_speed_reference),
+        motion_innovation_reference_m=float(args.pf_motion_innovation_reference),
+        motion_noise_adaptation=float(args.pf_motion_noise_adaptation),
+        direction_smooth_passes=(
+            int(args.pf_direction_smooth_passes)
+            if bool(args.pf_direction_smoothing)
+            else 0
+        ),
         measurement_node_std_m=float(args.pf_measurement_std),
         measurement_max_points=int(args.pf_measurement_points),
         scoring_backend=str(args.pf_scoring_backend),
@@ -495,26 +633,104 @@ def make_particle_filter_config(args, cable_index=0):
         endpoint_tangent_sigma_m=float(args.pf_tangent_sigma),
         endpoint_tangent_min_points=int(args.pf_tangent_min_points),
         endpoint_tangent_min_confidence=float(args.pf_tangent_min_confidence),
-        endpoint_conditioned_proposal_ratio=float(args.pf_conditioned_proposal_ratio),
+        endpoint_tangent_ransac_inlier_m=float(args.pf_tangent_ransac_inlier),
+        endpoint_tangent_max_hypotheses=int(args.pf_tangent_max_hypotheses),
+        endpoint_tangent_reference_weight=float(args.pf_tangent_reference_weight),
+        endpoint_tangent_estimation_enabled=bool(args.pf_endpoint_tangent),
+        endpoint_tangent_ransac_enabled=bool(args.pf_endpoint_tangent_ransac),
+        endpoint_tangent_likelihood_scale_m=(
+            float(args.pf_tangent_likelihood_scale)
+            if bool(args.pf_endpoint_tangent and args.pf_endpoint_tangent_likelihood)
+            else 0.0
+        ),
+        local_proposal_ratio=local_ratio,
+        endpoint_conditioned_proposal_ratio=endpoint_ratio,
         endpoint_conditioned_direction_std=float(args.pf_conditioned_direction_std),
         endpoint_conditioned_deformation_std_m=float(args.pf_conditioned_deformation_std),
+        endpoint_conditioned_slack_gain=float(args.pf_conditioned_slack_gain),
+        endpoint_conditioned_max_deformation_m=float(args.pf_conditioned_max_deformation),
         endpoint_conditioned_deformation_modes=int(args.pf_conditioned_deformation_modes),
-        ownership_outlier_likelihood=float(args.pf_ownership_outlier_likelihood),
-        ownership_outlier_prior=float(args.pf_ownership_outlier_prior),
-        ownership_min_responsibility=float(args.pf_ownership_min_responsibility),
-        ownership_visibility_threshold=float(args.pf_ownership_visibility_threshold),
+        robust_measurement_enabled=bool(args.pf_robust_measurement),
         robust_distance_m=float(args.pf_robust_distance),
-        coverage_penalty_m=float(args.pf_coverage_penalty),
-        coverage_min_fraction=float(args.pf_coverage_min_fraction),
-        bend_penalty_m=float(args.pf_bend_penalty),
-        global_random_particle_ratio=float(args.pf_global_random_ratio),
+        path_support_weight=(
+            float(args.pf_path_support_weight)
+            if bool(args.pf_dense_path_support)
+            else 0.0
+        ),
+        path_support_samples_per_segment=int(args.pf_path_support_samples),
+        union_coverage_top_particle_count=int(args.pf_union_coverage_top_particles),
+        union_coverage_weight=(
+            float(args.pf_union_coverage_weight)
+            if bool(args.pf_union_coverage)
+            else 0.0
+        ),
+        bend_penalty_m=(
+            float(args.pf_bend_penalty)
+            if bool(args.pf_bend_regularization)
+            else 0.0
+        ),
+        global_random_particle_ratio=random_ratio,
         endpoint_constraint_iterations=int(args.pf_endpoint_constraint_iterations),
         endpoint_constraint_tolerance_m=float(args.pf_endpoint_constraint_tolerance),
         min_measurement_points=int(args.pf_min_measurement_points),
-        min_segment_points=int(args.pf_min_segment_points),
-        occlusion_assignment_max_distance_m=float(args.pf_occlusion_gate),
-        max_prediction_frames=int(args.pf_max_prediction_frames),
+        min_segment_support_samples=int(args.pf_min_segment_support_samples),
+        support_visibility_distance_m=float(args.pf_support_visibility_distance),
+        crossing_position_sigma_px=float(args.crossing_position_sigma),
+        crossing_angle_sigma_deg=float(args.crossing_angle_sigma),
+        crossing_log_reward=(
+            float(args.crossing_log_reward)
+            if bool(args.crossing_likelihood)
+            else 0.0
+        ),
+        max_prediction_frames=(
+            int(args.pf_max_prediction_frames)
+            if bool(args.pf_occlusion_prediction)
+            else 0
+        ),
         max_motion_noise_scale=float(args.pf_max_motion_noise_scale),
+        point_support_diagnostics_enabled=bool(args.point_support_coloring),
+        particle_diagnostics_enabled=bool(args.particle_diagnostics_overlay),
+    )
+
+
+def validate_feature_contract(args):
+    """Reject feature combinations that would otherwise be silently inert."""
+
+    validate_feature_state(feature_state_from_args(args))
+
+
+def feature_gate_status(args):
+    """Compact, stable feature summary for ablation logs."""
+
+    gates = (
+        ("PF", args.particle_filter),
+        ("body-morph", args.cable_mask_morphology),
+        ("body-components", args.cable_component_filter),
+        ("endpoint-morph", args.endpoint_mask_morphology),
+        ("endpoint-components", args.endpoint_component_filter),
+        ("depth-confidence", args.depth_confidence_filter),
+        ("endpoint-support", args.endpoint_association_support),
+        ("velocity", args.pf_velocity),
+        ("adaptive-motion", args.pf_adaptive_motion),
+        ("occlusion", args.pf_occlusion_prediction),
+        ("direction-smooth", args.pf_direction_smoothing),
+        ("medoid", args.pf_posterior_medoid),
+        ("tangent", args.pf_endpoint_tangent),
+        ("tangent-RANSAC", args.pf_endpoint_tangent_ransac),
+        ("tangent-L", args.pf_endpoint_tangent_likelihood),
+        ("conditioned", args.pf_conditioned_proposals),
+        ("random", args.pf_global_random_particles),
+        ("robust-L", args.pf_robust_measurement),
+        ("path-support", args.pf_dense_path_support),
+        ("union", args.pf_union_coverage),
+        ("bend", args.pf_bend_regularization),
+        ("crossing", args.crossing_proposals),
+        ("crossing-L", args.crossing_likelihood),
+        ("point-colors", args.point_support_coloring),
+        ("PF-overlay", args.particle_diagnostics_overlay),
+    )
+    return "FEATURES " + " ".join(
+        f"{name}={int(bool(enabled))}" for name, enabled in gates
     )
 
 
@@ -531,6 +747,7 @@ class AsyncTrackingFrame:
     point_cloud: object
     confidence_measure: np.ndarray | None
     release_callback: object | None = None
+    feature_snapshot: dict | None = None
 
 
 @dataclass
@@ -544,6 +761,7 @@ class DetectedTrackingFrame:
     crossing_mask: np.ndarray
     crossing_proposals: tuple
     detect_seconds: float
+    feature_snapshot: dict
 
 
 @dataclass
@@ -557,8 +775,9 @@ class AsyncTrackingResult:
     endpoint_overlap_mask: np.ndarray | None
     endpoint_observations: tuple | None
     crossing_mask: np.ndarray | None
+    crossing_points: np.ndarray
     crossing_proposals: tuple
-    contact_observations: tuple
+    crossing_targets_by_cable: tuple
     measurement: object | None
     estimate: object | None
     filter_result: object | None
@@ -614,7 +833,7 @@ def label_mask_from_detections(detections, output_shape, first_label=1):
 
 
 class AsyncTrackingWorker:
-    def __init__(self, args, cable_detector, particle_filters):
+    def __init__(self, args, cable_detector, particle_filters, runtime_features=None):
         self.args = args
         self.cable_detector = cable_detector
         if particle_filters is None:
@@ -622,6 +841,9 @@ class AsyncTrackingWorker:
         elif isinstance(particle_filters, CableParticleFilter):
             particle_filters = [particle_filters]
         self.particle_filters = list(particle_filters)
+        self.runtime_features = runtime_features
+        self.runtime_feature_revision = 0
+        self.runtime_reset_revision = 0
         self.detector_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cable-detector")
         self.tracking_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cable-tracking")
         self.branch_executor = ThreadPoolExecutor(
@@ -645,7 +867,11 @@ class AsyncTrackingWorker:
             cable_count=max(1, int(args.cable_count)),
             config=PerCableEndpointAssociationConfig(
                 ambiguity_margin_m=float(args.endpoint_association_ambiguity_margin),
-                support_weight=float(args.endpoint_association_support_weight),
+                support_weight=(
+                    float(args.endpoint_association_support_weight)
+                    if bool(args.endpoint_association_support)
+                    else 0.0
+                ),
                 support_clip_m=float(args.endpoint_association_support_clip),
                 endpoint_constraint_tolerance_m=float(args.pf_endpoint_constraint_tolerance),
                 node_count=int(args.cable_segments) + 1,
@@ -749,10 +975,39 @@ class AsyncTrackingWorker:
     def _detect_frame(self, frame):
         args = self.args
         stage_start = time.monotonic()
+        feature_snapshot = frame.feature_snapshot or (
+            self.runtime_features.snapshot()
+            if self.runtime_features is not None
+            else {
+                "revision": int(self.runtime_feature_revision),
+                "reset_revision": int(self.runtime_reset_revision),
+                "features": feature_state_from_args(args),
+            }
+        )
+        feature_state = feature_snapshot["features"]
+        # The detector executor is single-threaded. Configure preprocessing
+        # from the snapshot belonging to this exact frame, without mutating
+        # the shared runtime args while the previous frame is being tracked.
+        self.cable_detector.min_area = (
+            int(args.detector_min_area)
+            if bool(feature_state["cable_component_filter"])
+            else 1
+        )
+        self.cable_detector.open_kernel = (
+            max(1, int(args.detector_open_kernel)) | 1
+            if bool(feature_state["cable_mask_morphology"])
+            else 1
+        )
+        self.cable_detector.close_kernel = (
+            max(1, int(args.detector_close_kernel)) | 1
+            if bool(feature_state["cable_mask_morphology"])
+            else 1
+        )
         observation = self.cable_detector.detect_observation_masks(
             frame.bgr,
             endpoint_channel_count=2,
             scale=args.detector_scale,
+            endpoint_thresholds=args.neural_detector_endpoint_thresholds,
             crossing_threshold=args.crossing_threshold,
             include_endpoint_mask=True,
         )
@@ -774,11 +1029,20 @@ class AsyncTrackingWorker:
             first_label=2,
             reject_overlaps=True,
         )
-        crossing_proposals = extract_crossing_proposals(
-            observation.crossing_mask,
-            observation.crossing_probability,
-            min_area_px=args.crossing_min_area,
-            max_proposals=args.crossing_max_proposals,
+        crossing_mask = (
+            observation.crossing_mask
+            if bool(feature_state["crossing_proposals"])
+            else None
+        )
+        crossing_proposals = (
+            extract_crossing_proposals(
+                crossing_mask,
+                observation.crossing_probability,
+                min_area_px=args.crossing_min_area,
+                max_proposals=args.crossing_max_proposals,
+            )
+            if crossing_mask is not None
+            else tuple()
         )
         return DetectedTrackingFrame(
             frame=frame,
@@ -787,13 +1051,57 @@ class AsyncTrackingWorker:
             detection_label_mask=detection_label_mask,
             endpoint_label_mask=endpoint_label_mask,
             endpoint_channel_masks=list(endpoint_channel_masks),
-            crossing_mask=observation.crossing_mask,
+            crossing_mask=crossing_mask,
             crossing_proposals=crossing_proposals,
             detect_seconds=time.monotonic() - stage_start,
+            feature_snapshot=feature_snapshot,
         )
 
+    def _apply_runtime_features(self, feature_snapshot=None):
+        if self.runtime_features is None:
+            return
+        snapshot = feature_snapshot or self.runtime_features.snapshot()
+        revision = int(snapshot["revision"])
+        if revision == self.runtime_feature_revision:
+            return
+        apply_feature_state_to_args(self.args, snapshot["features"])
+        validate_feature_contract(self.args)
+        self.endpoint_associator.config.support_weight = (
+            float(self.args.endpoint_association_support_weight)
+            if bool(self.args.endpoint_association_support)
+            else 0.0
+        )
+        reset_revision = int(snapshot["reset_revision"])
+        if reset_revision > self.runtime_reset_revision:
+            self.particle_filters = [
+                CableParticleFilter(
+                    node_count=self.args.cable_segments + 1,
+                    config=make_particle_filter_config(self.args, cable_index),
+                    seed=17 + cable_index,
+                )
+                for cable_index in range(self.args.cable_count)
+            ]
+            self.last_filter_nodes_by_cable = [None for _ in range(self.args.cable_count)]
+            self.last_filter_lost_frames_by_cable = [0 for _ in range(self.args.cable_count)]
+            self.last_filter_lost_frames = 0
+            self.last_filter_time = None
+            self.endpoint_associator.last_endpoint_nodes_by_cable = [
+                None for _ in range(self.args.cable_count)
+            ]
+            self.endpoint_associator.endpoint_stale_frames_by_cable = [
+                0 for _ in range(self.args.cable_count)
+            ]
+            self.runtime_reset_revision = reset_revision
+        self.runtime_feature_revision = revision
+        print(f"Applied ablation revision {revision}: {feature_gate_status(self.args)}")
+
     def _process_detected_frame(self, detected):
-        stage_seconds = {"detect": float(detected.detect_seconds), "fit": 0.0, "filter": 0.0}
+        self._apply_runtime_features(detected.feature_snapshot)
+        stage_seconds = {
+            "detect": float(detected.detect_seconds),
+            "fit": 0.0,
+            "filter": 0.0,
+        }
         return self._process_frame_multi(
             detected.frame,
             detected.detection,
@@ -832,9 +1140,10 @@ class AsyncTrackingWorker:
 
         stage_start = time.monotonic()
         shared_support_future = self.branch_executor.submit(
-            self._shared_cable_support,
+            self._shared_cable_and_crossing_support,
             frame,
             detection,
+            crossing_mask,
         )
         endpoint_futures = [
             self.branch_executor.submit(
@@ -842,9 +1151,9 @@ class AsyncTrackingWorker:
                 frame,
                 endpoint_channel_masks[cable_index],
             )
-            for cable_index in range(2)
+            for cable_index in range(cable_count)
         ]
-        shared_support = shared_support_future.result()
+        shared_support, crossing_points = shared_support_future.result()
         endpoint_markers_by_cable = [future.result() for future in endpoint_futures]
         association_result = self.endpoint_associator.associate(
             endpoint_markers_by_cable,
@@ -855,9 +1164,30 @@ class AsyncTrackingWorker:
             offset_to_tips=args.endpoint_marker_offset_to_tips,
         )
         candidate_markers = association_result.markers_by_cable
+        crossing_proposals = estimate_crossing_axes(
+            crossing_proposals,
+            None if detection is None else detection.mask,
+            outer_radius_px=args.crossing_axis_radius,
+            min_axis_separation_deg=args.crossing_min_axis_separation,
+            min_axis_support_px=args.crossing_min_axis_support,
+        )
+        endpoint_nodes_by_cable = [
+            getattr(marker, "endpoint_nodes", None) if marker is not None else None
+            for marker in candidate_markers
+        ]
+        crossing_targets_by_cable = (
+            assign_crossing_targets(
+                crossing_proposals,
+                self.last_filter_nodes_by_cable,
+                endpoint_nodes_by_cable,
+                getattr(args, "camera_intrinsics", None),
+            )
+            if bool(args.crossing_likelihood)
+            else tuple(tuple() for _ in range(cable_count))
+        )
         endpoint_observations = endpoint_group_observations_xy(endpoint_markers_by_cable)
         endpoint_overlap_mask = overlap_mask_from_binary_masks(
-            endpoint_channel_masks,
+            endpoint_channel_masks[:cable_count],
             frame.bgr.shape[:2],
         )
         association_result.diagnostics["endpoint_overlap_px"] = int(
@@ -875,7 +1205,7 @@ class AsyncTrackingWorker:
         ]
         for cable_index, future in enumerate(measurement_futures):
             measurements[cable_index], diagnostics[cable_index] = future.result()
-        stage_seconds["fit"] += time.monotonic() - stage_start
+        stage_seconds["fit"] += max(0.0, time.monotonic() - stage_start)
 
         stage_start = time.monotonic()
         filter_dt = (
@@ -885,11 +1215,18 @@ class AsyncTrackingWorker:
         )
         self.last_filter_time = frame.timestamp_s
 
-        active_filters = self.particle_filters[:cable_count]
+        active_filters = (
+            self.particle_filters[:cable_count]
+            if bool(args.particle_filter)
+            else []
+        )
         filter_results = update_cable_particle_filters(
             active_filters,
             measurements[:len(active_filters)],
             dt=filter_dt,
+            crossing_targets_by_filter=crossing_targets_by_cable[:len(active_filters)],
+            camera_intrinsics=getattr(args, "camera_intrinsics", None),
+            union_coverage_enabled=bool(args.pf_union_coverage),
         )
         if len(filter_results) < cable_count:
             filter_results.extend([None] * (cable_count - len(filter_results)))
@@ -914,15 +1251,6 @@ class AsyncTrackingWorker:
             if filter_result is not None:
                 self.last_filter_lost_frames_by_cable[cable_index] = int(filter_result.lost_frames)
 
-        contact_observations = verify_crossing_proposals(
-            crossing_proposals,
-            [None if estimate is None else estimate.points_xyz for estimate in estimates],
-            getattr(args, "camera_intrinsics", None),
-            args.cable_diameters_m,
-            contact_tolerance_m=args.crossing_contact_tolerance,
-            association_sigma_px=args.crossing_association_sigma,
-        )
-
         stage_seconds["filter"] += time.monotonic() - stage_start
 
         measurement = combine_cable_estimates(measurements, method="multi-cable measurement")
@@ -934,19 +1262,17 @@ class AsyncTrackingWorker:
             cable_count=cable_count,
         )
         tracking_diagnostics.update(association_result.diagnostics)
+        tracking_diagnostics["ablation_revision"] = int(self.runtime_feature_revision)
         tracking_diagnostics["association"] = "fixed_endpoint_channel_identity"
         tracking_diagnostics["crossing_proposal_count"] = len(tuple(crossing_proposals or ()))
-        tracking_diagnostics["crossing_verified_count"] = sum(
-            int(observation.verified_contact) for observation in contact_observations
+        tracking_diagnostics["crossing_point_count"] = int(len(crossing_points))
+        tracking_diagnostics["crossing_axis_count"] = sum(
+            int(np.asarray(proposal.axes_xy).shape == (2, 2))
+            for proposal in tuple(crossing_proposals or ())
         )
-        tracking_diagnostics["crossing_diameter_calibrated"] = bool(
-            np.all(np.asarray(args.cable_diameters_m, dtype=np.float64) > 0.0)
+        tracking_diagnostics["crossing_target_count"] = sum(
+            len(targets) for targets in crossing_targets_by_cable
         )
-        if contact_observations:
-            best_contact = max(contact_observations, key=lambda item: item.confidence)
-            tracking_diagnostics["crossing_gap_m"] = float(best_contact.gap_m)
-            tracking_diagnostics["crossing_confidence"] = float(best_contact.confidence)
-            tracking_diagnostics["crossing_depth_order"] = str(best_contact.depth_order)
 
         self.last_filter_lost_frames = max(self.last_filter_lost_frames_by_cable) if self.last_filter_lost_frames_by_cable else 0
 
@@ -961,8 +1287,9 @@ class AsyncTrackingWorker:
             endpoint_overlap_mask=endpoint_overlap_mask,
             endpoint_observations=endpoint_observations,
             crossing_mask=crossing_mask,
+            crossing_points=np.ascontiguousarray(crossing_points, dtype=np.float32),
             crossing_proposals=tuple(crossing_proposals or ()),
-            contact_observations=contact_observations,
+            crossing_targets_by_cable=tuple(crossing_targets_by_cable),
             measurement=measurement,
             estimate=estimate,
             filter_result=filter_result,
@@ -981,14 +1308,24 @@ class AsyncTrackingWorker:
             endpoint_mask=endpoint_group_mask,
         )
 
-    def _shared_cable_support(self, frame, detection):
-        measurement = self._measurement_from_detection(
-            frame,
-            detection,
+    def _shared_cable_and_crossing_support(self, frame, detection, crossing_mask):
+        if detection is None or detection.mask is None:
+            empty = np.empty((0, 3), dtype=np.float32)
+            return empty, empty.copy()
+        args = self.args
+        return sampled_masked_point_cloud_point_sets(
+            frame.point_cloud,
+            (detection.mask, crossing_mask),
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            confidence_map=frame.confidence_measure,
+            max_confidence=effective_cable_confidence_max(args),
+            max_points_by_mask=(
+                args.pf_measurement_points,
+                args.crossing_max_visual_points,
+            ),
+            oversample=4,
         )
-        if measurement is None:
-            return np.empty((0, 3), dtype=np.float32)
-        return np.ascontiguousarray(measurement.source_points, dtype=np.float32)
 
     def _process_measurement_branch(
         self,
@@ -1017,25 +1354,6 @@ class AsyncTrackingWorker:
         measurement_diagnostics.update(endpoint_diag)
         measurement_diagnostics.update(dict(association_diagnostics or {}))
         return measurement, measurement_diagnostics
-
-    def _measurement_from_detection(
-        self,
-        frame,
-        detection,
-    ):
-        args = self.args
-        if detection is None:
-            return None
-        return cable_measurement_from_mask_points(
-            frame.point_cloud,
-            detection,
-            segment_count=args.cable_segments,
-            depth_min=args.depth_min,
-            depth_max=args.depth_max,
-            confidence_map=frame.confidence_measure,
-            max_confidence=args.cable_confidence_max if args.cable_confidence_max >= 0.0 else None,
-            max_points=args.pf_measurement_points,
-        )
 
 
 def combine_cable_estimates(estimates, method="multi-cable"):
@@ -1188,10 +1506,10 @@ def combine_filter_results(filter_results):
         for diagnostics in (getattr(result, "particle_diagnostics", None),)
         if diagnostics is not None
     )
-    map_average_errors = [
-        float(getattr(diagnostics, "map_to_average_node_error_m", np.nan))
+    map_representative_errors = [
+        float(getattr(diagnostics, "map_to_representative_node_error_m", np.nan))
         for _cable_index, diagnostics in particle_diagnostics
-        if np.isfinite(float(getattr(diagnostics, "map_to_average_node_error_m", np.nan)))
+        if np.isfinite(float(getattr(diagnostics, "map_to_representative_node_error_m", np.nan)))
     ]
     mean_spreads = [
         float(getattr(diagnostics, "mean_node_spread_m", np.nan))
@@ -1226,7 +1544,36 @@ def combine_filter_results(filter_results):
     stage_seconds = {}
     for result in valid_results:
         for key, value in dict(getattr(result, "stage_seconds", {}) or {}).items():
-            stage_seconds[key] = stage_seconds.get(key, 0.0) + float(value)
+            if key in ("measurement", "crossing", "union"):
+                stage_seconds[key] = max(stage_seconds.get(key, 0.0), float(value))
+            else:
+                stage_seconds[key] = stage_seconds.get(key, 0.0) + float(value)
+    support_points = np.asarray(
+        getattr(valid_results[0], "support_points_xyz", np.empty((0, 3))),
+        dtype=np.float32,
+    )
+    affinity_rows = []
+    affinities_valid = support_points.ndim == 2 and support_points.shape[1] >= 3
+    if affinities_valid:
+        affinities_by_index = {
+            int(cable_index): np.asarray(
+                getattr(result, "support_point_affinities", np.empty(0)),
+                dtype=np.float32,
+            ).reshape(-1)
+            for cable_index, result in indexed_results
+        }
+        row_count = max(affinities_by_index, default=-1) + 1
+        for cable_index in range(row_count):
+            row = affinities_by_index.get(cable_index)
+            if row is None or len(row) != len(support_points):
+                affinities_valid = False
+                break
+            affinity_rows.append(row)
+    support_affinities = (
+        np.ascontiguousarray(np.stack(affinity_rows, axis=0), dtype=np.float32)
+        if affinities_valid and affinity_rows
+        else np.empty((0, 0), dtype=np.float32)
+    )
     return SimpleNamespace(
         visible_nodes=visible_nodes,
         extended_visible_nodes=extended_nodes,
@@ -1236,16 +1583,18 @@ def combine_filter_results(filter_results):
         lost_frames=max(int(getattr(result, "lost_frames", 0)) for result in valid_results),
         measurement_point_count=max(int(getattr(result, "measurement_point_count", 0)) for result in valid_results),
         segment_length_m=finite_result_mean(valid_results, "segment_length_m"),
+        local_proposal_ratio=finite_result_mean(updated_results, "local_proposal_ratio"),
         endpoint_conditioned_proposal_ratio=finite_result_mean(
             updated_results,
             "endpoint_conditioned_proposal_ratio",
         ),
         global_random_particle_ratio=finite_result_mean(updated_results, "global_random_particle_ratio"),
-        mean_ownership_responsibility=finite_result_mean(updated_results, "mean_ownership_responsibility"),
-        ownership_entropy=finite_result_mean(updated_results, "ownership_entropy"),
-        ownership_effective_point_count=sum(
-            float(getattr(result, "ownership_effective_point_count", 0.0))
-            for result in updated_results
+        effective_sample_size=finite_result_mean(updated_results, "effective_sample_size"),
+        path_support_rms_m=finite_result_mean(updated_results, "path_support_rms_m"),
+        mean_support_affinity=finite_result_mean(updated_results, "mean_support_affinity"),
+        supported_sample_fraction=finite_result_mean(
+            updated_results,
+            "supported_sample_fraction",
         ),
         estimate_particle_count=int(round(np.mean([
             int(getattr(result, "estimate_particle_count", 1))
@@ -1255,12 +1604,21 @@ def combine_filter_results(filter_results):
             float(np.mean(estimate_weight_values))
             if estimate_weight_values else np.nan
         ),
-        map_to_average_node_error_m=float(np.mean(map_average_errors)) if map_average_errors else np.nan,
+        map_to_representative_node_error_m=(
+            float(np.mean(map_representative_errors)) if map_representative_errors else np.nan
+        ),
         mean_node_spread_m=float(np.mean(mean_spreads)) if mean_spreads else np.nan,
         max_node_spread_m=float(np.max(max_spreads)) if max_spreads else np.nan,
         endpoint_direction_delta_deg=endpoint_direction_mean,
         particle_diagnostics=particle_diagnostics,
+        support_points_xyz=np.ascontiguousarray(support_points[:, :3], dtype=np.float32),
+        support_point_affinities=support_affinities,
         mean_node_speed_mps=finite_result_mean(valid_results, "mean_node_speed_mps"),
+        endpoint_speed_mps=finite_result_mean(valid_results, "endpoint_speed_mps"),
+        endpoint_motion_innovation_m=finite_result_mean(
+            valid_results,
+            "endpoint_motion_innovation_m",
+        ),
         stage_seconds=stage_seconds,
     )
 
@@ -1295,6 +1653,7 @@ def combine_tracking_diagnostics(diagnostics, candidate_count=0, cable_count=1):
         "cable_count": int(cable_count),
         "candidate_count": int(candidate_count),
         "active_cables": int(sum(bool(item.get("measurement_used", False)) for item in valid)),
+        "per_cable": valid[:max(0, int(cable_count))],
     }
     if int(cable_count) > 1 and valid:
         endpoint_counts = [int(item.get("endpoint_marker_count", 0) or 0) for item in valid[: int(cable_count)]]
@@ -1323,24 +1682,41 @@ def combine_tracking_diagnostics(diagnostics, candidate_count=0, cable_count=1):
             )
     for key in (
         "support_to_prior_m",
+        "measurement_to_filter_m",
+        "path_support_rms_m",
+        "estimate_temporal_delta_m",
+        "raw_residual_m",
+        "filtered_residual_m",
+        "local_ratio",
         "conditioned_ratio",
         "global_random_ratio",
-        "ownership_responsibility",
-        "ownership_entropy",
+        "motion_noise_scale",
+        "endpoint_speed_mps",
+        "endpoint_motion_innovation_m",
+        "effective_sample_size",
+        "support_affinity",
+        "supported_sample_fraction",
         "tangent_confidence",
         "estimate_weight_mass",
-        "map_to_average_node_error_m",
+        "map_to_representative_node_error_m",
         "mean_node_spread_m",
         "estimate_start_direction_delta_deg",
         "estimate_end_direction_delta_deg",
         "mean_node_speed_mps",
+        "crossing_reward",
+        "crossing_distance_px",
+        "crossing_angle_error_deg",
+        "union_coverage_rms_m",
+        "union_coverage_fraction",
+        "union_coverage_rms_gain_m",
+        "union_coverage_fraction_gain",
     ):
         values = [float(item.get(key, np.nan)) for item in valid]
         finite = [value for value in values if np.isfinite(value)]
         if finite:
             combined[key] = float(np.mean(finite))
-    combined["ownership_effective_points"] = float(sum(
-        max(0.0, float(item.get("ownership_effective_points", 0.0) or 0.0))
+    combined["assigned_support_points"] = float(sum(
+        max(0.0, float(item.get("assigned_support_points", 0.0) or 0.0))
         for item in valid
     ))
     combined["tangent_support_count"] = int(sum(
@@ -1354,6 +1730,12 @@ def combine_tracking_diagnostics(diagnostics, candidate_count=0, cable_count=1):
     ]
     if estimate_counts:
         combined["estimate_particle_count"] = int(round(np.mean(estimate_counts)))
+    union_ranks = [
+        int(item.get("union_coverage_rank", 0) or 0)
+        for item in valid[:max(0, int(cable_count))]
+    ]
+    if union_ranks and all(rank > 0 for rank in union_ranks):
+        combined["union_coverage_rank_text"] = ",".join(str(rank) for rank in union_ranks)
     max_spreads = [
         float(item.get("max_node_spread_m", np.nan))
         for item in valid
@@ -1404,11 +1786,71 @@ def format_runtime_status(
         f"cloud={main_stage_ms['cloud']:.1f} submit={main_stage_ms['copy']:.1f} | "
         f"ui {main_stage_ms['ui']:.1f}ms/update | "
         f"worker {worker_ms:.1f}ms det={worker_stage_ms['detect']:.1f} "
-        f"fit={worker_stage_ms['fit']:.1f} pf={worker_stage_ms['filter']:.1f} | "
+        f"fit={worker_stage_ms['fit']:.1f} "
+        f"pf={worker_stage_ms['filter']:.1f} | "
         f"async sub/ok/drop={async_worker.submitted}/{async_worker.completed}/{async_worker.dropped} "
         f"busy={1 if async_worker.busy_flag() else 0} | cloud {cloud_text} pts | "
         f"{latest_cable_status}"
     )
+
+
+def make_runtime_feature_controller(args):
+    initial = feature_state_from_args(args)
+
+    def validate_runtime_state(state):
+        candidate = SimpleNamespace(**vars(args))
+        apply_feature_state_to_args(candidate, state)
+        validate_feature_contract(candidate)
+
+    return RuntimeFeatureController(initial, validator=validate_runtime_state)
+
+
+def experiment_metadata(args, runtime_features):
+    source_files = (
+        "main.py",
+        "cable_particle_filter.py",
+        "cable_crossing.py",
+        "cable_cuda.py",
+        "cable_cuda_kernels.cu",
+        "cable_detection.py",
+        "cable_pidnet.py",
+        "pf_ablation.py",
+        "zed_spatial.py",
+        "zed_split_viewer.py",
+    )
+    return {
+        "schema_version": 2,
+        "objective": "independent endpoint-constrained cable particle-filter ablation",
+        "config_path": str(Path(args.config).resolve()),
+        "config_sha256": file_sha256(args.config),
+        "checkpoint_path": str(Path(args.neural_detector_checkpoint).resolve()),
+        "checkpoint_sha256": file_sha256(args.neural_detector_checkpoint),
+        "source_sha256": {
+            name: file_sha256(PROJECT_DIR / name)
+            for name in source_files
+        },
+        "camera_source": (
+            str(Path(args.input_svo_file).resolve())
+            if args.input_svo_file
+            else (str(args.ip_address) if args.ip_address else "local_zed")
+        ),
+        "scoring_backend": str(args.pf_scoring_backend),
+        "particle_count": int(args.pf_particles),
+        "node_count": int(args.cable_segments) + 1,
+        "cable_lengths_m": list(args.cable_lengths_m),
+        "crossing_likelihood": {
+            "position_sigma_px": float(args.crossing_position_sigma),
+            "angle_sigma_deg": float(args.crossing_angle_sigma),
+            "log_reward": float(args.crossing_log_reward),
+        },
+        "proposal_ratios": {
+            "local": float(args.pf_local_proposal_ratio),
+            "endpoint": float(args.pf_conditioned_proposal_ratio),
+            "global_random": float(args.pf_global_random_ratio),
+        },
+        "seeds": [17 + index for index in range(int(args.cable_count))],
+        "initial_features": runtime_features.snapshot()["features"],
+    }
 
 
 class TrackingGpuBuffer:
@@ -1420,11 +1862,12 @@ class TrackingGpuBuffer:
 
 
 class LiveCaptureWorker:
-    def __init__(self, args, zed, runtime, async_worker):
+    def __init__(self, args, zed, runtime, async_worker, runtime_features=None):
         self.args = args
         self.zed = zed
         self.runtime = runtime
         self.async_worker = async_worker
+        self.runtime_features = runtime_features
         self.image = sl.Mat()
         self.visual_point_cloud = sl.Mat()
         self.tracking_buffers = [TrackingGpuBuffer() for _ in range(3)]
@@ -1491,6 +1934,16 @@ class LiveCaptureWorker:
                     latest_result = completed_result
 
                 frame_index = self.frame_count
+                feature_snapshot = (
+                    self.runtime_features.snapshot()
+                    if self.runtime_features is not None
+                    else {
+                        "revision": 0,
+                        "reset_revision": 0,
+                        "features": feature_state_from_args(self.args),
+                    }
+                )
+                feature_state = feature_snapshot["features"]
                 want_submit = should_submit_async_frame(self.args, frame_index, latest_result)
                 can_submit = self.async_worker.can_submit()
                 tracking_buffer = next(
@@ -1515,7 +1968,7 @@ class LiveCaptureWorker:
                     )
                     if error != sl.ERROR_CODE.SUCCESS:
                         raise RuntimeError(f"ZED GPU point-cloud retrieval failed: {error}")
-                    if self.args.confidence_update_every > 0 and (
+                    if bool(feature_state["depth_confidence_filter"]) and self.args.confidence_update_every > 0 and (
                         tracking_buffer.last_confidence_frame < 0
                         or frame_index - tracking_buffer.last_confidence_frame
                         >= self.args.confidence_update_every
@@ -1549,6 +2002,7 @@ class LiveCaptureWorker:
                 if submit_frame:
                     confidence_enabled = bool(
                         self.args.confidence_update_every > 0
+                        and bool(feature_state["depth_confidence_filter"])
                         and self.args.cable_confidence_max >= 0.0
                         and tracking_buffer.last_confidence_frame >= 0
                     )
@@ -1579,6 +2033,7 @@ class LiveCaptureWorker:
                             point_cloud=point_cloud_view,
                             confidence_measure=None,
                             release_callback=lambda buffer=tracking_buffer: setattr(buffer, "in_use", False),
+                            feature_snapshot=feature_snapshot,
                         )
                     )
                     if not submitted:
@@ -1616,6 +2071,12 @@ def show_viewer_startup_status(viewer, status):
 
 
 def run_live_parallel(args):
+    runtime_features = make_runtime_feature_controller(args)
+    control_panel = None
+    recorder = ExperimentRecorder(
+        args.experiment_output_directory,
+        experiment_metadata(args, runtime_features),
+    )
     viewer = ZedDepthGLViewer(
         args.rgb_width + args.cloud_width,
         args.height,
@@ -1638,27 +2099,45 @@ def run_live_parallel(args):
     try:
         cable_detector = load_cable_detector(args)
         show_viewer_startup_status(viewer, "PIDNet ready | creating particle filters...")
-        particle_filters = (
-            [
-                CableParticleFilter(
-                    node_count=args.cable_segments + 1,
-                    config=make_particle_filter_config(args, cable_index),
-                    seed=17 + cable_index,
-                )
-                for cable_index in range(args.cable_count)
-            ]
-            if args.particle_filter
-            else []
-        )
+        particle_filters = [
+            CableParticleFilter(
+                node_count=args.cable_segments + 1,
+                config=make_particle_filter_config(args, cable_index),
+                seed=17 + cable_index,
+            )
+            for cable_index in range(args.cable_count)
+        ]
         show_viewer_startup_status(viewer, "PIDNet ready | opening ZED camera...")
         zed = open_zed(args)
         args.camera_intrinsics = camera_intrinsics_from_zed(zed)
+        recorder.metadata["camera_intrinsics"] = {
+            "fx": float(args.camera_intrinsics.fx),
+            "fy": float(args.camera_intrinsics.fy),
+            "cx": float(args.camera_intrinsics.cx),
+            "cy": float(args.camera_intrinsics.cy),
+            "y_axis_up": bool(args.camera_intrinsics.y_axis_up),
+            "z_axis_forward": bool(args.camera_intrinsics.z_axis_forward),
+        }
         runtime = make_runtime_parameters(args)
         configure_viewer_from_zed(zed, viewer)
         show_viewer_startup_status(viewer, "ZED ready | starting tracking workers...")
-        async_worker = AsyncTrackingWorker(args, cable_detector, particle_filters)
-        capture = LiveCaptureWorker(args, zed, runtime, async_worker)
+        async_worker = AsyncTrackingWorker(
+            args,
+            cable_detector,
+            particle_filters,
+            runtime_features=runtime_features,
+        )
+        capture = LiveCaptureWorker(
+            args,
+            zed,
+            runtime,
+            async_worker,
+            runtime_features=runtime_features,
+        )
         capture.start()
+        if bool(args.ablation_control_ui):
+            control_panel = AblationControlPanel(runtime_features)
+            control_panel.start()
     except Exception as exc:
         message = f"STARTUP FAILED: {type(exc).__name__}: {exc}"
         print(message)
@@ -1677,6 +2156,7 @@ def run_live_parallel(args):
         "Parallel pipeline enabled: ZED capture/submission, tracking, and OpenGL UI run independently. "
         "Stats report GUI, CAPTURE, and TRACK FPS separately."
     )
+    print(feature_gate_status(args))
 
     latest_detection = None
     latest_endpoint_mask = None
@@ -1685,8 +2165,9 @@ def run_live_parallel(args):
     latest_endpoint_overlap_mask = None
     latest_endpoint_observations = None
     latest_crossing_mask = None
+    latest_crossing_points = np.empty((0, 3), dtype=np.float32)
     latest_crossing_proposals = tuple()
-    latest_contact_observations = tuple()
+    latest_crossing_targets_by_cable = tuple()
     last_visual_measurement = None
     last_visual_estimate = None
     last_visual_filter_result = None
@@ -1713,13 +2194,24 @@ def run_live_parallel(args):
                 latest_endpoint_overlap_mask = result.endpoint_overlap_mask
                 latest_endpoint_observations = result.endpoint_observations
                 latest_crossing_mask = result.crossing_mask
+                latest_crossing_points = result.crossing_points
                 latest_crossing_proposals = result.crossing_proposals
-                latest_contact_observations = result.contact_observations
+                latest_crossing_targets_by_cable = result.crossing_targets_by_cable
                 latest_tracking_diagnostics = result.tracking_diagnostics
                 last_visual_measurement = result.measurement
                 last_visual_estimate = result.estimate
                 last_visual_filter_result = result.filter_result
                 last_processed_completed = snapshot.completed
+                feature_revision = int(latest_tracking_diagnostics.get("ablation_revision", 0) or 0)
+                feature_snapshot = runtime_features.snapshot_for_revision(feature_revision)
+                if runtime_features.snapshot()["recording"]:
+                    recorder.record(
+                        result.frame_index,
+                        feature_snapshot,
+                        latest_tracking_diagnostics,
+                        timing=result.worker_stage_seconds,
+                        frame_timestamp_s=result.frame_timestamp_s,
+                    )
 
             if (
                 snapshot.bgr is not None
@@ -1743,7 +2235,7 @@ def run_live_parallel(args):
                     endpoint_observations=latest_endpoint_observations,
                     crossing_mask=latest_crossing_mask,
                     crossing_proposals=latest_crossing_proposals,
-                    contact_observations=latest_contact_observations,
+                    crossing_targets_by_cable=latest_crossing_targets_by_cable,
                 )
                 update_viewer_cable(
                     viewer,
@@ -1751,7 +2243,10 @@ def run_live_parallel(args):
                     last_visual_estimate,
                     last_visual_filter_result,
                     args.cable_max_points,
-                    contact_observations=latest_contact_observations,
+                    crossing_points=latest_crossing_points,
+                    crossing_proposal_count=len(latest_crossing_proposals),
+                    point_support_coloring=bool(args.point_support_coloring),
+                    particle_diagnostics_overlay=bool(args.particle_diagnostics_overlay),
                 )
                 latest_cable_status = cable_status(
                     latest_detection,
@@ -1829,12 +2324,31 @@ def run_live_parallel(args):
                         latest_cable_status,
                     )
                 )
+                panel_metrics = {
+                    "tracking_fps": round((snapshot.completed - previous.completed) / elapsed, 2),
+                    "filter_ms": round(worker_stage_ms["filter"], 3),
+                }
+                for key in (
+                    "effective_sample_size",
+                    "path_support_rms_m",
+                    "mean_node_spread_m",
+                    "crossing_reward",
+                    "crossing_distance_px",
+                    "crossing_angle_error_deg",
+                ):
+                    value = latest_tracking_diagnostics.get(key)
+                    if value is not None and np.isscalar(value):
+                        panel_metrics[key] = float(value)
+                runtime_features.publish_metrics(panel_metrics)
                 previous = snapshot
                 previous_visual_updates = visual_update_count
                 previous_ui_seconds = ui_seconds
                 last_stats_time = now
             viewer.poll()
     finally:
+        recorder.close()
+        if control_panel is not None:
+            control_panel.close()
         capture.stop()
         async_worker.close()
         viewer.close()
@@ -1863,13 +2377,19 @@ def cable_tracking_diagnostics(previous_filter_nodes, measurement, estimate, fil
         else np.nan
     )
     diagnostics["measurement_to_filter_m"] = mean_node_error(previous_nodes, measured_nodes)
-    diagnostics["estimate_to_raw_m"] = (
-        polyline_residual(support_points, estimate_nodes)
-        if len(support_points) and estimate_nodes is not None
+    diagnostics["estimate_temporal_delta_m"] = mean_node_error(previous_nodes, estimate_nodes)
+    diagnostics["path_support_rms_m"] = (
+        float(getattr(filter_result, "path_support_rms_m", np.nan))
+        if filter_result is not None and measurement_used
         else np.nan
     )
     diagnostics["raw_residual_m"] = float(getattr(measurement, "residual_m", np.nan)) if measurement is not None else np.nan
     diagnostics["filtered_residual_m"] = float(getattr(estimate, "residual_m", np.nan)) if estimate is not None else np.nan
+    diagnostics["local_ratio"] = (
+        float(getattr(filter_result, "local_proposal_ratio", np.nan))
+        if filter_result is not None and measurement_used
+        else np.nan
+    )
     diagnostics["conditioned_ratio"] = (
         float(getattr(filter_result, "endpoint_conditioned_proposal_ratio", np.nan))
         if filter_result is not None and measurement_used
@@ -1880,18 +2400,30 @@ def cable_tracking_diagnostics(previous_filter_nodes, measurement, estimate, fil
         if filter_result is not None and measurement_used
         else np.nan
     )
-    diagnostics["ownership_responsibility"] = (
-        float(getattr(filter_result, "mean_ownership_responsibility", np.nan))
+    diagnostics["motion_noise_scale"] = (
+        float(getattr(filter_result, "motion_noise_scale", np.nan))
+        if filter_result is not None else np.nan
+    )
+    diagnostics["endpoint_speed_mps"] = (
+        float(getattr(filter_result, "endpoint_speed_mps", np.nan))
+        if filter_result is not None else np.nan
+    )
+    diagnostics["endpoint_motion_innovation_m"] = (
+        float(getattr(filter_result, "endpoint_motion_innovation_m", np.nan))
+        if filter_result is not None else np.nan
+    )
+    diagnostics["effective_sample_size"] = (
+        float(getattr(filter_result, "effective_sample_size", np.nan))
         if filter_result is not None and measurement_used
         else np.nan
     )
-    diagnostics["ownership_entropy"] = (
-        float(getattr(filter_result, "ownership_entropy", np.nan))
+    diagnostics["support_affinity"] = (
+        float(getattr(filter_result, "mean_support_affinity", np.nan))
         if filter_result is not None and measurement_used
         else np.nan
     )
-    diagnostics["ownership_effective_points"] = (
-        float(getattr(filter_result, "ownership_effective_point_count", np.nan))
+    diagnostics["supported_sample_fraction"] = (
+        float(getattr(filter_result, "supported_sample_fraction", np.nan))
         if filter_result is not None and measurement_used
         else np.nan
     )
@@ -1924,8 +2456,8 @@ def cable_tracking_diagnostics(previous_filter_nodes, measurement, estimate, fil
         if filter_result is not None
         else None
     )
-    diagnostics["map_to_average_node_error_m"] = (
-        float(getattr(particle_diagnostics, "map_to_average_node_error_m", np.nan))
+    diagnostics["map_to_representative_node_error_m"] = (
+        float(getattr(particle_diagnostics, "map_to_representative_node_error_m", np.nan))
         if particle_diagnostics is not None
         else np.nan
     )
@@ -1954,6 +2486,56 @@ def cable_tracking_diagnostics(previous_filter_nodes, measurement, estimate, fil
         if filter_result is not None
         else np.nan
     )
+    diagnostics["crossing_target_count"] = (
+        int(getattr(filter_result, "crossing_target_count", 0))
+        if filter_result is not None
+        else 0
+    )
+    diagnostics["crossing_reward"] = (
+        float(getattr(filter_result, "crossing_reward", np.nan))
+        if filter_result is not None
+        else np.nan
+    )
+    diagnostics["crossing_distance_px"] = (
+        float(getattr(filter_result, "crossing_distance_px", np.nan))
+        if filter_result is not None
+        else np.nan
+    )
+    diagnostics["crossing_angle_error_deg"] = (
+        float(getattr(filter_result, "crossing_angle_error_deg", np.nan))
+        if filter_result is not None
+        else np.nan
+    )
+    diagnostics["crossing_closest_xy"] = np.asarray(
+        getattr(filter_result, "crossing_closest_xy", (np.nan, np.nan)),
+        dtype=np.float32,
+    ).reshape(-1)[:2]
+    diagnostics["crossing_target_xy"] = np.asarray(
+        getattr(filter_result, "crossing_target_xy", (np.nan, np.nan)),
+        dtype=np.float32,
+    ).reshape(-1)[:2]
+    diagnostics["crossing_axis_xy"] = np.asarray(
+        getattr(filter_result, "crossing_axis_xy", (np.nan, np.nan)),
+        dtype=np.float32,
+    ).reshape(-1)[:2]
+    diagnostics["union_coverage_selected"] = bool(
+        getattr(filter_result, "union_coverage_selected", False)
+    ) if filter_result is not None else False
+    diagnostics["union_coverage_rank"] = int(
+        getattr(filter_result, "union_coverage_rank", 0)
+    ) if filter_result is not None else 0
+    diagnostics["union_coverage_rms_m"] = float(
+        getattr(filter_result, "union_coverage_rms_m", np.nan)
+    ) if filter_result is not None else np.nan
+    diagnostics["union_coverage_fraction"] = float(
+        getattr(filter_result, "union_coverage_fraction", np.nan)
+    ) if filter_result is not None else np.nan
+    diagnostics["union_coverage_rms_gain_m"] = float(
+        getattr(filter_result, "union_coverage_rms_gain_m", np.nan)
+    ) if filter_result is not None else np.nan
+    diagnostics["union_coverage_fraction_gain"] = float(
+        getattr(filter_result, "union_coverage_fraction_gain", np.nan)
+    ) if filter_result is not None else np.nan
     stage_seconds = getattr(filter_result, "stage_seconds", None) if filter_result is not None else None
     if isinstance(stage_seconds, dict):
         diagnostics["pf_stage_ms"] = {
@@ -1998,15 +2580,19 @@ def update_viewer_cable(
     estimate,
     filter_result,
     max_points,
-    contact_observations=(),
+    crossing_points=(),
+    crossing_proposal_count=0,
+    point_support_coloring=True,
+    particle_diagnostics_overlay=True,
 ):
     if estimate is None:
         viewer.update_cable(
             np.empty((0, 3), dtype=np.float32),
             np.empty((0, 3), dtype=np.float32),
             np.empty(0, dtype=bool),
+            crossing_points=crossing_points,
+            crossing_proposal_count=crossing_proposal_count,
             cable_runs=(),
-            contact_observations=contact_observations,
             particle_diagnostics=(),
         )
         return
@@ -2028,19 +2614,42 @@ def update_viewer_cable(
         extended_visible_nodes &= valid_nodes
     else:
         extended_visible_nodes = visible_nodes.copy()
-    source_points = np.empty((0, 3), dtype=np.float32)
-    if measurement is not None:
+    source_points = np.asarray(
+        getattr(filter_result, "support_points_xyz", np.empty((0, 3))),
+        dtype=np.float32,
+    )
+    if len(source_points) == 0 and measurement is not None:
         source_points = np.asarray(measurement.source_points, dtype=np.float32)
+    support_affinities = np.asarray(
+        getattr(filter_result, "support_point_affinities", np.empty((0, 0))),
+        dtype=np.float32,
+    )
+    if bool(point_support_coloring):
+        sampled_points, sampled_affinities = sample_points_with_rows(
+            source_points,
+            support_affinities,
+            max_points,
+        )
+        cable_point_colors = cable_support_colors(sampled_affinities)
+    else:
+        sampled_points = sample_points(source_points, max_points)
+        cable_point_colors = None
 
     viewer.update_cable(
-        sample_points(source_points, max_points),
+        sampled_points,
         nodes,
         valid_nodes,
+        cable_point_colors=cable_point_colors,
+        crossing_points=crossing_points,
+        crossing_proposal_count=crossing_proposal_count,
         visible_nodes=visible_nodes,
         extended_visible_nodes=extended_visible_nodes,
         cable_runs=getattr(estimate, "pf_node_runs", None),
-        contact_observations=contact_observations,
-        particle_diagnostics=getattr(filter_result, "particle_diagnostics", ()),
+        particle_diagnostics=(
+            getattr(filter_result, "particle_diagnostics", ())
+            if bool(particle_diagnostics_overlay)
+            else ()
+        ),
     )
 
 
@@ -2133,40 +2742,69 @@ def format_tracking_diagnostics(diagnostics):
     if np.isfinite(support_to_prior):
         parts.append(f"support2prior={format_mm(support_to_prior)}")
     crossing_count = int(diagnostics.get("crossing_proposal_count", 0) or 0)
-    verified_count = int(diagnostics.get("crossing_verified_count", 0) or 0)
     if crossing_count > 0:
-        crossing_text = f"cross={crossing_count} contact={verified_count}"
-        gap = float(diagnostics.get("crossing_gap_m", np.nan))
-        confidence = float(diagnostics.get("crossing_confidence", np.nan))
-        calibrated = bool(diagnostics.get("crossing_diameter_calibrated", False))
-        if np.isfinite(gap):
-            crossing_text += f" {'gap' if calibrated else 'center'}={format_mm(gap)}"
-        if np.isfinite(confidence):
-            crossing_text += f" conf={confidence:.2f}"
-        if not calibrated:
-            crossing_text += " diameter=UNSET"
-        depth_order = str(diagnostics.get("crossing_depth_order", "") or "")
-        if depth_order:
-            crossing_text += f" {depth_order.replace(' ', '_')}"
+        axis_count = int(diagnostics.get("crossing_axis_count", 0) or 0)
+        target_count = int(diagnostics.get("crossing_target_count", 0) or 0)
+        crossing_text = f"cross={crossing_count} axes={axis_count} targets={target_count}"
+        crossing_point_count = int(diagnostics.get("crossing_point_count", 0) or 0)
+        crossing_text += f" blue3d={crossing_point_count}"
+        reward = float(diagnostics.get("crossing_reward", np.nan))
+        distance = float(diagnostics.get("crossing_distance_px", np.nan))
+        angle = float(diagnostics.get("crossing_angle_error_deg", np.nan))
+        if np.isfinite(reward):
+            crossing_text += f" R={reward:.2f}"
+        if np.isfinite(distance):
+            crossing_text += f" d={distance:.1f}px"
+        if np.isfinite(angle):
+            crossing_text += f" a={angle:.1f}deg"
         parts.append(crossing_text)
+    union_rank_text = str(diagnostics.get("union_coverage_rank_text", "") or "")
+    union_rms = float(diagnostics.get("union_coverage_rms_m", np.nan))
+    union_fraction = float(diagnostics.get("union_coverage_fraction", np.nan))
+    union_rms_gain = float(diagnostics.get("union_coverage_rms_gain_m", np.nan))
+    union_fraction_gain = float(diagnostics.get("union_coverage_fraction_gain", np.nan))
+    if union_rank_text:
+        union_text = f"union-rank={union_rank_text}"
+        if np.isfinite(union_rms):
+            union_text += f" rms={format_mm(union_rms)}"
+        if np.isfinite(union_fraction):
+            union_text += f" cov={union_fraction:.2f}"
+        if np.isfinite(union_rms_gain):
+            union_text += f" gain={1000.0 * union_rms_gain:+.1f}mm"
+        if np.isfinite(union_fraction_gain):
+            union_text += f"/{union_fraction_gain:+.2f}cov"
+        parts.append(union_text)
+    local_ratio = diagnostics.get("local_ratio", np.nan)
+    if np.isfinite(local_ratio):
+        parts.append(f"local={local_ratio:.2f}")
     conditioned_ratio = diagnostics.get("conditioned_ratio", np.nan)
     if np.isfinite(conditioned_ratio):
         parts.append(f"conditioned={conditioned_ratio:.2f}")
     random_ratio = diagnostics.get("global_random_ratio", np.nan)
     if np.isfinite(random_ratio):
         parts.append(f"rand={random_ratio:.2f}")
+    motion_scale = float(diagnostics.get("motion_noise_scale", np.nan))
+    endpoint_speed = float(diagnostics.get("endpoint_speed_mps", np.nan))
+    motion_innovation = float(diagnostics.get("endpoint_motion_innovation_m", np.nan))
+    if np.isfinite(motion_scale):
+        motion_text = f"motion={motion_scale:.2f}x"
+        if np.isfinite(endpoint_speed):
+            motion_text += f"/{endpoint_speed:.2f}mps"
+        if np.isfinite(motion_innovation):
+            motion_text += f"/{format_mm(motion_innovation)}innov"
+        parts.append(motion_text)
     estimate_count = int(diagnostics.get("estimate_particle_count", 0) or 0)
     estimate_mass = float(diagnostics.get("estimate_weight_mass", np.nan))
     if estimate_count > 0:
-        estimate_text = f"topavg={estimate_count}"
+        estimate_text = f"medoid-set={estimate_count}"
         if np.isfinite(estimate_mass):
             estimate_text += f" mass={estimate_mass:.2f}"
         parts.append(estimate_text)
-    map_average_error = float(diagnostics.get("map_to_average_node_error_m", np.nan))
+    map_representative_error = float(diagnostics.get("map_to_representative_node_error_m", np.nan))
     mean_spread = float(diagnostics.get("mean_node_spread_m", np.nan))
     max_spread = float(diagnostics.get("max_node_spread_m", np.nan))
-    if np.isfinite(map_average_error):
-        parts.append(f"MAP-AVG={format_mm(map_average_error)}")
+    if np.isfinite(map_representative_error):
+        parts.append(f"MAP-MED={format_mm(map_representative_error)}")
     if np.isfinite(mean_spread):
         spread_text = f"spread={format_mm(mean_spread)}"
         if np.isfinite(max_spread):
@@ -2177,17 +2815,24 @@ def format_tracking_diagnostics(diagnostics):
     if np.isfinite(start_direction_delta) or np.isfinite(end_direction_delta):
         start_text = f"{start_direction_delta:.1f}" if np.isfinite(start_direction_delta) else "nan"
         end_text = f"{end_direction_delta:.1f}" if np.isfinite(end_direction_delta) else "nan"
-        parts.append(f"MAP-AVG-dir={start_text}/{end_text}deg")
-    ownership = float(diagnostics.get("ownership_responsibility", np.nan))
-    ownership_entropy = float(diagnostics.get("ownership_entropy", np.nan))
-    ownership_points = float(diagnostics.get("ownership_effective_points", np.nan))
-    if np.isfinite(ownership):
-        text = f"own={ownership:.2f}"
-        if np.isfinite(ownership_entropy):
-            text += f" H={ownership_entropy:.2f}"
-        if np.isfinite(ownership_points):
-            text += f" Neff={ownership_points:.0f}"
+        parts.append(f"MAP-MED-dir={start_text}/{end_text}deg")
+    support_affinity = float(diagnostics.get("support_affinity", np.nan))
+    supported_fraction = float(diagnostics.get("supported_sample_fraction", np.nan))
+    path_support_rms = float(diagnostics.get("path_support_rms_m", np.nan))
+    if np.isfinite(support_affinity) or np.isfinite(supported_fraction) or np.isfinite(path_support_rms):
+        text = (
+            f"support={support_affinity:.2f}"
+            if np.isfinite(support_affinity)
+            else "support=off"
+        )
+        if np.isfinite(supported_fraction):
+            text += f" coverage={supported_fraction:.2f}"
+        if np.isfinite(path_support_rms):
+            text += f" rms={format_mm(path_support_rms)}"
         parts.append(text)
+    effective_sample_size = float(diagnostics.get("effective_sample_size", np.nan))
+    if np.isfinite(effective_sample_size):
+        parts.append(f"ESS={effective_sample_size:.0f}")
     tangent_confidence = float(diagnostics.get("tangent_confidence", np.nan))
     tangent_support = int(diagnostics.get("tangent_support_count", 0) or 0)
     if np.isfinite(tangent_confidence):
@@ -2209,7 +2854,9 @@ def format_pf_stage_ms(stage_ms):
         ("tangent", "tan"),
         ("initialize", "init"),
         ("predict", "pred"),
-        ("consensus", "cons"),
+        ("measurement", "meas"),
+        ("crossing", "cross"),
+        ("union", "union"),
         ("estimate", "est"),
     )
     parts = []
@@ -2237,7 +2884,7 @@ def draw_cable_rgb_panel(
     endpoint_observations=None,
     crossing_mask=None,
     crossing_proposals=None,
-    contact_observations=None,
+    crossing_targets_by_cable=None,
 ):
     if mode == "mask":
         panel = draw_cable_mask_view(
@@ -2283,7 +2930,8 @@ def draw_cable_rgb_panel(
         panel,
         crossing_mask,
         crossing_proposals,
-        contact_observations,
+        crossing_targets_by_cable,
+        tracking_diagnostics,
     )
     draw_endpoint_association_status(panel, tracking_diagnostics)
     return panel
@@ -2513,8 +3161,14 @@ def draw_raw_endpoint_observations(panel, endpoint_observations):
         )
 
 
-def draw_crossing_observations(panel, crossing_mask, crossing_proposals, contact_observations):
-    """Draw NN proposals and their PF/3D verification without conflating them."""
+def draw_crossing_observations(
+    panel,
+    crossing_mask,
+    crossing_proposals,
+    crossing_targets_by_cable,
+    tracking_diagnostics=None,
+):
+    """Draw the RGB-only crossing observation and PF likelihood diagnostics."""
 
     if crossing_mask is not None:
         mask = np.asarray(crossing_mask, dtype=np.uint8)
@@ -2526,41 +3180,82 @@ def draw_crossing_observations(panel, crossing_mask, crossing_proposals, contact
                 roi = panel[y:y + height, x:x + width]
                 mask_roi = mask[y:y + height, x:x + width]
                 tint = np.empty_like(roi)
-                tint[:] = (0, 210, 255)
+                tint[:] = (255, 90, 10)
                 blended = cv2.addWeighted(roi, 0.58, tint, 0.42, 0.0)
                 cv2.copyTo(blended, mask_roi, roi)
 
-    contacts = {
-        int(observation.proposal.proposal_id): observation
-        for observation in tuple(contact_observations or ())
-    }
+    targets_by_proposal = {}
+    for cable_index, targets in enumerate(tuple(crossing_targets_by_cable or ())):
+        for target in tuple(targets or ()):
+            targets_by_proposal.setdefault(int(target.proposal_id), []).append((cable_index, target))
     for proposal in tuple(crossing_proposals or ()):
-        observation = contacts.get(int(proposal.proposal_id))
-        verified = bool(observation is not None and observation.verified_contact)
-        color = (40, 255, 80) if verified else (255, 210, 30)
+        centroid_xy = np.asarray(getattr(proposal, "centroid_xy", ()), dtype=np.float64).reshape(-1)
+        if len(centroid_xy) < 2 or not np.all(np.isfinite(centroid_xy[:2])):
+            continue
+        centroid_xy = centroid_xy[:2]
+        color = (255, 170, 30)
         x, y, width, height = [int(value) for value in proposal.bbox_xywh]
-        centroid = tuple(np.round(proposal.centroid_xy).astype(np.int32))
+        centroid = bounded_panel_point(centroid_xy, panel.shape)
+        if centroid is None:
+            continue
         cv2.rectangle(panel, (x, y), (x + width, y + height), color, 2, cv2.LINE_AA)
         cv2.drawMarker(panel, centroid, color, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
-        state = "3D CONTACT" if verified else "RGB CROSSING"
-        details = f"{state} p={proposal.mean_probability:.2f}"
-        if observation is not None:
-            for cable_index, segment_points in enumerate(observation.segment_image_points):
-                points = np.round(segment_points).astype(np.int32)
-                if points.shape == (2, 2) and np.all(np.isfinite(segment_points)):
-                    segment_color = (255, 0, 255) if cable_index == 0 else (255, 220, 0)
-                    cv2.line(panel, tuple(points[0]), tuple(points[1]), segment_color, 4, cv2.LINE_AA)
-            if observation.diameter_calibrated:
-                details += f" gap={1000.0 * observation.gap_m:.1f}mm"
-            else:
-                details += f" center={1000.0 * observation.centerline_distance_m:.1f}mm DIAMETER UNSET"
-            details += (
-                f" s=({observation.s1_m:.3f},{observation.s2_m:.3f})m "
-                f"g={observation.confidence:.2f} {observation.depth_order}"
-            )
+        axes = np.asarray(getattr(proposal, "axes_xy", ()), dtype=np.float64)
+        axis_length = max(24, int(round(1.4 * max(width, height))))
+        if axes.shape == (2, 2) and np.all(np.isfinite(axes)):
+            for axis in axes:
+                start = bounded_panel_point(centroid_xy - axis_length * axis, panel.shape)
+                end = bounded_panel_point(centroid_xy + axis_length * axis, panel.shape)
+                if start is not None and end is not None:
+                    cv2.line(panel, start, end, (210, 210, 210), 2, cv2.LINE_AA)
+        for cable_index, target in targets_by_proposal.get(int(proposal.proposal_id), ()):
+            target_color = SEGMENTATION_LABEL_COLORS_BGR[1 + (int(cable_index) % 2)]
+            axis = np.asarray(target.axis_xy, dtype=np.float64).reshape(-1)
+            if len(axis) < 2 or not np.all(np.isfinite(axis[:2])):
+                continue
+            axis = axis[:2]
+            start = bounded_panel_point(centroid_xy - axis_length * axis, panel.shape)
+            end = bounded_panel_point(centroid_xy + axis_length * axis, panel.shape)
+            if start is not None and end is not None:
+                cv2.line(panel, start, end, target_color, 3, cv2.LINE_AA)
+        details = (
+            f"RGB CROSSING p={proposal.mean_probability:.2f} "
+            f"axes={2 if axes.shape == (2, 2) else 0}"
+        )
         text_y = min(panel.shape[0] - 8, max(18, y + height + 18))
         cv2.putText(panel, details, (max(4, x), text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (10, 10, 10), 3, cv2.LINE_AA)
         cv2.putText(panel, details, (max(4, x), text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+    per_cable = list(dict(tracking_diagnostics or {}).get("per_cable", ()) or ())
+    for cable_index, diagnostics in enumerate(per_cable):
+        closest = np.asarray(diagnostics.get("crossing_closest_xy", ()), dtype=np.float32).reshape(-1)
+        target = np.asarray(diagnostics.get("crossing_target_xy", ()), dtype=np.float32).reshape(-1)
+        if len(closest) < 2 or len(target) < 2 or not np.all(np.isfinite((closest[:2], target[:2]))):
+            continue
+        closest_point = tuple(np.round(closest[:2]).astype(np.int32))
+        target_point = tuple(np.round(target[:2]).astype(np.int32))
+        cable_color = SEGMENTATION_LABEL_COLORS_BGR[1 + (int(cable_index) % 2)]
+        cv2.line(panel, closest_point, target_point, cable_color, 2, cv2.LINE_AA)
+        cv2.drawMarker(panel, closest_point, cable_color, cv2.MARKER_DIAMOND, 16, 2, cv2.LINE_AA)
+        reward = float(diagnostics.get("crossing_reward", np.nan))
+        distance = float(diagnostics.get("crossing_distance_px", np.nan))
+        angle = float(diagnostics.get("crossing_angle_error_deg", np.nan))
+        text = f"PF{cable_index + 1} cross R={reward:.2f} d={distance:.1f}px a={angle:.1f}deg"
+        text_origin = (min(panel.shape[1] - 280, max(4, closest_point[0] + 10)), max(18, closest_point[1] - 10))
+        cv2.putText(panel, text, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.40, (10, 10, 10), 3, cv2.LINE_AA)
+        cv2.putText(panel, text, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.40, cable_color, 1, cv2.LINE_AA)
+
+
+def bounded_panel_point(values, panel_shape):
+    """Convert finite floating-point image coordinates to safe OpenCV integers."""
+
+    point = np.asarray(values, dtype=np.float64).reshape(-1)
+    if len(point) < 2 or not np.all(np.isfinite(point[:2])):
+        return None
+    height, width = int(panel_shape[0]), int(panel_shape[1])
+    limits = np.asarray((max(width, 1), max(height, 1)), dtype=np.float64)
+    point = np.clip(point[:2], -2.0 * limits, 3.0 * limits)
+    return int(round(float(point[0]))), int(round(float(point[1])))
 
 
 def draw_endpoint_association_status(panel, diagnostics):
@@ -2609,6 +3304,54 @@ def sample_points(points, max_points):
         indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
         points = points[indices]
     return np.ascontiguousarray(points, dtype=np.float32)
+
+
+def sample_points_with_rows(points, rows, max_points):
+    points = np.asarray(points, dtype=np.float32)
+    rows = np.asarray(rows, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 3:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 0), dtype=np.float32)
+    points = points[:, :3]
+    valid = np.all(np.isfinite(points), axis=1)
+    points = points[valid]
+    if rows.ndim != 2 or rows.shape[1] != len(valid):
+        rows = np.empty((0, len(points)), dtype=np.float32)
+    else:
+        rows = rows[:, valid]
+    max_points = max(0, int(max_points))
+    if max_points > 0 and len(points) > max_points:
+        indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
+        points = points[indices]
+        rows = rows[:, indices]
+    return (
+        np.ascontiguousarray(points, dtype=np.float32),
+        np.ascontiguousarray(rows, dtype=np.float32),
+    )
+
+
+def cable_support_colors(affinities):
+    """Color shared cloud points by independent proximity to each PF estimate."""
+
+    affinities = np.asarray(affinities, dtype=np.float32)
+    if affinities.ndim != 2 or affinities.shape[0] < 1:
+        return np.empty((0, 3), dtype=np.float32)
+    first = np.clip(affinities[0], 0.0, 1.0)
+    second = (
+        np.clip(affinities[1], 0.0, 1.0)
+        if affinities.shape[0] >= 2
+        else np.zeros_like(first)
+    )
+    explained = np.maximum(first, second)
+    certainty = np.abs(first - second) / np.maximum(first + second, 1e-6)
+    winner = first >= second
+    pf1 = np.asarray((1.00, 0.08, 0.88), dtype=np.float32)
+    pf2 = np.asarray((0.00, 0.86, 1.00), dtype=np.float32)
+    ambiguous = np.asarray((1.00, 0.58, 0.08), dtype=np.float32)
+    outlier = np.asarray((0.36, 0.39, 0.42), dtype=np.float32)
+    selected = np.where(winner[:, None], pf1[None, :], pf2[None, :])
+    explained_color = ambiguous[None, :] * (1.0 - certainty[:, None]) + selected * certainty[:, None]
+    colors = outlier[None, :] * (1.0 - explained[:, None]) + explained_color * explained[:, None]
+    return np.ascontiguousarray(colors, dtype=np.float32)
 
 
 def empty_point_cloud_stats():

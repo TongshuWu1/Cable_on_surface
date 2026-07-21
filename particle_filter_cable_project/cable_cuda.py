@@ -164,7 +164,7 @@ class CableCudaKernels:
                     self.functions[name] = function
         return self.functions[name]
 
-    def launch(self, name, count, arguments, stream, block_size=128):
+    def launch(self, name, count, arguments, stream, block_size=128, grid_size=None):
         count = int(count)
         if count <= 0:
             return
@@ -185,7 +185,11 @@ class CableCudaKernels:
         parameters = (ctypes.c_void_p * len(holders))(
             *(ctypes.cast(ctypes.byref(holder), ctypes.c_void_p) for holder in holders)
         )
-        grid_size = (count + int(block_size) - 1) // int(block_size)
+        grid_size = (
+            (count + int(block_size) - 1) // int(block_size)
+            if grid_size is None
+            else max(1, int(grid_size))
+        )
         self._check(
             self.driver.cuLaunchKernel(
                 self.function(name),
@@ -284,6 +288,49 @@ def particle_point_distances(particles, points, stream):
     return squared, nearest
 
 
+def particle_support_distances(particles, points, samples_per_segment, stream):
+    """Fused nearest-cloud distance for fixed samples along every particle.
+
+    This is the reverse half of the two-sided support objective. It returns
+    ``[cable, particle, segment, sample]`` without materializing the much
+    larger sample-by-cloud broadcast tensor.
+    """
+
+    particles = particles.contiguous()
+    points = points.contiguous()
+    samples_per_segment = max(1, int(samples_per_segment))
+    if particles.ndim != 4 or particles.shape[-1] != 3 or particles.shape[2] < 2:
+        raise ValueError("particles must have shape [cable, particle, node, 3].")
+    if points.ndim != 2 or points.shape[-1] != 3 or len(points) == 0:
+        raise ValueError("points must have non-empty shape [point, 3].")
+    if particles.device != points.device:
+        raise ValueError("particles and points must be on the same CUDA device.")
+    shape = (
+        int(particles.shape[0]),
+        int(particles.shape[1]),
+        int(particles.shape[2]) - 1,
+        samples_per_segment,
+    )
+    squared = torch.empty(shape, dtype=torch.float32, device=particles.device)
+    cable_cuda_kernels().launch(
+        "particle_support_distances_kernel",
+        squared.numel(),
+        [
+            ("tensor", particles),
+            ("tensor", points),
+            ("tensor", squared),
+            ("int", particles.shape[0]),
+            ("int", particles.shape[1]),
+            ("int", particles.shape[2]),
+            ("int", points.shape[0]),
+            ("int", samples_per_segment),
+        ],
+        stream,
+        block_size=256,
+    )
+    return squared
+
+
 _SAMPLER_LOCAL = threading.local()
 
 
@@ -363,8 +410,14 @@ def sample_indexed_points(
     if stream is None:
         stream = torch.cuda.Stream()
         _SAMPLER_LOCAL.stream = stream
-    caller_stream = torch.cuda.current_stream()
+    caller_stream = torch.cuda.current_stream(pixel_indices.device)
     with torch.inference_mode(), torch.cuda.stream(stream):
+        # ``pixel_indices`` is uploaded on the caller stream.  The private
+        # gather stream must not consume it until that upload is complete.
+        # The reverse wait below then makes the gathered output safe for the
+        # caller.  Together these waits form the complete two-way handoff.
+        stream.wait_stream(caller_stream)
+        pixel_indices.record_stream(stream)
         output = torch.empty((len(pixel_indices), 3), dtype=torch.float32, device=pixel_indices.device)
         use_confidence = max_confidence is not None
         if use_confidence and (

@@ -1,12 +1,16 @@
 """Canonical PIDNet observation and annotation schema.
 
-The cable body is a shared visual class.  Each endpoint channel contains both
-ends of one physical cable, so endpoint channel identity is also PF identity.
+The neural observation and the editable annotation use the same four-layer
+layout.  Cable is one shared visual class.  Each endpoint layer contains both
+ends of one physical cable, so endpoint-layer identity is also PF identity.
+Crossing is an RGB proposal layer only; physical ownership/contact stays in the
+particle filters.
 """
 
 PIDNET_SCHEMA_VERSION = 3
 PIDNET_LABEL_MODE = "cable_with_per_cable_endpoints_and_crossing"
 ENDPOINT_SEMANTICS = "per_cable_endpoint_sets"
+ANNOTATION_SCHEMA_VERSION = 1
 
 CABLE_CHANNEL = 0
 ENDPOINT_CABLE_NAMES = ("cable1", "cable2")
@@ -14,28 +18,28 @@ ENDPOINT_CHANNELS = (1, 2)
 CROSSING_CHANNEL = 3
 OUTPUT_CHANNEL_COUNT = 4
 
-# Layered annotation files historically reserved two body-layer labels even
-# though both are merged into one cable target.  Keep that storage convention
-# explicit and separate from the neural output schema.
-ANNOTATION_BODY_LAYER_COUNT = 2
+# Editable layered masks map one-to-one onto the neural observation.  There are
+# no cable1/cable2 body labels: cable ownership is decided by the PF.
+ANNOTATION_BODY_LAYER_COUNT = 1
 ANNOTATION_ENDPOINT_GROUP_COUNT = len(ENDPOINT_CABLE_NAMES)
+ANNOTATION_CHANNEL_COUNT = OUTPUT_CHANNEL_COUNT
 
 
-def endpoint_label_value(cable_index, body_layer_count=ANNOTATION_BODY_LAYER_COUNT):
+def endpoint_label_value(cable_index, _cable_count=None):
     cable_index = int(cable_index)
     if cable_index < 1 or cable_index > ANNOTATION_ENDPOINT_GROUP_COUNT:
         raise ValueError(
             f"Endpoint cable index must be in 1..{ANNOTATION_ENDPOINT_GROUP_COUNT}; got {cable_index}."
         )
-    return int(body_layer_count) + cable_index
+    return CABLE_CHANNEL + 1 + cable_index
 
 
-def crossing_label_value(body_layer_count=ANNOTATION_BODY_LAYER_COUNT):
-    return int(body_layer_count) + ANNOTATION_ENDPOINT_GROUP_COUNT + 1
+def crossing_label_value(_cable_count=None):
+    return CROSSING_CHANNEL + 1
 
 
-def max_label_value(body_layer_count=ANNOTATION_BODY_LAYER_COUNT):
-    return crossing_label_value(body_layer_count)
+def max_label_value(_cable_count=None):
+    return ANNOTATION_CHANNEL_COUNT
 
 
 def label_bit(label):

@@ -12,6 +12,7 @@ if str(PROJECT_DIR) not in sys.path:
 from cable_pidnet import require_torch
 from pidnet_schema import (
     ANNOTATION_BODY_LAYER_COUNT,
+    ANNOTATION_SCHEMA_VERSION,
     CROSSING_CHANNEL,
     ENDPOINT_SEMANTICS,
     OUTPUT_CHANNEL_COUNT,
@@ -54,6 +55,7 @@ def migrate_checkpoint(path):
     config.update(
         {
             "observation_schema_version": PIDNET_SCHEMA_VERSION,
+            "annotation_schema_version": ANNOTATION_SCHEMA_VERSION,
             "endpoint_semantics": ENDPOINT_SEMANTICS,
             "annotation_body_layer_count": ANNOTATION_BODY_LAYER_COUNT,
             "label_mode": PIDNET_LABEL_MODE,

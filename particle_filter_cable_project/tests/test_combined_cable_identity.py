@@ -48,9 +48,8 @@ class CombinedCableIdentityTests(unittest.TestCase):
             prediction_only=False,
             endpoint_conditioned_proposal_ratio=0.25,
             global_random_particle_ratio=0.10,
-            mean_ownership_responsibility=0.45,
-            ownership_entropy=0.20,
-            ownership_effective_point_count=45.0,
+            mean_support_affinity=0.45,
+            supported_sample_fraction=0.70,
         )
         predicted = SimpleNamespace(
             **common,
@@ -58,9 +57,8 @@ class CombinedCableIdentityTests(unittest.TestCase):
             prediction_only=True,
             endpoint_conditioned_proposal_ratio=0.0,
             global_random_particle_ratio=0.0,
-            mean_ownership_responsibility=np.nan,
-            ownership_entropy=np.nan,
-            ownership_effective_point_count=0.0,
+            mean_support_affinity=np.nan,
+            supported_sample_fraction=np.nan,
         )
 
         combined = combine_filter_results([updated, predicted])
@@ -75,13 +73,13 @@ class CombinedCableIdentityTests(unittest.TestCase):
 
         self.assertAlmostEqual(combined.global_random_particle_ratio, 0.10)
         self.assertAlmostEqual(combined.endpoint_conditioned_proposal_ratio, 0.25)
-        self.assertAlmostEqual(combined.mean_ownership_responsibility, 0.45)
+        self.assertAlmostEqual(combined.mean_support_affinity, 0.45)
         self.assertEqual(diagnostics["active_cables"], 1)
         self.assertAlmostEqual(diagnostics["global_random_ratio"], 0.10)
 
     def test_particle_diagnostic_group_keeps_physical_pf_index(self):
         estimate_diagnostics = SimpleNamespace(
-            map_to_average_node_error_m=0.012,
+            map_to_representative_node_error_m=0.012,
             mean_node_spread_m=0.008,
             max_node_spread_m=0.020,
             endpoint_direction_delta_deg=np.asarray([4.0, 7.0], dtype=np.float32),
@@ -102,7 +100,7 @@ class CombinedCableIdentityTests(unittest.TestCase):
         self.assertEqual(len(combined.particle_diagnostics), 1)
         self.assertEqual(combined.particle_diagnostics[0][0], 1)
         self.assertIs(combined.particle_diagnostics[0][1], estimate_diagnostics)
-        self.assertAlmostEqual(combined.map_to_average_node_error_m, 0.012)
+        self.assertAlmostEqual(combined.map_to_representative_node_error_m, 0.012)
         self.assertAlmostEqual(combined.max_node_spread_m, 0.020)
         np.testing.assert_allclose(combined.endpoint_direction_delta_deg, [4.0, 7.0])
 

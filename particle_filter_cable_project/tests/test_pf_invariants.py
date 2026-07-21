@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 import numpy as np
 
-from cable_detection import CableEstimate3D, polyline_residual
+from cable_detection import CableEstimate3D
 from cable_particle_filter import (
     CableParticleFilter,
     CableParticleFilterConfig,
@@ -14,6 +14,28 @@ from cable_particle_filter import (
 
 
 class ParticleFilterInvariantTests(unittest.TestCase):
+    def test_invalid_posterior_has_a_bounded_uniform_numerical_fallback(self):
+        config = CableParticleFilterConfig(
+            particle_count=3,
+            estimate_top_particle_count=3,
+            segment_length_m=0.1,
+            scoring_backend="cpu",
+            particle_diagnostics_enabled=False,
+        )
+        particle_filter = CableParticleFilter(node_count=3, config=config)
+        chain = np.asarray(
+            ((0.0, 0.0, 1.0), (0.1, 0.0, 1.0), (0.2, 0.0, 1.0)),
+            dtype=np.float64,
+        )
+        particle_filter.particles = np.repeat(chain[None, :, :], 3, axis=0)
+        particle_filter.weights = np.asarray((np.nan, -1.0, 0.0), dtype=np.float64)
+
+        result = particle_filter._estimate(measurement_used=True, prediction_only=False)
+
+        np.testing.assert_allclose(particle_filter.weights, np.full(3, 1.0 / 3.0))
+        self.assertAlmostEqual(result.effective_sample_size, 3.0)
+        self.assertLessEqual(result.effective_sample_size, len(particle_filter.weights))
+
     def test_endpoint_constraint_converges_and_preserves_lengths(self):
         rng = np.random.default_rng(12)
         count, node_count = 100, 13
@@ -62,7 +84,7 @@ class ParticleFilterInvariantTests(unittest.TestCase):
         self.assertTrue(result.prediction_only)
         np.testing.assert_allclose(particle_filter.last_endpoint_nodes, candidate)
 
-    def test_estimate_is_mean_of_top_ranked_particles(self):
+    def test_estimate_is_weighted_medoid_of_top_ranked_particles(self):
         config = CableParticleFilterConfig(
             segment_length_m=0.1,
             scoring_backend="cpu",
@@ -77,13 +99,13 @@ class ParticleFilterInvariantTests(unittest.TestCase):
             dtype=np.float64,
         )
         particle_filter.weights = np.asarray([0.1, 0.9], dtype=np.float64)
-        expected = np.mean(particle_filter.particles, axis=0)
+        expected = particle_filter.particles[1]
         np.testing.assert_allclose(particle_filter._estimate_nodes(), expected, atol=1e-7)
         self.assertEqual(particle_filter._estimate_particle_count_cache, 2)
         self.assertAlmostEqual(particle_filter._estimate_weight_mass_cache, 1.0)
         diagnostics = particle_filter._particle_estimate_diagnostics_cache
         self.assertIsNotNone(diagnostics)
-        np.testing.assert_allclose(diagnostics.average_points_xyz, expected, atol=1e-7)
+        np.testing.assert_allclose(diagnostics.representative_points_xyz, expected, atol=1e-7)
         np.testing.assert_allclose(diagnostics.map_points_xyz, particle_filter.particles[1], atol=1e-7)
         np.testing.assert_allclose(diagnostics.top_particle_points_xyz, particle_filter.particles, atol=1e-7)
 
@@ -105,7 +127,7 @@ class ParticleFilterInvariantTests(unittest.TestCase):
             0.1,
             atol=1e-7,
         )
-        self.assertAlmostEqual(diagnostics.map_to_average_node_error_m, 0.1, places=6)
+        self.assertAlmostEqual(diagnostics.map_to_representative_node_error_m, 0.1, places=6)
         self.assertAlmostEqual(diagnostics.mean_node_spread_m, 0.1, places=6)
         self.assertAlmostEqual(diagnostics.max_node_spread_m, 0.1, places=6)
 
@@ -119,7 +141,7 @@ class ParticleFilterInvariantTests(unittest.TestCase):
             atol=1e-5,
         )
 
-    def test_top_particle_mean_preserves_endpoints_and_segment_lengths(self):
+    def test_posterior_medoid_preserves_endpoints_and_segment_lengths(self):
         segment_length = 0.1
         endpoints = np.asarray([[0.0, 0.0, 1.0], [0.25, 0.0, 1.0]], dtype=np.float64)
         seeds = np.asarray(
@@ -157,7 +179,7 @@ class ParticleFilterInvariantTests(unittest.TestCase):
             atol=2e-6,
         )
 
-    def test_top_particle_mean_reduces_single_map_outlier_error(self):
+    def test_posterior_medoid_never_creates_an_unscored_midpoint_shape(self):
         base = np.asarray(
             [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0], [0.2, 0.0, 1.0]],
             dtype=np.float64,
@@ -167,7 +189,6 @@ class ParticleFilterInvariantTests(unittest.TestCase):
             base,
             base + np.asarray([0.0, -0.30, 0.0]),
         ))
-        support = base + np.asarray([0.0, 0.05, 0.0])
         config = CableParticleFilterConfig(
             segment_length_m=0.1,
             scoring_backend="cpu",
@@ -178,13 +199,10 @@ class ParticleFilterInvariantTests(unittest.TestCase):
         particle_filter.weights = np.asarray([0.55, 0.40, 0.05], dtype=np.float64)
 
         estimate = particle_filter._estimate_nodes()
-        map_error = polyline_residual(support, particles[0])
-        averaged_error = polyline_residual(support, estimate)
+        self.assertTrue(any(np.allclose(estimate, particle) for particle in particles))
+        np.testing.assert_allclose(estimate, particles[0], atol=1e-7)
 
-        self.assertLess(averaged_error, 1e-7)
-        self.assertGreater(map_error, 0.049)
-
-    def test_equal_weight_resampled_particles_are_all_averaged(self):
+    def test_equal_weight_medoid_is_still_one_sampled_particle(self):
         base = np.asarray(
             [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0], [0.2, 0.0, 1.0]],
             dtype=np.float64,
@@ -205,10 +223,10 @@ class ParticleFilterInvariantTests(unittest.TestCase):
 
         estimate = particle_filter._estimate_nodes()
 
-        np.testing.assert_allclose(estimate, base, atol=1e-7)
-        self.assertEqual(particle_filter._estimate_particle_count_cache, 3)
+        self.assertTrue(any(np.allclose(estimate, particle) for particle in particles))
+        self.assertEqual(particle_filter._estimate_particle_count_cache, 2)
 
-    def test_transition_mixture_keeps_ten_percent_global_recovery(self):
+    def test_transition_mixture_keeps_ten_percent_global_random_particles(self):
         config = CableParticleFilterConfig(
             particle_count=100,
             segment_length_m=0.1,
@@ -229,6 +247,40 @@ class ParticleFilterInvariantTests(unittest.TestCase):
         self.assertIsNotNone(particle_filter.step(measurement))
         self.assertAlmostEqual(particle_filter.last_global_random_particle_ratio, 0.10)
         self.assertAlmostEqual(particle_filter.last_endpoint_conditioned_proposal_ratio, 0.25)
+
+    def test_fast_endpoint_motion_increases_bounded_transition_uncertainty(self):
+        config = CableParticleFilterConfig(
+            particle_count=100,
+            segment_length_m=0.05,
+            scoring_backend="cpu",
+            global_random_particle_ratio=0.10,
+            motion_speed_reference_mps=0.25,
+            motion_innovation_reference_m=0.010,
+            motion_noise_adaptation=1.0,
+            max_motion_noise_scale=3.0,
+        )
+        particle_filter = CableParticleFilter(node_count=7, config=config, seed=13)
+
+        def measurement(offset):
+            endpoints = np.asarray(
+                [[-0.15 + offset, 0.0, 1.0], [0.15 + offset, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+            return CableEstimate3D(
+                points_xyz=np.empty((0, 3), dtype=np.float32),
+                source_points=np.linspace(endpoints[0], endpoints[1], 80, dtype=np.float32),
+                residual_m=0.0,
+                method="moving cable",
+                endpoint_nodes=endpoints,
+            )
+
+        particle_filter.step(measurement(0.0), dt=1.0 / 30.0)
+        result = particle_filter.step(measurement(0.03), dt=1.0 / 30.0)
+
+        self.assertGreater(result.endpoint_speed_mps, 0.80)
+        self.assertGreater(result.motion_noise_scale, 1.0)
+        self.assertLessEqual(result.motion_noise_scale, 3.0)
+        self.assertAlmostEqual(result.global_random_particle_ratio, 0.10)
 
     def test_filtered_estimate_uses_selected_pf_support_for_residual(self):
         chain = np.asarray(

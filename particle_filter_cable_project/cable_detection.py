@@ -411,6 +411,87 @@ def sampled_masked_point_cloud_points(
     return np.ascontiguousarray(points, dtype=np.float32)
 
 
+def sampled_masked_point_cloud_point_sets(
+    point_cloud,
+    masks,
+    *,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    max_points_by_mask=(),
+    oversample=4,
+):
+    """Lift several independent masks with one CUDA gather and one CPU transfer."""
+
+    masks = tuple(masks or ())
+    limits = tuple(int(value) for value in max_points_by_mask)
+    if len(limits) != len(masks):
+        raise ValueError("max_points_by_mask must contain one limit for each mask.")
+    if not isinstance(point_cloud, CudaPointCloudView):
+        return tuple(
+            sampled_masked_point_cloud_points(
+                point_cloud,
+                mask,
+                depth_min=depth_min,
+                depth_max=depth_max,
+                confidence_map=confidence_map,
+                max_confidence=max_confidence,
+                max_points=max(0, limit),
+                oversample=oversample,
+            )
+            if mask is not None
+            else np.empty((0, 3), dtype=np.float32)
+            for mask, limit in zip(masks, limits)
+        )
+
+    sampled_indices = []
+    for mask, limit in zip(masks, limits):
+        if mask is None:
+            sampled_indices.append(np.empty(0, dtype=np.int64))
+            continue
+        mask_array = np.asarray(mask, dtype=np.uint8)
+        if mask_array.shape[:2] != (point_cloud.height, point_cloud.width):
+            mask_array = cv2.resize(
+                mask_array,
+                (point_cloud.width, point_cloud.height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        flat_indices = np.flatnonzero(mask_array.reshape(-1))
+        limit = max(0, int(limit))
+        if limit > 0 and len(flat_indices) > limit * max(1, int(oversample)):
+            flat_indices = evenly_sample_indices(
+                flat_indices,
+                limit * max(1, int(oversample)),
+            )
+        sampled_indices.append(np.ascontiguousarray(flat_indices, dtype=np.int64))
+
+    counts = [len(value) for value in sampled_indices]
+    if not any(counts):
+        return tuple(np.empty((0, 3), dtype=np.float32) for _ in masks)
+    combined_indices = np.concatenate(sampled_indices)
+    combined_points = sample_indexed_points(
+        point_cloud,
+        combined_indices,
+        depth_min=depth_min,
+        depth_max=depth_max,
+        max_confidence=max_confidence,
+    ).cpu().numpy()
+
+    outputs = []
+    cursor = 0
+    for count, limit in zip(counts, limits):
+        points = np.asarray(combined_points[cursor:cursor + count], dtype=np.float32)
+        cursor += count
+        points = points[np.all(np.isfinite(points), axis=1)]
+        limit = max(0, int(limit))
+        if limit > 0 and len(points) > limit:
+            indices = np.linspace(0, len(points) - 1, limit, dtype=np.int64)
+            points = points[indices]
+        outputs.append(np.ascontiguousarray(points, dtype=np.float32))
+    return tuple(outputs)
+
+
 def evenly_sample_indices(indices, count):
     indices = np.asarray(indices, dtype=np.int64).reshape(-1)
     count = max(0, int(count))

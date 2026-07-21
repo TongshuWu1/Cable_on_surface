@@ -381,7 +381,7 @@ class PidNetCableDetector(CableMaskDetector):
         bgr,
         endpoint_channel_count=2,
         scale=1.0,
-        endpoint_threshold=None,
+        endpoint_thresholds=None,
         crossing_threshold=None,
         include_endpoint_mask=True,
     ):
@@ -406,11 +406,20 @@ class PidNetCableDetector(CableMaskDetector):
         else:
             detector_input = bgr
 
-        endpoint_threshold = self.threshold if endpoint_threshold is None else float(endpoint_threshold)
+        if endpoint_thresholds is None:
+            endpoint_thresholds = (self.threshold,) * len(ENDPOINT_CHANNELS)
+        elif np.isscalar(endpoint_thresholds):
+            endpoint_thresholds = (float(endpoint_thresholds),) * len(ENDPOINT_CHANNELS)
+        else:
+            endpoint_thresholds = tuple(float(value) for value in endpoint_thresholds)
+        if len(endpoint_thresholds) != len(ENDPOINT_CHANNELS):
+            raise ValueError(
+                f"Expected {len(ENDPOINT_CHANNELS)} endpoint thresholds; got {len(endpoint_thresholds)}."
+            )
         crossing_threshold = self.threshold if crossing_threshold is None else float(crossing_threshold)
         thresholds = (
             self.threshold,
-            *(endpoint_threshold for _ in ENDPOINT_CHANNELS),
+            *endpoint_thresholds,
             crossing_threshold,
         )
         masks, crossing_probability = self.segmenter.observation_channels(detector_input, thresholds)

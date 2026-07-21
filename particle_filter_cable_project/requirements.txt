@@ -1,5 +1,6 @@
 numpy
 opencv-python
+imageio-ffmpeg
 PyOpenGL
 
 # PIDNet detector/training dependency. Install the CUDA build that matches your

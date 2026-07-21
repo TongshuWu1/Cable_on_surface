@@ -5,6 +5,36 @@
 #
 # This file is the single runtime tuning surface.
 
+[features]
+# Central ablation switches. Parameters remain in their domain sections below,
+# but these booleans are the only enable/disable controls. This makes runtime
+# and accuracy comparisons reproducible without editing tuned numeric values.
+particle_filter = true
+cable_mask_morphology = true
+cable_component_filter = true
+endpoint_mask_morphology = true
+endpoint_component_filter = true
+depth_confidence_filter = true
+endpoint_association_support = true
+velocity_prediction = true
+adaptive_motion_noise = true
+occlusion_prediction = true
+direction_smoothing = false
+posterior_medoid_estimate = true
+endpoint_tangent_estimation = true
+endpoint_tangent_ransac = true
+endpoint_tangent_likelihood = true
+endpoint_conditioned_proposals = true
+global_random_particles = true
+robust_measurement_likelihood = true
+dense_path_support = true
+union_coverage_selection = true
+bend_regularization = false
+crossing_proposals = true
+crossing_likelihood = true
+point_support_coloring = true
+particle_diagnostics_overlay = true
+
 [camera]
 # Leave both input fields empty for the local ZED camera.
 input_svo_file = ""
@@ -18,8 +48,8 @@ depth_mode = "NEURAL"
 min_m = 0.01
 max_m = 1.0
 
-# Larger values are stricter for ZED depth confidence. If cable depth disappears,
-# lower confidence first, then texture_confidence.
+# ZED confidence is 0=best and 100=worst. The SDK rejects values above each
+# threshold, so smaller thresholds are stricter and produce a sparser cloud.
 confidence = 95
 texture_confidence = 100
 fill = true
@@ -34,6 +64,12 @@ point_size = 1.5
 
 # Options: "segmentation", "tracking", "mask".
 rgb_view = "segmentation"
+ablation_control_ui = true
+
+[experiment]
+# The control UI starts/stops recording. Each JSONL file contains the complete
+# feature state and calibrated runtime metadata needed to reproduce an ablation.
+output_directory = "experiments"
 
 [pidnet]
 # Relative paths are resolved from this config file.
@@ -42,7 +78,11 @@ rgb_view = "segmentation"
 # its physical cable and maps directly to the PF with the same index.
 checkpoint = "models/pidnet_two_cable_best.pt"
 device = "cuda"
-threshold = 0.5
+# Neutral placeholders while the replacement dataset/model are being built.
+# Load the new checkpoint in the training UI, calibrate on validation only, and
+# explicitly save the four resulting thresholds here before running main.py.
+threshold = 0.85000002
+endpoint_thresholds = [0.89999998, 0.75]
 amp = true
 channels_last = true
 
@@ -67,17 +107,23 @@ support_weight = 0.35
 support_clip_m = 0.080
 
 [crossing]
-# The NN proposes image crossings only. Physical contact is verified from the
-# two reconstructed PF chains and never fed back as a PF constraint here.
-threshold = 0.50
+# The NN proposes an image-space crossing region only. Each independent PF is
+# rewarded when its calibrated RGB projection passes through that region along
+# one of the two observed cable axes. No physical-contact or depth-gap term is
+# part of this likelihood.
+threshold = 0.94999999
 min_area_px = 12
-max_proposals = 8
-association_sigma_px = 18.0
-contact_tolerance_m = 0.002
+max_proposals = 4
+# Maximum ZED points lifted from the NN crossing mask for the blue 3D overlay.
+max_visual_points = 512
+axis_radius_px = 36.0
+min_axis_separation_deg = 25.0
+min_axis_support_px = 12
+position_sigma_px = 14.0
+angle_sigma_deg = 20.0
+# Maximum additive log-weight reward for one perfectly aligned crossing target.
+log_reward = 4.0
 
-# Measure these physical diameters before enabling contact declarations. Zeros
-# intentionally keep every proposal in the "RGB crossing only" state.
-cable_diameters_m = [0.0, 0.0]
 
 [detector]
 # The current checkpoint was trained at full ZED HD720. Full-scale inference
@@ -91,15 +137,15 @@ update_every = 1
 # Binary mask cleanup after the selected detector. Increase min_area_px to ignore
 # small noise; increase close_kernel to bridge tiny mask gaps.
 min_area_px = 80
-open_kernel = 5
-close_kernel = 1
+open_kernel = 1
+close_kernel = 5
 
 [point_cloud]
 # Visual point-cloud sampling. Larger stride and lower max_points make the
 # display faster without changing particle-filter scoring.
 stride = 5
-max_points = 30000
-cloud_update_every = 3
+max_points = 20000
+cloud_update_every = 4
 
 # Retrieve the ZED confidence map every N frames. Use 0 to disable confidence
 # filtering, or increase to 2-3 if confidence retrieval becomes expensive.
@@ -111,42 +157,48 @@ confidence_update_every = 2
 count = 2
 
 # Number of connected fixed-length line segments. 2 segments gives 3 vertices.
-segments = 12
+segments = 15
 
 # Physical cable lengths in meters, one value per cable.
-lengths_m = [0.510, 0.515]
+lengths_m = [0.52, 0.52]
 
 # Maximum raw support points drawn in the 3D viewer.
-max_visual_points = 6000
+max_visual_points = 4000
 
 [measurement]
 # ZED confidence max for accepted cable depth samples. Use a negative value to
 # disable confidence filtering.
-confidence_max = 85.0
+confidence_max = 90.0
 
 [particle_filter]
-enabled = true
-# RTX 4080 profile. Both cable populations are evaluated together by one fused
-# point-to-polyline CUDA kernel.
+# RTX 4080 profile. PF1 and PF2 retain independent states, weights, ancestors,
+# random draws, and CUDA streams. Each evaluates its own paths against the same
+# unlabeled cable observation cloud.
 particles = 800
 
-# Estimate the cable as the arithmetic mean of the highest-weight particles,
-# then project that mean back onto the fixed-length endpoint constraints.
-estimate_top_particles = 50
+# Choose one actual particle minimizing posterior expected shape error over the
+# top set. This medoid cannot cut between incompatible cable-shape modes.
+estimate_top_particles = 30
 
 # Local transition noise. The endpoint-conditioned proposal population below is
 # responsible for larger, fast interior deformations.
-process_node_std_m = 0.01
-process_direction_std = 0.02
+process_node_std_m = 0.010
+process_direction_std = 0.025
 
 # Constant-velocity prediction. Each particle stores one 3D velocity per cable
 # node. Prediction moves nodes by v*dt, then reapplies fixed segment length and
 # endpoint constraints.
-velocity = true
 velocity_damping = 0.65
 velocity_measurement_blend = 0.10
 velocity_process_std_mps = 0.004
 max_node_speed_mps = 1.0
+
+# Heteroscedastic transition covariance. Endpoint speed and deviation from the
+# prior constant-velocity endpoint prediction increase local proposal noise.
+# The dimensionless scale is smoothed and capped by max_motion_noise_scale.
+motion_speed_reference_mps = 0.25
+motion_innovation_reference_m = 0.010
+motion_noise_adaptation = 0.35
 
 # Direction smoothing is off so the fixed-length PF can follow tight bends.
 direction_smooth_passes = 0
@@ -157,43 +209,54 @@ measurement_node_std_m = 0.025
 # Maximum shared raw-mask points. No per-cable hard pre-filtering is applied.
 measurement_points = 1000
 
-# Persistent particles, transition sampling, constraints, fused distances, soft
-# ownership, robust scoring, and weighting remain on CUDA.
+# Persistent particles, transition sampling, constraints, dense path-to-cloud
+# distances, robust scoring, and weighting remain on CUDA.
 scoring_backend = "cuda"
 
 # Estimate an inward cable tangent from raw points around each labeled endpoint.
-# Confidence is the local directional anisotropy times the support fraction.
+# Bounded RANSAC first rejects nearby branches/noise, then PCA refines the
+# winning support. The previous PF tangent is only a soft continuity prior.
 endpoint_tangent_min_radius_m = 0.008
 endpoint_tangent_radius_m = 0.075
 endpoint_tangent_sigma_m = 0.035
 endpoint_tangent_min_points = 8
 endpoint_tangent_min_confidence = 0.20
+endpoint_tangent_ransac_inlier_m = 0.006
+endpoint_tangent_max_hypotheses = 64
+endpoint_tangent_reference_weight = 0.25
+endpoint_tangent_likelihood_scale_m = 0.020
 
-# Transition mixture: 65% posterior-local, 25% endpoint/tangent-conditioned,
-# and 10% globally random feasible chains. Low-frequency sine deformation modes
-# change the interior efficiently without sampling every node independently.
+# Transition mixture. These three masses must sum to exactly 1. Disabled
+# optional populations transfer their mass only to the local population.
+local_proposal_ratio = 0.65
 endpoint_conditioned_proposal_ratio = 0.25
-endpoint_conditioned_direction_std = 0.08
-endpoint_conditioned_deformation_std_m = 0.025
-endpoint_conditioned_deformation_modes = 3
 global_random_particle_ratio = 0.10
 
-# Shared-mask latent ownership p(source in {cable1,cable2,outlier}). The cable
-# responsibilities remain soft at crossings and are computed before either PF
-# receives its single measurement likelihood update.
-ownership_outlier_likelihood = 0.05
-ownership_outlier_prior = 0.10
-ownership_min_responsibility = 0.01
-ownership_visibility_threshold = 0.15
+# Endpoint-conditioned low-frequency normal-space modes
+# change curvature without independently kicking every segment. Slack adjusts
+# their scale, but displacement is capped at about one physical segment.
+endpoint_conditioned_direction_std = 0.08
+endpoint_conditioned_deformation_std_m = 0.012
+endpoint_conditioned_slack_gain = 0.10
+endpoint_conditioned_max_deformation_m = 0.040
+endpoint_conditioned_deformation_modes = 3
 
 # Truncated-quadratic M-estimator cutoff. Points farther away contribute a
 # bounded cost rather than dominating or being deleted from the observation.
 robust_distance_m = 0.05
 
-# Penalize particles whose visible segments do not own enough support points.
-# Use 0 to disable.
-coverage_penalty_m = 0.025
-coverage_min_fraction = 0.05
+# Dominant measurement term: densely sample every proposed cable segment and
+# measure each sample to its nearest point in the complete unlabeled cable
+# cloud. There is deliberately no cloud-to-particle coverage term inside either
+# PF likelihood, so the other cable cannot pull this PF toward an average branch.
+path_support_weight = 1.0
+path_support_samples_per_segment = 5
+
+# Final representative selection only: compare the top particles from each
+# independent PF and prefer the one/two-cable union that explains the observed
+# cable cloud. This does not change weights or couple populations/motion models.
+union_coverage_top_particles = 30
+union_coverage_weight = 1.0
 
 # Bend penalty is off so tight measured cable bends can be followed. Fixed
 # segment lengths, endpoints, and raw support points provide the constraints.
@@ -207,10 +270,10 @@ endpoint_constraint_tolerance_m = 0.0001
 
 # Minimum support required before a measurement update is trusted.
 min_measurement_points = 12
-min_segment_points = 4
+min_segment_support_samples = 3
 
-# Max distance for assigning support points to visible/occluded segments.
-occlusion_gate_m = 0.12
+# Diagnostic visibility threshold for dense samples along each MAP segment.
+support_visibility_distance_m = 0.03
 
 # After this many frames without cable support, stop prediction. Endpoint-only
 # frames still constrain the predicted chain but correctly report no shape

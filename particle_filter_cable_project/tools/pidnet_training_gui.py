@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import queue
@@ -24,8 +25,24 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 from cable_detection import remove_small_components
+from pidnet_dataset import (
+    DATASET_SPLITS,
+    load_dataset_manifest,
+    metadata_for_stem,
+    move_session_split,
+    new_session_id,
+    register_dataset_item,
+    remove_dataset_item_metadata,
+    sanitize_identifier,
+    session_split_conflicts,
+    unique_capture_stem,
+    utc_now_text,
+)
 from pidnet_schema import (
+    ANNOTATION_CHANNEL_COUNT,
+    ANNOTATION_SCHEMA_VERSION,
     CROSSING_CHANNEL,
+    ENDPOINT_CHANNELS,
     OUTPUT_CHANNEL_COUNT,
     PIDNET_LABEL_MODE,
     crossing_label_value,
@@ -42,28 +59,16 @@ DEFAULT_CONFIG_PATH = PROJECT_DIR / "config.toml"
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
 LABEL_COLORS_BGR = (
     (40, 255, 40),     # cable body
-    (40, 255, 40),     # reserved cable body layer, merged for training
-    (40, 255, 40),     # reserved cable body layer, merged for training
-    (40, 255, 40),     # reserved cable body layer, merged for training
-    (255, 0, 255),     # endpoints_1
-    (255, 220, 0),     # endpoints_2
-    (80, 80, 255),     # endpoints_3
-    (0, 220, 255),     # endpoints_4
+    (255, 0, 255),     # endpoints_cable1
+    (255, 220, 0),     # endpoints_cable2
+    (0, 255, 255),     # RGB crossing proposal
 )
-CROSSING_COLOR_BGR = (0, 255, 255)
+MASK_UNDO_LIMIT = 12
 
 
 def label_color_bgr(label, cable_count=None):
     label = max(1, int(label))
-    if cable_count is None:
-        return LABEL_COLORS_BGR[(label - 1) % len(LABEL_COLORS_BGR)]
-    cable_count = max(1, int(cable_count))
-    if label == crossing_label_value(cable_count):
-        return CROSSING_COLOR_BGR
-    if label <= cable_count:
-        return LABEL_COLORS_BGR[(label - 1) % 4]
-    endpoint_index = label - cable_count - 1
-    return LABEL_COLORS_BGR[4 + (endpoint_index % 4)]
+    return LABEL_COLORS_BGR[(label - 1) % len(LABEL_COLORS_BGR)]
 
 
 def parse_args():
@@ -72,7 +77,7 @@ def parse_args():
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--image", action="append", default=[], help="Image path to label. Can be repeated.")
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
         "--imgsz",
@@ -80,14 +85,29 @@ def parse_args():
         help="Training image size. Use 1280x720 for full ZED HD720, or a single value like 512 for square training.",
     )
     parser.add_argument("--base-channels", type=int, default=24)
-    parser.add_argument("--cable-count", type=int, default=2, help="Number of cable endpoint groups to label and train.")
+    parser.add_argument("--cable-count", type=int, choices=(2,), default=2, help="Fixed two-cable endpoint schema.")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument("--endpoint-weight", type=float, default=2.0)
     parser.add_argument("--boundary-weight", type=float, default=0.20)
     parser.add_argument("--crossing-weight", type=float, default=1.0)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.995)
+    parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--early-stop", type=int, default=24)
+    parser.add_argument("--min-delta", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gpu-augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--init-checkpoint", type=Path, default=None)
     parser.add_argument("--resolution", choices=resolution_names(), default="HD720")
     parser.add_argument("--fps", type=int, default=60)
     return parser.parse_args()
@@ -115,26 +135,53 @@ def make_frame_item(
     path=None,
     split="train",
     dataset_dir=DEFAULT_DATASET_DIR,
-    cable_count=1,
+    cable_count=2,
     search_other_splits=True,
+    session_id=None,
 ):
     bgr = np.asarray(bgr, dtype=np.uint8)
+    if int(cable_count) != 2:
+        raise ValueError(f"This annotation schema requires exactly two endpoint sets; got {cable_count}.")
+    dataset_stem = dataset_stem_for_source(path, dataset_dir) if path is not None else None
     item = {
         "path": str(Path(path).expanduser().resolve()) if path is not None else None,
+        "dataset_stem": dataset_stem,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "bgr": bgr.copy(),
         "mask": np.zeros(bgr.shape[:2], dtype=np.uint16),
-        "cable_count": max(1, int(cable_count)),
+        "cable_count": 2,
         "split": split,
         "saved_image_path": None,
         "saved_mask_path": None,
         "saved_layer_path": None,
         "dirty": False,
+        "session_id": str(session_id or new_session_id()),
+        "verified": False,
+        "negative": False,
+        "notes": "",
+        "undo_stack": [],
+        "redo_stack": [],
+        "near_duplicate_of": None,
+        "near_duplicate_distance": None,
+        "annotation": {"origin": "manual"},
     }
+    if path is not None:
+        metadata = metadata_for_stem(dataset_dir, dataset_stem)
+        if metadata:
+            item["session_id"] = str(metadata.get("session_id") or item["session_id"])
+            item["verified"] = bool(metadata.get("verified", False))
+            item["negative"] = bool(metadata.get("negative", False))
+            item["notes"] = str(metadata.get("notes", ""))
+            if isinstance(metadata.get("annotation"), dict):
+                item["annotation"] = dict(metadata["annotation"])
+            if metadata.get("split") in DATASET_SPLITS:
+                split = str(metadata["split"])
+                item["split"] = split
     existing_mask, existing_split, existing_mask_path = (
         find_existing_mask(
             path,
             dataset_dir,
+            stem=dataset_stem,
             cable_count=cable_count,
             preferred_split=split,
             search_other_splits=search_other_splits,
@@ -160,30 +207,55 @@ def make_frame_item(
 def find_existing_mask(
     image_path,
     dataset_dir,
-    cable_count=1,
+    cable_count=2,
     preferred_split=None,
     search_other_splits=True,
+    stem=None,
 ):
-    stem = sanitize_stem(Path(image_path).stem)
+    stem = sanitize_stem(stem or Path(image_path).stem)
     preferred_split = str(preferred_split or "").strip().lower()
-    splits = [preferred_split] if preferred_split in ("train", "val") else []
+    splits = [preferred_split] if preferred_split in DATASET_SPLITS else []
     if search_other_splits:
-        splits.extend(split for split in ("train", "val") if split not in splits)
+        splits.extend(split for split in DATASET_SPLITS if split not in splits)
     for split in splits:
         mask_path = Path(dataset_dir) / "masks" / split / f"{stem}.png"
         layer_path = layered_mask_path_from_mask_path(mask_path)
         if layer_path.exists():
             return read_layered_mask(layer_path, cable_count), split, mask_path
         if mask_path.exists():
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            if mask is not None:
-                return label_mask_to_bitmask(normalize_label_mask(mask, cable_count), cable_count), split, mask_path
-            raise ValueError(f"Could not read mask: {mask_path}")
+            raise ValueError(f"Flat preview mask exists without its required four-layer annotation: {layer_path}")
     return None, None, None
 
 
 def path_is_within(path, root):
     return Path(path).expanduser().resolve().is_relative_to(Path(root).expanduser().resolve())
+
+
+def dataset_stem_for_source(source_path, dataset_dir):
+    """Choose a stable dataset stem without aliasing unrelated source files."""
+    source = Path(source_path).expanduser().resolve()
+    root = Path(dataset_dir).expanduser().resolve()
+    base = sanitize_stem(source.stem)
+    if path_is_within(source, root / "images"):
+        return base
+    items = load_dataset_manifest(root).get("items", {})
+    existing = items.get(base)
+    if existing is None:
+        return base
+    stored_source = str(existing.get("source_path", "")).strip()
+    if stored_source:
+        try:
+            if Path(stored_source).expanduser().resolve() == source:
+                return base
+        except OSError:
+            pass
+    digest = hashlib.sha256(str(source).casefold().encode("utf-8")).hexdigest()[:8]
+    candidate = f"{base}_{digest}"
+    suffix = 2
+    while candidate in items:
+        candidate = f"{base}_{digest}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def item_mask_state(item):
@@ -200,6 +272,80 @@ def item_mask_state(item):
     return "MASK MISSING"
 
 
+def prediction_channels_to_draft(predicted_channels, target_shape):
+    """Convert the four independent network heads to the editable bitmask schema."""
+    channels = tuple(predicted_channels)
+    if len(channels) != ANNOTATION_CHANNEL_COUNT:
+        raise ValueError(
+            f"A prediction draft requires {ANNOTATION_CHANNEL_COUNT} channels; got {len(channels)}."
+        )
+    height, width = int(target_shape[0]), int(target_shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid draft target shape: {target_shape!r}")
+    draft = np.zeros((height, width), dtype=np.uint16)
+    for channel, predicted in enumerate(channels, start=1):
+        predicted = np.asarray(predicted, dtype=bool)
+        if predicted.ndim != 2:
+            raise ValueError(f"Prediction channel {channel} must be HxW; got {predicted.shape}.")
+        if predicted.shape != draft.shape:
+            predicted = cv2.resize(
+                predicted.astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        draft[predicted] |= label_bit(channel)
+
+    # Endpoint and crossing pixels are still cable pixels in the annotation
+    # schema. Preserve overlaps instead of collapsing the semantic heads.
+    semantic_bits = np.uint16(~int(label_bit(1)) & 0xFFFF)
+    draft[(draft & semantic_bits) != 0] |= label_bit(1)
+    return np.ascontiguousarray(draft)
+
+
+def compact_mask_state(mask):
+    mask = np.asarray(mask, dtype=np.uint16)
+    layers = np.stack(
+        [(mask & label_bit(label)) != 0 for label in range(1, ANNOTATION_CHANNEL_COUNT + 1)]
+    )
+    return mask.shape, np.packbits(layers.reshape(-1))
+
+
+def compact_item_edit_state(item):
+    return {
+        "mask": compact_mask_state(item["mask"]),
+        "verified": bool(item.get("verified", False)),
+        "negative": bool(item.get("negative", False)),
+        "annotation": json.loads(json.dumps(item.get("annotation") or {"origin": "manual"})),
+    }
+
+
+def restore_item_edit_state(item, state):
+    if isinstance(state, dict) and "mask" in state:
+        item["mask"] = restore_mask_state(state["mask"])
+        item["verified"] = bool(state.get("verified", False))
+        item["negative"] = bool(state.get("negative", False))
+        item["annotation"] = dict(state.get("annotation") or {"origin": "manual"})
+        return
+    # LEGACY COMPATIBILITY: undo entries created before metadata-aware edit
+    # states contain only the packed mask tuple.  Keep this read path until
+    # projects saved by that GUI generation no longer need to be reopened.
+    item["mask"] = restore_mask_state(state)
+
+
+def restore_mask_state(state):
+    shape, packed = state
+    height, width = int(shape[0]), int(shape[1])
+    layer_size = height * width
+    layers = np.unpackbits(
+        np.asarray(packed, dtype=np.uint8),
+        count=ANNOTATION_CHANNEL_COUNT * layer_size,
+    ).reshape(ANNOTATION_CHANNEL_COUNT, height, width)
+    mask = np.zeros((height, width), dtype=np.uint16)
+    for label, layer in enumerate(layers, start=1):
+        mask[layer != 0] |= label_bit(label)
+    return mask
+
+
 def normalize_label_mask(mask, cable_count):
     cable_count = max(1, int(cable_count))
     mask = np.asarray(mask, dtype=np.uint8)
@@ -207,17 +353,7 @@ def normalize_label_mask(mask, cable_count):
     max_label = max_label_value(cable_count)
     for label in range(1, max_label + 1):
         labels[mask == label] = label
-    if not np.any(labels) and np.any(mask > 127):
-        labels[mask > 127] = 1
     return labels
-
-
-def label_mask_to_bitmask(mask, cable_count):
-    labels = normalize_label_mask(mask, cable_count)
-    bitmask = np.zeros(labels.shape[:2], dtype=np.uint16)
-    for label in range(1, max_label_value(cable_count) + 1):
-        bitmask[labels == label] |= label_bit(label)
-    return bitmask
 
 
 def bitmask_to_label_mask(mask, cable_count):
@@ -238,27 +374,39 @@ def label_pixels(mask, label, cable_count, multilabel=False):
 
 
 def read_layered_mask(path, cable_count):
-    payload = np.load(str(path))
-    if "mask" not in payload:
-        raise ValueError(f"Layered mask file missing 'mask' array: {path}")
-    mask = np.asarray(payload["mask"], dtype=np.uint16)
+    with np.load(str(path), allow_pickle=False) as payload:
+        required = {"mask", "cable_count", "annotation_schema_version"}
+        missing = sorted(required - set(payload.files))
+        if missing:
+            raise ValueError(f"Layered mask file missing {missing}: {path}")
+        mask = np.asarray(payload["mask"], dtype=np.uint16)
+        stored_cable_count = int(np.asarray(payload["cable_count"]).item())
+        annotation_version = int(np.asarray(payload["annotation_schema_version"]).item())
     if mask.ndim != 2:
         raise ValueError(f"Layered mask must be HxW: {path}")
-    valid_bits = np.uint16((1 << max_label_value(cable_count)) - 1)
+    if stored_cable_count != int(cable_count):
+        raise ValueError(f"Layered mask cable_count={stored_cable_count}, expected {cable_count}: {path}")
+    if annotation_version != ANNOTATION_SCHEMA_VERSION:
+        raise ValueError(
+            f"Layered mask annotation schema={annotation_version}, expected {ANNOTATION_SCHEMA_VERSION}: {path}"
+        )
+    valid_bits = np.uint16((1 << ANNOTATION_CHANNEL_COUNT) - 1)
     return np.ascontiguousarray(mask & valid_bits, dtype=np.uint16)
 
 
 def label_display_name(label, cable_count):
     label = int(label)
-    cable_count = max(1, int(cable_count))
     if label <= 0:
         return "background"
-    if label == crossing_label_value(cable_count):
-        return "crossing"
-    if label <= cable_count:
-        return "cable" if label == 1 else f"cable_body_layer{label}"
-    endpoint_index = label - cable_count
-    return f"endpoints_{endpoint_index}"
+    if label == 1:
+        return "generic cable"
+    if label == endpoint_label_value(1):
+        return "cable 1 endpoints (both ends)"
+    if label == endpoint_label_value(2):
+        return "cable 2 endpoints (both ends)"
+    if label == crossing_label_value():
+        return "RGB crossing proposal"
+    return f"unknown label {label}"
 
 
 def sanitize_stem(stem):
@@ -269,7 +417,11 @@ def sanitize_stem(stem):
 def label_paths_for_item(item, dataset_dir, index=0):
     split = item.get("split") or "train"
     source_path = item.get("path")
-    stem = sanitize_stem(Path(source_path).stem) if source_path else f"frame_{int(index):04d}"
+    stem = sanitize_stem(
+        item.get("dataset_stem")
+        or (Path(source_path).stem if source_path else f"frame_{int(index):04d}")
+    )
+    item["dataset_stem"] = stem
     dataset_dir = Path(dataset_dir)
     return (
         dataset_dir / "images" / split / f"{stem}.png",
@@ -289,30 +441,79 @@ def layered_mask_path_from_mask_path(mask_path):
 
 def save_label_pair(item, dataset_dir, index=0):
     split = str(item.get("split") or "train").strip().lower()
-    if split not in ("train", "val"):
+    if split not in DATASET_SPLITS:
         raise ValueError(f"Unsupported dataset split: {split!r}")
+    if int(item.get("cable_count", 2)) != 2:
+        raise ValueError("Cannot save an annotation that does not use exactly two endpoint sets.")
     item["split"] = split
+    dataset_dir = Path(dataset_dir)
     image_path, mask_path = label_paths_for_item(item, dataset_dir, index=index)
     layer_path = layered_mask_path_from_mask_path(mask_path)
     image_path.parent.mkdir(parents=True, exist_ok=True)
     mask_path.parent.mkdir(parents=True, exist_ok=True)
     layer_path.parent.mkdir(parents=True, exist_ok=True)
     mask = np.asarray(item["mask"], dtype=np.uint16)
-    preview_mask = bitmask_to_label_mask(mask, max(1, int(item.get("cable_count", 2))))
-    if not cv2.imwrite(str(image_path), np.asarray(item["bgr"], dtype=np.uint8)):
-        raise IOError(f"Could not write image: {image_path}")
-    if not cv2.imwrite(str(mask_path), preview_mask):
-        raise IOError(f"Could not write mask: {mask_path}")
-    np.savez_compressed(str(layer_path), mask=mask, cable_count=max(1, int(item.get("cable_count", 2))))
-    other_split = "val" if split == "train" else "train"
-    other_image = dataset_dir / "images" / other_split / image_path.name
-    other_mask = dataset_dir / "masks" / other_split / mask_path.name
-    other_layer = dataset_dir / "masks_layers" / other_split / layer_path.name
-    for duplicate_path in (other_image, other_mask, other_layer):
-        duplicate_path.unlink(missing_ok=True)
+    preview_mask = bitmask_to_label_mask(mask, 2)
+    annotation = json.loads(json.dumps(item.get("annotation") or {"origin": "manual"}))
+    session_id = sanitize_identifier(item.get("session_id") or "session")
+    item["session_id"] = session_id
+    manifest = load_dataset_manifest(dataset_dir)
+    stored_session = manifest.get("sessions", {}).get(session_id, {})
+    stored_split = stored_session.get("split")
+    if stored_split is not None and stored_split != split:
+        raise ValueError(
+            f"Session {session_id!r} is assigned to {stored_split!r}, not {split!r}. "
+            "Move the whole session before saving."
+        )
+    existing_item = manifest.get("items", {}).get(image_path.stem)
+    if existing_item is not None and sanitize_identifier(existing_item.get("session_id")) != session_id:
+        raise ValueError(
+            f"Dataset stem {image_path.stem!r} already belongs to session "
+            f"{existing_item.get('session_id')!r}; refusing to overwrite it from {session_id!r}."
+        )
+
+    temporary_paths = (
+        image_path.with_suffix(image_path.suffix + ".tmp"),
+        mask_path.with_suffix(mask_path.suffix + ".tmp"),
+        layer_path.with_suffix(layer_path.suffix + ".tmp"),
+    )
+    try:
+        for array, temporary, description in (
+            (np.asarray(item["bgr"], dtype=np.uint8), temporary_paths[0], "image"),
+            (preview_mask, temporary_paths[1], "mask"),
+        ):
+            success, encoded = cv2.imencode(".png", array)
+            if not success:
+                raise IOError(f"Could not encode {description} PNG for {image_path.stem}")
+            temporary.write_bytes(encoded.tobytes())
+        with temporary_paths[2].open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                mask=mask,
+                cable_count=2,
+                annotation_schema_version=ANNOTATION_SCHEMA_VERSION,
+            )
+        for temporary, target in zip(temporary_paths, (image_path, mask_path, layer_path)):
+            temporary.replace(target)
+    finally:
+        for temporary in temporary_paths:
+            temporary.unlink(missing_ok=True)
+    register_dataset_item(
+        dataset_dir,
+        image_path.stem,
+        session_id=session_id,
+        split=split,
+        verified=bool(item.get("verified", False)),
+        negative=bool(item.get("negative", False)),
+        source_path=item.get("path"),
+        notes=item.get("notes", ""),
+        annotation=annotation,
+    )
     item["saved_image_path"] = str(image_path)
     item["saved_mask_path"] = str(mask_path)
     item["saved_layer_path"] = str(layer_path)
+    item.setdefault("undo_stack", []).clear()
+    item.setdefault("redo_stack", []).clear()
     item["dirty"] = False
     return image_path, mask_path
 
@@ -320,35 +521,36 @@ def save_label_pair(item, dataset_dir, index=0):
 def count_labeled_pairs(dataset_dir):
     dataset_dir = Path(dataset_dir)
     counts = {}
-    for split in ("train", "val"):
+    for split in DATASET_SPLITS:
         counts[split] = len(dataset_image_mask_pairs(dataset_dir, split))
     return counts
 
 
-def dataset_image_mask_pairs(dataset_dir, split):
+def dataset_image_mask_pairs(dataset_dir, split, verified_only=False):
     image_dir = Path(dataset_dir) / "images" / split
     mask_dir = Path(dataset_dir) / "masks" / split
     if not image_dir.exists() or not mask_dir.exists():
         return []
     mask_by_stem = {path.stem: path for path in mask_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS}
     pairs = []
+    items = load_dataset_manifest(dataset_dir).get("items", {}) if bool(verified_only) else {}
     for image_path in sorted(image_dir.iterdir()):
         if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
         mask_path = mask_by_stem.get(image_path.stem)
-        if mask_path is not None:
+        if mask_path is not None and (
+            not bool(verified_only)
+            or bool(items.get(image_path.stem, {}).get("verified", False))
+        ):
             pairs.append((image_path, mask_path))
     return pairs
 
 
 def read_dataset_mask(mask_path, cable_count):
     layer_path = layered_mask_path_from_mask_path(mask_path)
-    if layer_path.exists():
-        return read_layered_mask(layer_path, cable_count), True
-    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    if mask is None:
-        raise ValueError(f"Could not read mask: {mask_path}")
-    return normalize_label_mask(mask, cable_count), False
+    if not layer_path.exists():
+        raise FileNotFoundError(f"Required four-layer annotation is missing: {layer_path}")
+    return read_layered_mask(layer_path, cable_count), True
 
 
 def binary_mask_metrics(predicted_mask, target_mask):
@@ -371,36 +573,51 @@ def binary_mask_metrics(predicted_mask, target_mask):
     }
 
 
+def frame_signature(bgr, width=32, height=18):
+    gray = cv2.cvtColor(np.asarray(bgr, dtype=np.uint8), cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (int(width), int(height)), interpolation=cv2.INTER_AREA)
+    return small.astype(np.float32) / 255.0
+
+
+def frame_signature_distance(left, right):
+    return float(np.mean(np.abs(np.asarray(left, dtype=np.float32) - np.asarray(right, dtype=np.float32))))
+
+
+def dataset_metadata_counts(dataset_dir):
+    manifest = load_dataset_manifest(dataset_dir)
+    result = {
+        split: {"items": 0, "verified": 0, "negative": 0, "sessions": set()}
+        for split in DATASET_SPLITS
+    }
+    for item in manifest.get("items", {}).values():
+        split = str(item.get("split", ""))
+        if split not in result:
+            continue
+        result[split]["items"] += 1
+        result[split]["verified"] += int(bool(item.get("verified", False)))
+        result[split]["negative"] += int(bool(item.get("negative", False)))
+        result[split]["sessions"].add(str(item.get("session_id", "")))
+    for split in result:
+        result[split]["sessions"] = len(result[split]["sessions"] - {""})
+    return result, session_split_conflicts(manifest)
+
+
 def body_label_mask(mask, cable_count, multilabel=False):
-    cable_count = max(1, int(cable_count))
     labels = np.asarray(mask)
-    body = np.zeros(labels.shape[:2], dtype=bool)
-    for label in range(1, cable_count + 1):
-        body |= label_pixels(labels, label, cable_count, multilabel=multilabel)
-    if not bool(multilabel) and not np.any(body) and np.any(labels > 127):
-        body = labels > 127
-    return body
-
-
-def endpoint_label_mask(mask, cable_count, multilabel=False):
-    cable_count = max(1, int(cable_count))
-    labels = np.asarray(mask)
-    endpoint = np.zeros(labels.shape[:2], dtype=bool)
-    for label in range(1, cable_count + 1):
-        endpoint |= label_pixels(labels, endpoint_label_value(label, cable_count), cable_count, multilabel=multilabel)
-    return endpoint
+    return label_pixels(labels, 1, cable_count, multilabel=multilabel)
 
 
 def crossing_label_mask(mask, cable_count, multilabel=False):
     return label_pixels(
         np.asarray(mask),
-        crossing_label_value(cable_count),
+        crossing_label_value(),
         cable_count,
         multilabel=multilabel,
     )
 
 
 def apply_binary_cleanup(mask, params):
+    """Return the cleaned uint8 mask and the number of retained components."""
     mask = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     if params["open_kernel"] > 1:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params["open_kernel"], params["open_kernel"]))
@@ -408,7 +625,8 @@ def apply_binary_cleanup(mask, params):
     if params["close_kernel"] > 1:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params["close_kernel"], params["close_kernel"]))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return remove_small_components(mask, min_area=params["min_area_px"])
+    cleaned, component_count = remove_small_components(mask, min_area=params["min_area_px"])
+    return cleaned, int(component_count)
 
 
 def safe_int(var, default, min_value=None, max_value=None):
@@ -511,6 +729,8 @@ def toml_scalar(value):
         return str(int(value))
     if isinstance(value, float):
         return f"{float(value):.8g}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_scalar(item) for item in value) + "]"
     return json.dumps(str(value))
 
 
@@ -522,11 +742,25 @@ class PidNetTrainingApp:
     def __init__(self, root, args):
         self.root = root
         self.args = args
-        self.root.title("PIDNet-S Cable Segmenter Training")
-        self.root.geometry("1720x980")
+        self.root.title("Cable Label Studio - PIDNet")
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = max(800, min(1840, screen_width - 40))
+        window_height = max(640, min(1080, screen_height - 80))
+        self.root.geometry(f"{window_width}x{window_height}")
         self.live_config = load_toml_config(args.config)
         pidnet_config = self.live_config.get("pidnet", {})
         detector_config = self.live_config.get("detector", {})
+        crossing_config = self.live_config.get("crossing", {})
+        body_threshold = float(pidnet_config.get("threshold", 0.50))
+        endpoint_thresholds = tuple(
+            float(value)
+            for value in pidnet_config.get("endpoint_thresholds", (body_threshold, body_threshold))
+        )
+        if len(endpoint_thresholds) != len(ENDPOINT_CHANNELS):
+            raise ValueError(
+                f"pidnet.endpoint_thresholds must contain {len(ENDPOINT_CHANNELS)} values."
+            )
 
         self.frames = []
         self.selected_frame_idx = -1
@@ -536,8 +770,16 @@ class PidNetTrainingApp:
         self.cable_count_var = tk.IntVar(value=2)
         self.mode_var = tk.StringVar(value="paint_1")
         self.split_var = tk.StringVar(value="train")
+        self.session_var = tk.StringVar(value=new_session_id())
+        self.verified_var = tk.BooleanVar(value=False)
+        self.verification_action_var = tk.StringVar(value="Human Verify")
+        self.notes_var = tk.StringVar(value="")
+        self.pending_capture_session = True
         self.brush_radius_var = tk.IntVar(value=4)
         self.draw_when_zoomed_var = tk.BooleanVar(value=False)
+        self.burst_count_var = tk.IntVar(value=5)
+        self.burst_interval_ms_var = tk.IntVar(value=250)
+        self.burst_remaining = 0
         self.epochs_var = tk.IntVar(value=int(args.epochs))
         self.batch_var = tk.IntVar(value=int(args.batch_size))
         self.imgsz_var = tk.StringVar(value=str(args.imgsz))
@@ -545,13 +787,43 @@ class PidNetTrainingApp:
         self.lr_var = tk.DoubleVar(value=float(args.lr))
         self.weight_decay_var = tk.DoubleVar(value=float(args.weight_decay))
         self.num_workers_var = tk.IntVar(value=int(args.num_workers))
+        self.prefetch_factor_var = tk.IntVar(value=int(args.prefetch_factor))
+        self.endpoint_weight_var = tk.DoubleVar(value=float(args.endpoint_weight))
         self.boundary_weight_var = tk.DoubleVar(value=float(args.boundary_weight))
         self.crossing_weight_var = tk.DoubleVar(value=float(args.crossing_weight))
+        self.focal_gamma_var = tk.DoubleVar(value=float(args.focal_gamma))
+        self.dice_weight_var = tk.DoubleVar(value=float(args.dice_weight))
+        self.ema_decay_var = tk.DoubleVar(value=float(args.ema_decay))
+        self.grad_clip_var = tk.DoubleVar(value=float(args.grad_clip))
+        self.early_stop_var = tk.IntVar(value=int(args.early_stop))
+        self.min_delta_var = tk.DoubleVar(value=float(args.min_delta))
+        self.seed_var = tk.IntVar(value=int(args.seed))
         self.amp_var = tk.BooleanVar(value=bool(args.amp))
+        self.channels_last_var = tk.BooleanVar(value=bool(args.channels_last))
+        self.tf32_var = tk.BooleanVar(value=bool(args.tf32))
+        self.compile_var = tk.BooleanVar(value=bool(args.compile))
+        self.gpu_augment_var = tk.BooleanVar(value=bool(args.gpu_augment))
+        self.deterministic_var = tk.BooleanVar(value=bool(args.deterministic))
+        self.resume_var = tk.BooleanVar(value=False)
+        self.verified_only_var = tk.BooleanVar(value=True)
+        self.evaluate_test_var = tk.BooleanVar(value=False)
         self.device_var = tk.StringVar(value=str(args.device or "cuda"))
-        self.test_threshold_var = tk.DoubleVar(value=float(pidnet_config.get("threshold", 0.50)))
-        self.threshold_text_var = tk.StringVar(value=f"{float(pidnet_config.get('threshold', 0.50)):.2f}")
+        self.test_threshold_var = tk.DoubleVar(value=body_threshold)
+        self.endpoint_threshold_vars = tuple(
+            tk.DoubleVar(value=value) for value in endpoint_thresholds
+        )
+        self.crossing_threshold_var = tk.DoubleVar(
+            value=float(crossing_config.get("threshold", body_threshold))
+        )
+        self.threshold_text_var = tk.StringVar(value=f"{body_threshold:.2f}")
         self.live_test_var = tk.BooleanVar(value=False)
+        self.prediction_channel_var = tk.StringVar(value="combined")
+        self.label_visibility_vars = {
+            "cable": tk.BooleanVar(value=True),
+            "endpoint1": tk.BooleanVar(value=True),
+            "endpoint2": tk.BooleanVar(value=True),
+            "crossing": tk.BooleanVar(value=True),
+        }
         self.morph_kernel_var = tk.IntVar(value=5)
         self.morph_iterations_var = tk.IntVar(value=1)
         self.config_var = tk.StringVar(value=str(Path(args.config)))
@@ -560,7 +832,9 @@ class PidNetTrainingApp:
         self.detector_close_kernel_var = tk.IntVar(value=int(detector_config.get("close_kernel", 5)))
         self.dataset_var = tk.StringVar(value=str(Path(args.dataset)))
         self.output_var = tk.StringVar(value=str(Path(args.output)))
+        self.init_checkpoint_var = tk.StringVar(value=str(getattr(args, "init_checkpoint", None) or ""))
         self.status_var = tk.StringVar(value="Open or capture frames, paint cable masks, save labels, then train and test PIDNet.")
+        self.draft_status_var = tk.StringVar(value="No editable model draft on the selected frame.")
         self.train_progress_var = tk.DoubleVar(value=0.0)
         self.train_summary_var = tk.StringVar(value="No training run active.")
 
@@ -578,6 +852,7 @@ class PidNetTrainingApp:
         self.runtime = None
         self.left_image = None
         self.train_process = None
+        self.training_termination = None
         self.output_queue = queue.Queue()
         self.segmenter = None
         self.segmenter_key = None
@@ -588,6 +863,7 @@ class PidNetTrainingApp:
         self.prediction_summary = ""
         self.live_test_last_time = 0.0
         self.live_test_interval_s = 0.10
+        self.checkpoint_hash_cache = {}
 
         self._build_ui()
         self._bind_keys()
@@ -600,205 +876,96 @@ class PidNetTrainingApp:
         self.poll_training_output()
 
     def _build_ui(self):
-        instructions = tk.Frame(self.root, padx=10, pady=8, bg="#f4f4f4")
-        instructions.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(
-            instructions,
-            text="PIDNet-S cable mask training",
-            font=("TkDefaultFont", 13, "bold"),
-            bg="#f4f4f4",
-            anchor="w",
-        ).pack(side=tk.TOP, fill=tk.X)
-        tk.Label(
-            instructions,
-            text="Paint cable, endpoint, and crossing masks, train at 1280x720, then test the checkpoint before using it live.",
-            bg="#f4f4f4",
-            anchor="w",
-            justify=tk.LEFT,
-        ).pack(side=tk.TOP, fill=tk.X)
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        self.root.configure(bg="#e9edf2")
+        style.configure("App.TFrame", background="#e9edf2")
+        style.configure("Header.TFrame", background="#172230")
+        style.configure("HeaderTitle.TLabel", background="#172230", foreground="#ffffff", font=("Segoe UI", 15, "bold"))
+        style.configure("HeaderSub.TLabel", background="#172230", foreground="#aebdca", font=("Segoe UI", 9))
+        style.configure("Panel.TFrame", background="#f7f9fb")
+        style.configure("PanelTitle.TLabel", background="#f7f9fb", foreground="#263747", font=("Segoe UI", 10, "bold"))
+        style.configure("Status.TLabel", background="#dfe6ed", foreground="#243342", padding=(8, 5))
+        style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"), foreground="#ffffff", background="#1677c8")
+        style.map("Accent.TButton", background=[("active", "#0d65ad"), ("pressed", "#09558f")])
+        style.configure("Danger.TButton", foreground="#a12020")
+        style.configure("TNotebook", background="#e9edf2", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(12, 7), font=("Segoe UI", 9))
+        style.map("TNotebook.Tab", background=[("selected", "#ffffff")], foreground=[("selected", "#165f9b")])
+        style.configure("TLabelframe", background="#ffffff")
+        style.configure("TLabelframe.Label", background="#ffffff", foreground="#30465a", font=("Segoe UI", 9, "bold"))
 
-        toolbar = tk.Frame(self.root, padx=8, pady=6)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
-        tk.Button(toolbar, text="Open Images", command=self.open_images).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Capture ZED", command=self.capture_current_frame).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Prev", command=self.previous_frame).pack(side=tk.LEFT, padx=3)
-        tk.Button(toolbar, text="Next", command=self.next_frame).pack(side=tk.LEFT, padx=3)
+        def section(parent, title, row, pady=(0, 8)):
+            frame = ttk.LabelFrame(parent, text=title, padding=9)
+            frame.grid(row=row, column=0, sticky="ew", pady=pady)
+            frame.columnconfigure(1, weight=1)
+            return frame
 
-        tk.Label(toolbar, text="  Paint").pack(side=tk.LEFT)
-        self.paint_mode_frame = tk.Frame(toolbar)
-        self.paint_mode_frame.pack(side=tk.LEFT)
-        self.rebuild_paint_mode_buttons()
-
-        label_bar = tk.Frame(self.root, padx=8, pady=4)
-        label_bar.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(label_bar, text="Endpoint groups").pack(side=tk.LEFT)
-        tk.Spinbox(label_bar, from_=2, to=2, width=3, textvariable=self.cable_count_var, state="readonly").pack(side=tk.LEFT, padx=3)
-
-        tk.Label(label_bar, text="  Split").pack(side=tk.LEFT)
-        for text, value in (("Train", "train"), ("Val", "val")):
-            tk.Radiobutton(label_bar, text=text, variable=self.split_var, value=value, command=self.set_active_split).pack(side=tk.LEFT)
-
-        tk.Label(label_bar, text="  Brush").pack(side=tk.LEFT)
-        tk.Scale(label_bar, from_=1, to=40, orient=tk.HORIZONTAL, variable=self.brush_radius_var, length=110).pack(side=tk.LEFT)
-        tk.Checkbutton(label_bar, text="Draw while zoomed", variable=self.draw_when_zoomed_var).pack(side=tk.LEFT, padx=8)
-        tk.Button(label_bar, text="Save Current Mask", command=self.save_current_label).pack(side=tk.LEFT, padx=3)
-        tk.Button(label_bar, text="Save All Painted Masks", command=self.save_all_labels).pack(side=tk.LEFT, padx=3)
-        tk.Button(label_bar, text="Clear Mask", command=self.clear_current_mask).pack(side=tk.LEFT, padx=3)
-
-        mask_tools_bar = tk.Frame(self.root, padx=8, pady=4)
-        mask_tools_bar.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(mask_tools_bar, text="Mask cleanup").pack(side=tk.LEFT)
-        tk.Label(mask_tools_bar, text="Kernel").pack(side=tk.LEFT, padx=(8, 0))
-        tk.Spinbox(mask_tools_bar, from_=1, to=41, increment=2, width=4, textvariable=self.morph_kernel_var).pack(side=tk.LEFT, padx=3)
-        tk.Label(mask_tools_bar, text="Iterations").pack(side=tk.LEFT)
-        tk.Spinbox(mask_tools_bar, from_=1, to=8, width=3, textvariable=self.morph_iterations_var).pack(side=tk.LEFT, padx=3)
-        tk.Button(mask_tools_bar, text="Label Open", command=lambda: self.apply_mask_morph("open")).pack(side=tk.LEFT, padx=3)
-        tk.Button(mask_tools_bar, text="Label Close", command=lambda: self.apply_mask_morph("close")).pack(side=tk.LEFT, padx=3)
-        tk.Button(mask_tools_bar, text="Reset View", command=self.reset_view).pack(side=tk.LEFT, padx=(12, 3))
-
-        paths = tk.Frame(self.root, padx=8, pady=4)
-        paths.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(paths, text="Dataset").pack(side=tk.LEFT)
-        tk.Entry(paths, textvariable=self.dataset_var, width=46).pack(side=tk.LEFT, padx=3)
-        tk.Button(paths, text="Browse", command=self.choose_dataset_dir).pack(side=tk.LEFT, padx=3)
-        tk.Label(paths, text="Cable+Endpoint model").pack(side=tk.LEFT, padx=(12, 0))
-        tk.Entry(paths, textvariable=self.output_var, width=40).pack(side=tk.LEFT, padx=3)
-        tk.Button(paths, text="Browse", command=self.choose_output_path).pack(side=tk.LEFT, padx=3)
-        tk.Button(paths, text="Load Model", command=self.load_model_from_button).pack(side=tk.LEFT, padx=3)
-        tk.Label(paths, textvariable=self.model_status_var, fg="#444").pack(side=tk.LEFT, padx=8)
-
-        review_bar = tk.Frame(self.root, padx=8, pady=4)
-        review_bar.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(review_bar, text="Review dataset").pack(side=tk.LEFT)
-        tk.Button(review_bar, text="Open Train Folder", command=lambda: self.open_dataset_split("train")).pack(side=tk.LEFT, padx=3)
-        tk.Button(review_bar, text="Open Val Folder", command=lambda: self.open_dataset_split("val")).pack(side=tk.LEFT, padx=3)
-        tk.Button(review_bar, text="Open Captures", command=self.open_capture_folder).pack(side=tk.LEFT, padx=3)
-        tk.Button(review_bar, text="Delete Current Item", command=self.delete_current_item, fg="#a00000").pack(side=tk.LEFT, padx=(14, 3))
-        tk.Label(
-            review_bar,
-            text="Train/Val loads every image, including images with no mask.",
-            fg="#555",
-        ).pack(side=tk.LEFT, padx=10)
-
-        train_bar = tk.Frame(self.root, padx=8, pady=4)
-        train_bar.pack(side=tk.TOP, fill=tk.X)
-        for label, var, width in (
-            ("Epochs", self.epochs_var, 6),
-            ("Batch", self.batch_var, 5),
-            ("Channels", self.base_channels_var, 5),
-        ):
-            tk.Label(train_bar, text=label).pack(side=tk.LEFT)
-            tk.Spinbox(train_bar, from_=1, to=4096, width=width, textvariable=var, command=self.refresh_command_text).pack(side=tk.LEFT, padx=3)
-        tk.Label(train_bar, text="Target: cable + endpoints + crossing").pack(side=tk.LEFT, padx=(8, 8))
-        tk.Label(train_bar, text="Image WxH").pack(side=tk.LEFT)
-        image_entry = tk.Entry(train_bar, textvariable=self.imgsz_var, width=10)
-        image_entry.pack(side=tk.LEFT, padx=3)
-        image_entry.bind("<KeyRelease>", lambda _event: self.refresh_command_text())
-        tk.Label(train_bar, text="Device").pack(side=tk.LEFT)
-        tk.Entry(train_bar, textvariable=self.device_var, width=8).pack(side=tk.LEFT, padx=3)
-        tk.Button(train_bar, text="Train PIDNet-S on CUDA", command=self.start_training).pack(side=tk.LEFT, padx=8)
-        tk.Button(train_bar, text="Stop Training", command=self.stop_training).pack(side=tk.LEFT, padx=3)
-        tk.Button(train_bar, text="Check Dataset", command=self.check_dataset_health).pack(side=tk.LEFT, padx=8)
-
-        tune_bar = tk.Frame(self.root, padx=8, pady=4)
-        tune_bar.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(tune_bar, text="Tune").pack(side=tk.LEFT)
-        for label, var, width in (
-            ("LR", self.lr_var, 9),
-            ("Weight Decay", self.weight_decay_var, 9),
-            ("Boundary", self.boundary_weight_var, 6),
-            ("Crossing", self.crossing_weight_var, 6),
-        ):
-            tk.Label(tune_bar, text=label).pack(side=tk.LEFT, padx=(10, 0))
-            entry = tk.Entry(tune_bar, textvariable=var, width=width)
-            entry.pack(side=tk.LEFT, padx=3)
+        def field(parent, row, label, variable, width=14, column=0):
+            base = column * 2
+            ttk.Label(parent, text=label).grid(row=row, column=base, sticky="w", padx=(0, 6), pady=3)
+            entry = ttk.Entry(parent, textvariable=variable, width=width)
+            entry.grid(row=row, column=base + 1, sticky="ew", pady=3, padx=(0, 8))
             entry.bind("<KeyRelease>", lambda _event: self.refresh_command_text())
-        tk.Label(tune_bar, text="Workers").pack(side=tk.LEFT, padx=(10, 0))
-        tk.Spinbox(tune_bar, from_=0, to=32, width=4, textvariable=self.num_workers_var, command=self.refresh_command_text).pack(side=tk.LEFT, padx=3)
-        tk.Checkbutton(tune_bar, text="AMP", variable=self.amp_var, command=self.refresh_command_text).pack(side=tk.LEFT, padx=8)
-        tk.Button(tune_bar, text="Save Params", command=self.save_pidnet_params).pack(side=tk.LEFT, padx=3)
-        tk.Button(tune_bar, text="Load Params", command=self.load_pidnet_params).pack(side=tk.LEFT, padx=3)
+            parent.columnconfigure(base + 1, weight=1)
+            return entry
 
-        progress_bar = tk.Frame(self.root, padx=8, pady=2)
-        progress_bar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Progressbar(progress_bar, variable=self.train_progress_var, maximum=100.0, length=260).pack(side=tk.LEFT, padx=3)
-        tk.Label(progress_bar, textvariable=self.train_summary_var, anchor="w").pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(14, 9))
+        header.pack(side=tk.TOP, fill=tk.X)
+        title_block = ttk.Frame(header, style="Header.TFrame")
+        title_block.pack(side=tk.LEFT)
+        ttk.Label(title_block, text="Cable Label Studio", style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            title_block,
+            text="Four-layer PIDNet annotation and training",
+            style="HeaderSub.TLabel",
+        ).pack(anchor="w")
+        header_actions = ttk.Frame(header, style="Header.TFrame")
+        header_actions.pack(side=tk.RIGHT)
+        ttk.Button(header_actions, text="Open Images", command=self.open_images).pack(side=tk.LEFT, padx=3)
+        ttk.Button(header_actions, text="Capture", command=self.capture_current_frame, style="Accent.TButton").pack(side=tk.LEFT, padx=3)
+        ttk.Separator(header_actions, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
+        ttk.Button(header_actions, text="Previous", command=self.previous_frame).pack(side=tk.LEFT, padx=2)
+        ttk.Button(header_actions, text="Next", command=self.next_frame).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(header_actions, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
+        ttk.Button(header_actions, text="Undo", command=self.undo_mask).pack(side=tk.LEFT, padx=2)
+        ttk.Button(header_actions, text="Redo", command=self.redo_mask).pack(side=tk.LEFT, padx=2)
+        ttk.Button(header_actions, text="Save", command=self.save_current_label, style="Accent.TButton").pack(side=tk.LEFT, padx=(7, 2))
 
-        test_bar = tk.Frame(self.root, padx=8, pady=4)
-        test_bar.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(test_bar, text="Test threshold").pack(side=tk.LEFT)
-        tk.Scale(
-            test_bar,
-            from_=0.05,
-            to=0.95,
-            resolution=0.01,
-            orient=tk.HORIZONTAL,
-            variable=self.test_threshold_var,
-            length=150,
-            command=self.on_threshold_change,
-        ).pack(side=tk.LEFT, padx=3)
-        tk.Label(test_bar, textvariable=self.threshold_text_var, width=5).pack(side=tk.LEFT)
-        tk.Button(test_bar, text="Test Current / Live Preview", command=self.test_current_frame).pack(side=tk.LEFT, padx=8)
-        tk.Checkbutton(
-            test_bar,
-            text="Live Segmentation",
-            variable=self.live_test_var,
-            command=self.toggle_live_segmentation,
-        ).pack(side=tk.LEFT, padx=3)
-        tk.Button(test_bar, text="Test Val Set", command=lambda: self.test_dataset_split("val")).pack(side=tk.LEFT, padx=3)
-        tk.Button(test_bar, text="Test Train Set", command=lambda: self.test_dataset_split("train")).pack(side=tk.LEFT, padx=3)
-        tk.Button(test_bar, text="Clear Test View", command=self.clear_prediction).pack(side=tk.LEFT, padx=3)
+        footer = ttk.Frame(self.root, style="App.TFrame")
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(footer, textvariable=self.status_var, style="Status.TLabel", anchor="w").pack(fill=tk.X)
+        ttk.Label(
+            footer,
+            text="Shortcuts: 1/2/3/X layer | E erase | D prediction draft | Ctrl+Z/Y undo/redo | S save | mouse wheel zoom | right-drag pan",
+            style="Status.TLabel",
+            anchor="w",
+            foreground="#5c6c79",
+        ).pack(fill=tk.X)
 
-        cleanup_bar = tk.Frame(self.root, padx=8, pady=4)
-        cleanup_bar.pack(side=tk.TOP, fill=tk.X)
-        tk.Label(cleanup_bar, text="Live PIDNet cleanup").pack(side=tk.LEFT)
-        tk.Label(cleanup_bar, text="Min area").pack(side=tk.LEFT, padx=(10, 0))
-        tk.Spinbox(
-            cleanup_bar,
-            from_=0,
-            to=100000,
-            width=7,
-            textvariable=self.detector_min_area_var,
-            command=self.refresh,
-        ).pack(side=tk.LEFT, padx=3)
-        tk.Label(cleanup_bar, text="Open").pack(side=tk.LEFT, padx=(10, 0))
-        tk.Spinbox(
-            cleanup_bar,
-            from_=1,
-            to=99,
-            increment=2,
-            width=4,
-            textvariable=self.detector_open_kernel_var,
-            command=self.on_live_cleanup_change,
-        ).pack(side=tk.LEFT, padx=3)
-        tk.Label(cleanup_bar, text="Close").pack(side=tk.LEFT, padx=(10, 0))
-        tk.Spinbox(
-            cleanup_bar,
-            from_=1,
-            to=99,
-            increment=2,
-            width=4,
-            textvariable=self.detector_close_kernel_var,
-            command=self.on_live_cleanup_change,
-        ).pack(side=tk.LEFT, padx=3)
-        tk.Button(cleanup_bar, text="Preview Cleanup", command=self.refresh).pack(side=tk.LEFT, padx=8)
-        tk.Button(cleanup_bar, text="Save to config.toml", command=self.save_live_cleanup_to_config).pack(side=tk.LEFT, padx=3)
-        tk.Label(cleanup_bar, text="Config").pack(side=tk.LEFT, padx=(12, 0))
-        tk.Entry(cleanup_bar, textvariable=self.config_var, width=44).pack(side=tk.LEFT, padx=3)
-        tk.Button(cleanup_bar, text="Browse", command=self.choose_config_path).pack(side=tk.LEFT, padx=3)
+        main = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        workspace = ttk.Frame(main, style="Panel.TFrame", padding=8)
+        sidebar = ttk.Frame(main, style="App.TFrame", width=500)
+        main.add(workspace, weight=5)
+        main.add(sidebar, weight=2)
 
-        body = tk.Frame(self.root)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=4)
-        body.columnconfigure(0, weight=2)
-        body.columnconfigure(1, weight=2)
-        body.columnconfigure(2, weight=1)
-        body.rowconfigure(1, weight=1)
-        titles = ["Captured RGB image", "Painted mask / model test"]
+        workspace.columnconfigure(0, weight=1)
+        workspace.columnconfigure(1, weight=1)
+        workspace.rowconfigure(1, weight=1)
+        ttk.Label(workspace, text="EDITABLE SOURCE IMAGE", style="PanelTitle.TLabel", anchor="w").grid(row=0, column=0, sticky="ew", padx=(2, 5), pady=(0, 6))
+        ttk.Label(workspace, text="EXACT LAYERS / MODEL DIAGNOSTICS", style="PanelTitle.TLabel", anchor="w").grid(row=0, column=1, sticky="ew", padx=(5, 2), pady=(0, 6))
         self.canvases = []
-        for column, title in enumerate(titles):
-            tk.Label(body, text=title, font=("TkDefaultFont", 11, "bold")).grid(row=0, column=column, sticky="ew")
-            canvas = tk.Canvas(body, bg="#181818", highlightthickness=1, highlightbackground="#555")
-            canvas.grid(row=1, column=column, sticky="nsew", padx=4)
+        for column in range(2):
+            canvas = tk.Canvas(
+                workspace,
+                bg="#11171d",
+                highlightthickness=1,
+                highlightbackground="#3f4b56",
+                cursor="crosshair" if column == 0 else "arrow",
+            )
+            canvas.grid(row=1, column=column, sticky="nsew", padx=(2, 5) if column == 0 else (5, 2))
             canvas.bind("<Configure>", self.on_canvas_configure)
             canvas.bind("<MouseWheel>", self.on_wheel)
             canvas.bind("<Button-4>", self.on_wheel)
@@ -813,88 +980,319 @@ class PidNetTrainingApp:
             canvas.bind("<B3-Motion>", self.on_pan_drag)
             canvas.bind("<ButtonRelease-3>", self.on_pan_up)
             self.canvases.append(canvas)
+        workspace_actions = ttk.Frame(workspace, style="Panel.TFrame")
+        workspace_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Button(workspace_actions, text="Reset View", command=self.reset_view).pack(side=tk.LEFT)
+        ttk.Checkbutton(workspace_actions, text="Paint while zoomed", variable=self.draw_when_zoomed_var).pack(side=tk.LEFT, padx=10)
+        ttk.Label(
+            workspace_actions,
+            text="Paint on the source image; the right panel shows the exact saved layers.",
+            style="PanelTitle.TLabel",
+        ).pack(side=tk.RIGHT)
 
-        tk.Label(body, text="Training command and output", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=2, sticky="ew")
-        output_frame = tk.Frame(body)
-        output_frame.grid(row=1, column=2, sticky="nsew", padx=4)
-        output_frame.rowconfigure(1, weight=1)
-        output_frame.columnconfigure(0, weight=1)
-        self.command_text = tk.Text(output_frame, height=5, wrap=tk.WORD)
-        self.command_text.grid(row=0, column=0, sticky="ew")
-        self.output_text = tk.Text(output_frame, wrap=tk.WORD, bg="#101010", fg="#e8e8e8", insertbackground="#e8e8e8")
-        self.output_text.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.sidebar_notebook = ttk.Notebook(sidebar)
+        self.sidebar_notebook.pack(fill=tk.BOTH, expand=True)
+        annotate_tab = ttk.Frame(self.sidebar_notebook, padding=10)
+        data_tab = ttk.Frame(self.sidebar_notebook, padding=10)
+        model_tab = ttk.Frame(self.sidebar_notebook, padding=10)
+        train_tab = ttk.Frame(self.sidebar_notebook, padding=10)
+        log_tab = ttk.Frame(self.sidebar_notebook, padding=8)
+        for tab in (annotate_tab, data_tab, model_tab, train_tab, log_tab):
+            tab.columnconfigure(0, weight=1)
+        self.sidebar_notebook.add(annotate_tab, text="Annotate")
+        self.sidebar_notebook.add(data_tab, text="Dataset")
+        self.sidebar_notebook.add(model_tab, text="Model")
+        self.sidebar_notebook.add(train_tab, text="Train")
+        self.sidebar_notebook.add(log_tab, text="Log")
+        self.annotate_tab = annotate_tab
+        self.data_tab = data_tab
+        self.model_tab = model_tab
 
-        footer = tk.Frame(self.root, padx=8, pady=6)
-        footer.pack(side=tk.BOTTOM, fill=tk.X)
-        tk.Label(footer, textvariable=self.status_var, anchor="w", justify=tk.LEFT).pack(side=tk.TOP, fill=tk.X)
-        tk.Label(
-            footer,
-            text=(
-                "Keys: p capture, 1 cable, 2 endpoint, x crossing, c erase crossing, e erase all, "
-                "s save current, a save all, t train, "
-                "r test current/start live, [/] brush, z reset view. Unpainted pixels train as background. "
-                "Mouse wheel zooms; left-drag pans when zoomed unless Draw while zoomed is enabled."
-            ),
-            anchor="w",
+        draft_section = section(annotate_tab, "Model-assisted editable draft", 0)
+        ttk.Button(
+            draft_section,
+            text="Predict Current Capture as Draft",
+            command=self.predict_current_capture_as_draft,
+            style="Accent.TButton",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(
+            draft_section,
+            textvariable=self.draft_status_var,
+            wraplength=420,
+            foreground="#53687a",
             justify=tk.LEFT,
-            fg="#444",
-        ).pack(side=tk.TOP, fill=tk.X)
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+
+        paint_section = section(annotate_tab, "Paint layer", 1)
+        self.paint_mode_frame = tk.Frame(paint_section, bg="#ffffff")
+        self.paint_mode_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.rebuild_paint_mode_buttons()
+        brush_section = section(annotate_tab, "Brush and mask", 2)
+        ttk.Label(brush_section, text="Brush radius").grid(row=0, column=0, sticky="w")
+        ttk.Scale(brush_section, from_=1, to=40, variable=self.brush_radius_var, orient=tk.HORIZONTAL).grid(row=0, column=1, sticky="ew", padx=7)
+        ttk.Label(brush_section, textvariable=self.brush_radius_var, width=4).grid(row=0, column=2)
+        cleanup_controls = ttk.Frame(brush_section)
+        cleanup_controls.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(cleanup_controls, text="Kernel").pack(side=tk.LEFT)
+        ttk.Spinbox(cleanup_controls, from_=1, to=41, increment=2, width=4, textvariable=self.morph_kernel_var).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(cleanup_controls, text="Iterations").pack(side=tk.LEFT)
+        ttk.Spinbox(cleanup_controls, from_=1, to=8, width=4, textvariable=self.morph_iterations_var).pack(side=tk.LEFT, padx=4)
+        cleanup_buttons = ttk.Frame(brush_section)
+        cleanup_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Button(cleanup_buttons, text="Open", command=lambda: self.apply_mask_morph("open")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ttk.Button(cleanup_buttons, text="Close", command=lambda: self.apply_mask_morph("close")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+        ttk.Button(cleanup_buttons, text="Clear Mask", command=self.clear_current_mask, style="Danger.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+        view_section = section(annotate_tab, "Visible overlay", 3)
+        for index, (channel_name, variable) in enumerate(self.label_visibility_vars.items()):
+            ttk.Checkbutton(
+                view_section,
+                text=channel_name.replace("endpoint", "Endpoint ").title(),
+                variable=variable,
+                command=self.refresh,
+            ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 14), pady=3)
+        review_section = section(annotate_tab, "Human review", 4)
+        ttk.Label(
+            review_section,
+            text="After reviewing and correcting all four layers:",
+            foreground="#53687a",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Button(
+            review_section,
+            textvariable=self.verification_action_var,
+            command=self.toggle_human_verification,
+            style="Accent.TButton",
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Button(
+            review_section,
+            text="Save Human-Verified Label",
+            command=self.save_reviewed_label,
+            style="Accent.TButton",
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(
+            annotate_tab,
+            text=(
+                "The prediction becomes the same editable paint layers as a manual label. "
+                "Endpoint and crossing pixels retain the generic cable layer; verification is never automatic."
+            ),
+            wraplength=420,
+            foreground="#586b7b",
+            justify=tk.LEFT,
+        ).grid(row=5, column=0, sticky="ew", pady=4)
+
+        capture_section = section(data_tab, "Capture", 0)
+        ttk.Button(capture_section, text="Capture Current Frame", command=self.capture_current_frame, style="Accent.TButton").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(capture_section, text="Capture Burst", command=self.capture_burst).grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        burst_options = ttk.Frame(capture_section)
+        burst_options.grid(row=1, column=1, sticky="e")
+        ttk.Label(burst_options, text="Frames").pack(side=tk.LEFT)
+        ttk.Spinbox(burst_options, from_=2, to=100, width=4, textvariable=self.burst_count_var).pack(side=tk.LEFT, padx=3)
+        ttk.Label(burst_options, text="Every ms").pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Spinbox(burst_options, from_=50, to=5000, increment=50, width=6, textvariable=self.burst_interval_ms_var).pack(side=tk.LEFT, padx=3)
+        session_section = section(data_tab, "Session and split", 1)
+        ttk.Entry(session_section, textvariable=self.session_var, state="readonly").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(session_section, text="New Session", command=self.new_capture_session).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 7))
+        split_frame = ttk.Frame(session_section)
+        split_frame.grid(row=2, column=0, columnspan=2, sticky="w")
+        for text, value in (("Train", "train"), ("Validation", "val"), ("Locked test", "test")):
+            ttk.Radiobutton(split_frame, text=text, variable=self.split_var, value=value, command=self.set_active_split).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(
+            session_section,
+            text="Human verified",
+            variable=self.verified_var,
+            command=self.update_active_metadata,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 3))
+        ttk.Label(session_section, text="Notes").grid(row=4, column=0, sticky="nw", pady=3)
+        notes_entry = ttk.Entry(session_section, textvariable=self.notes_var)
+        notes_entry.grid(row=4, column=1, sticky="ew", pady=3)
+        notes_entry.bind("<FocusOut>", lambda _event: self.update_active_metadata())
+        save_section = section(data_tab, "Save and review", 2)
+        ttk.Button(save_section, text="Save Current Label", command=self.save_current_label, style="Accent.TButton").grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Button(save_section, text="Save All Painted", command=self.save_all_labels).grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=2)
+        ttk.Button(save_section, text="Save Verified Negative", command=self.save_verified_negative).grid(row=1, column=0, columnspan=2, sticky="ew", pady=4)
+        folder_buttons = ttk.Frame(save_section)
+        folder_buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        for text, command in (
+            ("Train", lambda: self.open_dataset_split("train")),
+            ("Val", lambda: self.open_dataset_split("val")),
+            ("Test", lambda: self.open_dataset_split("test")),
+            ("Captures", self.open_capture_folder),
+        ):
+            ttk.Button(folder_buttons, text=text, command=command).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(save_section, text="Delete Current Item", command=self.delete_current_item, style="Danger.TButton").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        path_section = section(data_tab, "Dataset location", 3, pady=(0, 0))
+        ttk.Entry(path_section, textvariable=self.dataset_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(path_section, text="Browse", command=self.choose_dataset_dir).grid(row=0, column=1, padx=(6, 0))
+
+        checkpoint_section = section(model_tab, "Checkpoint", 0)
+        ttk.Entry(checkpoint_section, textvariable=self.output_var).grid(row=0, column=0, sticky="ew")
+        checkpoint_buttons = ttk.Frame(checkpoint_section)
+        checkpoint_buttons.grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(checkpoint_buttons, text="Browse", command=self.choose_output_path).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Button(checkpoint_buttons, text="Load", command=self.load_model_from_button, style="Accent.TButton").pack(side=tk.LEFT)
+        ttk.Label(checkpoint_section, textvariable=self.model_status_var, wraplength=410, foreground="#53687a").grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        assist_section = section(model_tab, "Model-assisted annotation", 1)
+        ttk.Button(assist_section, text="Preview Current Frame", command=self.test_current_frame).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(assist_section, text="Apply Preview as Draft", command=self.use_prediction_as_draft, style="Accent.TButton").grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Checkbutton(
+            assist_section,
+            text="Live segmentation preview",
+            variable=self.live_test_var,
+            command=self.toggle_live_segmentation,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Label(assist_section, text="Heatmap").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        channel_box = ttk.Combobox(
+            assist_section,
+            textvariable=self.prediction_channel_var,
+            values=("combined", "cable", "endpoint1", "endpoint2", "crossing"),
+            state="readonly",
+            width=16,
+        )
+        channel_box.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        channel_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh())
+        threshold_section = section(model_tab, "Channel thresholds", 2)
+        for index, (label, variable) in enumerate((
+            ("Cable body", self.test_threshold_var),
+            ("Endpoint 1", self.endpoint_threshold_vars[0]),
+            ("Endpoint 2", self.endpoint_threshold_vars[1]),
+            ("Crossing", self.crossing_threshold_var),
+        )):
+            ttk.Label(threshold_section, text=label).grid(row=index, column=0, sticky="w", pady=3)
+            threshold = ttk.Spinbox(threshold_section, from_=0.05, to=0.99, increment=0.01, textvariable=variable, width=8, command=self.on_threshold_change)
+            threshold.grid(row=index, column=1, sticky="e", pady=3)
+            threshold.bind("<KeyRelease>", self.on_threshold_change)
+        evaluation_section = section(model_tab, "Evaluation", 3)
+        for index, (text, command) in enumerate((
+            ("Train", lambda: self.test_dataset_split("train")),
+            ("Validation", lambda: self.test_dataset_split("val")),
+            ("Locked Test", lambda: self.test_dataset_split("test")),
+        )):
+            ttk.Button(evaluation_section, text=text, command=command).grid(row=0, column=index, sticky="ew", padx=2)
+            evaluation_section.columnconfigure(index, weight=1)
+        ttk.Button(evaluation_section, text="Calibrate on Validation", command=self.calibrate_validation_thresholds).grid(row=1, column=0, columnspan=2, sticky="ew", padx=2, pady=(6, 0))
+        ttk.Button(evaluation_section, text="Clear Preview", command=self.clear_prediction).grid(row=1, column=2, sticky="ew", padx=2, pady=(6, 0))
+        live_cleanup_section = section(model_tab, "Runtime mask cleanup", 4, pady=(0, 0))
+        for column, (label, variable, upper) in enumerate((
+            ("Min area", self.detector_min_area_var, 100000),
+            ("Open", self.detector_open_kernel_var, 99),
+            ("Close", self.detector_close_kernel_var, 99),
+        )):
+            ttk.Label(live_cleanup_section, text=label).grid(row=0, column=column, padx=3)
+            ttk.Spinbox(live_cleanup_section, from_=0 if column == 0 else 1, to=upper, increment=1 if column == 0 else 2, width=7, textvariable=variable, command=self.on_live_cleanup_change).grid(row=1, column=column, padx=3)
+            live_cleanup_section.columnconfigure(column, weight=1)
+        ttk.Button(live_cleanup_section, text="Preview", command=self.refresh).grid(row=2, column=0, sticky="ew", padx=3, pady=(7, 0))
+        ttk.Button(live_cleanup_section, text="Save to config.toml", command=self.save_live_cleanup_to_config).grid(row=2, column=1, columnspan=2, sticky="ew", padx=3, pady=(7, 0))
+        ttk.Entry(live_cleanup_section, textvariable=self.config_var).grid(row=3, column=0, columnspan=2, sticky="ew", padx=3, pady=(7, 0))
+        ttk.Button(live_cleanup_section, text="Browse", command=self.choose_config_path).grid(row=3, column=2, padx=3, pady=(7, 0))
+
+        train_actions = ttk.Frame(train_tab)
+        train_actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(train_actions, text="Start Training", command=self.start_training, style="Accent.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ttk.Button(train_actions, text="Stop", command=self.stop_training).pack(side=tk.LEFT, padx=3)
+        ttk.Button(train_actions, text="Check Dataset", command=self.check_dataset_health).pack(side=tk.LEFT, padx=(3, 0))
+        ttk.Progressbar(train_tab, variable=self.train_progress_var, maximum=100.0).grid(row=1, column=0, sticky="ew")
+        ttk.Label(train_tab, textvariable=self.train_summary_var, wraplength=430).grid(row=2, column=0, sticky="w", pady=(4, 8))
+        train_settings = ttk.Notebook(train_tab)
+        train_settings.grid(row=3, column=0, sticky="nsew")
+        train_tab.rowconfigure(3, weight=1)
+        basic_tab = ttk.Frame(train_settings, padding=9)
+        loss_tab = ttk.Frame(train_settings, padding=9)
+        runtime_tab = ttk.Frame(train_settings, padding=9)
+        train_settings.add(basic_tab, text="Basic")
+        train_settings.add(loss_tab, text="Loss")
+        train_settings.add(runtime_tab, text="Runtime")
+        for panel in (basic_tab, loss_tab, runtime_tab):
+            for column in (1, 3):
+                panel.columnconfigure(column, weight=1)
+        basic_fields = (
+            ("Epochs", self.epochs_var), ("Batch size", self.batch_var),
+            ("Image WxH", self.imgsz_var), ("Base channels", self.base_channels_var),
+            ("Device", self.device_var), ("Learning rate", self.lr_var),
+            ("Weight decay", self.weight_decay_var), ("Workers", self.num_workers_var),
+            ("Prefetch", self.prefetch_factor_var), ("Early-stop patience", self.early_stop_var),
+            ("Seed", self.seed_var),
+        )
+        for index, (label, variable) in enumerate(basic_fields):
+            field(basic_tab, index // 2, label, variable, column=index % 2)
+        loss_fields = (
+            ("Endpoint weight", self.endpoint_weight_var), ("Crossing weight", self.crossing_weight_var),
+            ("Boundary weight", self.boundary_weight_var), ("Focal gamma", self.focal_gamma_var),
+            ("Dice weight", self.dice_weight_var), ("EMA decay", self.ema_decay_var),
+            ("Gradient clip", self.grad_clip_var), ("Min delta", self.min_delta_var),
+        )
+        for index, (label, variable) in enumerate(loss_fields):
+            field(loss_tab, index // 2, label, variable, column=index % 2)
+        for index, (text_value, variable) in enumerate((
+            ("AMP mixed precision", self.amp_var),
+            ("Channels-last", self.channels_last_var),
+            ("TF32", self.tf32_var),
+            ("GPU augmentation", self.gpu_augment_var),
+            ("Deterministic", self.deterministic_var),
+            ("torch.compile", self.compile_var),
+            ("Verified only", self.verified_only_var),
+            ("Evaluate locked test", self.evaluate_test_var),
+            ("Resume last", self.resume_var),
+        )):
+            ttk.Checkbutton(runtime_tab, text=text_value, variable=variable, command=self.refresh_command_text).grid(row=index // 2, column=(index % 2) * 2, columnspan=2, sticky="w", pady=3)
+        ttk.Label(runtime_tab, text="Initialization checkpoint").grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 3))
+        ttk.Entry(runtime_tab, textvariable=self.init_checkpoint_var).grid(row=6, column=0, columnspan=3, sticky="ew")
+        init_buttons = ttk.Frame(runtime_tab)
+        init_buttons.grid(row=6, column=3, sticky="e", padx=(5, 0))
+        ttk.Button(init_buttons, text="Browse", command=self.choose_init_checkpoint).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(init_buttons, text="Clear", command=lambda: self.init_checkpoint_var.set("")).pack(side=tk.LEFT)
+        param_actions = ttk.Frame(train_tab)
+        param_actions.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(param_actions, text="Save Parameters", command=self.save_pidnet_params).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ttk.Button(param_actions, text="Load Parameters", command=self.load_pidnet_params).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+
+        log_tab.rowconfigure(3, weight=1)
+        ttk.Label(log_tab, text="Run summary", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.command_text = tk.Text(log_tab, height=8, wrap=tk.WORD, relief=tk.FLAT, bg="#f1f4f7", fg="#34495b", padx=8, pady=8)
+        self.command_text.grid(row=1, column=0, sticky="ew", pady=(5, 9))
+        ttk.Label(log_tab, text="Training output", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky="w")
+        self.output_text = tk.Text(log_tab, wrap=tk.WORD, bg="#111820", fg="#d9e5ef", insertbackground="#ffffff", relief=tk.FLAT, padx=8, pady=8)
+        self.output_text.grid(row=3, column=0, sticky="nsew", pady=(5, 0))
 
     def rebuild_paint_mode_buttons(self):
         if not hasattr(self, "paint_mode_frame"):
             return
         for child in self.paint_mode_frame.winfo_children():
             child.destroy()
-        tk.Radiobutton(
-            self.paint_mode_frame,
-            text="cable",
-            variable=self.mode_var,
-            value="paint_1",
-            command=self.refresh,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            self.paint_mode_frame,
-            text="endpoints_1",
-            variable=self.mode_var,
-            value="endpoint_1",
-            command=self.refresh,
-        ).pack(side=tk.LEFT)
-        for endpoint_index in range(2, max(1, int(self.cable_count_var.get())) + 1):
-            tk.Radiobutton(
+        for column in range(2):
+            self.paint_mode_frame.columnconfigure(column, weight=1)
+        tools = (
+            ("Cable body  [1]", "paint_1", "#5de35d", "#102410"),
+            ("Cable 1 endpoints  [2]", "endpoint_1", "#e058d1", "#ffffff"),
+            ("Cable 2 endpoints  [3]", "endpoint_2", "#43cbe8", "#10242b"),
+            ("Crossing proposal  [X]", "crossing", "#f0d84b", "#282205"),
+            ("Erase crossing  [C]", "erase_crossing", "#d9e0e6", "#263746"),
+            ("Erase all  [E]", "erase", "#f0c3c3", "#672020"),
+        )
+        for index, (text, value, color, foreground) in enumerate(tools):
+            button = tk.Radiobutton(
                 self.paint_mode_frame,
-                text=f"endpoints_{endpoint_index}",
+                text=text,
                 variable=self.mode_var,
-                value=f"endpoint_{endpoint_index}",
+                value=value,
                 command=self.refresh,
-            ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            self.paint_mode_frame,
-            text="crossing",
-            variable=self.mode_var,
-            value="crossing",
-            command=self.refresh,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            self.paint_mode_frame,
-            text="Erase crossing",
-            variable=self.mode_var,
-            value="erase_crossing",
-            command=self.refresh,
-        ).pack(side=tk.LEFT)
-        tk.Radiobutton(
-            self.paint_mode_frame,
-            text="Erase all",
-            variable=self.mode_var,
-            value="erase",
-            command=self.refresh,
-        ).pack(side=tk.LEFT)
+                indicatoron=False,
+                relief=tk.FLAT,
+                borderwidth=1,
+                padx=8,
+                pady=8,
+                bg="#f4f6f8",
+                fg="#263746",
+                activebackground=color,
+                activeforeground=foreground,
+                selectcolor=color,
+                anchor="w",
+                font=("Segoe UI", 9, "bold"),
+            )
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=3, pady=3)
 
     def _bind_keys(self):
         self.root.bind("1", lambda _event: self.set_mode("paint_1"))
         self.root.bind("2", lambda _event: self.set_mode("endpoint_1"))
         self.root.bind("3", lambda _event: self.set_mode("endpoint_2"))
-        self.root.bind("4", lambda _event: self.set_mode("endpoint_3"))
-        self.root.bind("5", lambda _event: self.set_mode("endpoint_4"))
         self.root.bind("x", lambda _event: self.set_mode("crossing"))
         self.root.bind("c", lambda _event: self.set_mode("erase_crossing"))
         self.root.bind("e", lambda _event: self.set_mode("erase"))
@@ -902,10 +1300,13 @@ class PidNetTrainingApp:
         self.root.bind("a", lambda _event: self.save_all_labels())
         self.root.bind("t", lambda _event: self.start_training())
         self.root.bind("r", lambda _event: self.test_current_frame())
+        self.root.bind("d", lambda _event: self.predict_current_capture_as_draft())
         self.root.bind("p", lambda _event: self.capture_current_frame())
         self.root.bind("n", lambda _event: self.next_frame())
         self.root.bind("b", lambda _event: self.previous_frame())
         self.root.bind("z", lambda _event: self.reset_view())
+        self.root.bind("<Control-z>", lambda _event: self.undo_mask())
+        self.root.bind("<Control-y>", lambda _event: self.redo_mask())
         self.root.bind("[", lambda _event: self.adjust_brush(-1))
         self.root.bind("]", lambda _event: self.adjust_brush(1))
 
@@ -978,16 +1379,175 @@ class PidNetTrainingApp:
         return label_display_name(self.active_label_value(), self.cable_count_var.get())
 
     def set_active_split(self):
+        if self.training_is_running():
+            item = self.active_item()
+            if item is not None:
+                self.split_var.set(item.get("split") or "train")
+            self.status_var.set("Stop training before moving a session between dataset splits.")
+            return
+        if self.pending_capture_session:
+            self.status_var.set(
+                f"Pending capture session {self.session_var.get()} assigned to {self.split_var.get()}."
+            )
+            self.refresh()
+            return
         item = self.active_item()
         if item is not None:
             new_split = self.split_var.get()
             if item.get("split") != new_split:
-                item["split"] = new_split
-                item["dirty"] = True
+                session_id = str(item.get("session_id") or self.session_var.get())
+                manifest = load_dataset_manifest(Path(self.dataset_var.get()))
+                has_saved_session = session_id in manifest.get("sessions", {}) or any(
+                    candidate.get("session_id") == session_id and candidate.get("saved_image_path")
+                    for candidate in self.frames
+                )
+                if has_saved_session and not messagebox.askyesno(
+                    "Move capture session",
+                    f"Move the entire session {session_id!r} to {new_split!r}?\n\n"
+                    "All saved images and masks in the session move together.",
+                ):
+                    self.split_var.set(item.get("split") or "train")
+                    return
+                if has_saved_session:
+                    try:
+                        move_session_split(Path(self.dataset_var.get()), session_id, new_split)
+                    except Exception as exc:
+                        self.split_var.set(item.get("split") or "train")
+                        messagebox.showerror("Session move failed", str(exc))
+                        return
+                for candidate in self.frames:
+                    if candidate.get("session_id") == session_id:
+                        candidate["split"] = new_split
+                        candidate["dirty"] = True
+                        self.refresh_saved_paths(candidate)
         self.refresh()
 
+    def refresh_saved_paths(self, item):
+        if not item.get("saved_mask_path") and not item.get("saved_image_path"):
+            return
+        image_path, mask_path = label_paths_for_item(item, Path(self.dataset_var.get()))
+        item["saved_image_path"] = str(image_path) if image_path.exists() else None
+        item["saved_mask_path"] = str(mask_path) if mask_path.exists() else None
+        layer_path = layered_mask_path_from_mask_path(mask_path)
+        item["saved_layer_path"] = str(layer_path) if layer_path.exists() else None
+        if item.get("path") and path_is_within(Path(item["path"]), Path(self.dataset_var.get()) / "images"):
+            item["path"] = str(image_path)
+
+    def update_active_metadata(self):
+        if self.pending_capture_session:
+            self.status_var.set(f"Pending capture session {self.session_var.get()} assigned to {self.split_var.get()}.")
+            return
+        item = self.active_item()
+        if item is None:
+            return
+        item["session_id"] = sanitize_stem(self.session_var.get() or new_session_id())
+        self.set_item_verified(item, bool(self.verified_var.get()))
+        item["notes"] = str(self.notes_var.get())
+        item["dirty"] = True
+        self.refresh()
+
+    def set_item_verified(self, item, verified):
+        verified = bool(verified)
+        annotation = dict(item.get("annotation") or {"origin": "manual"})
+        annotation.setdefault("origin", "manual")
+        if verified:
+            annotation.setdefault("human_verified_at", utc_now_text())
+        else:
+            annotation.pop("human_verified_at", None)
+        item["annotation"] = annotation
+        item["verified"] = verified
+
+    def update_verification_action_text(self):
+        if not hasattr(self, "verification_action_var"):
+            return
+        item = self.active_item()
+        verified = bool(item.get("verified")) if item is not None else bool(self.verified_var.get())
+        self.verification_action_var.set(
+            "Human Verified (click to undo)" if verified else "Human Verify"
+        )
+
+    def toggle_human_verification(self):
+        item = self.active_item()
+        if item is None:
+            self.status_var.set("Capture or select a frame before changing human verification.")
+            return False
+        verified = not bool(item.get("verified", False))
+        self.verified_var.set(verified)
+        item["session_id"] = sanitize_stem(self.session_var.get() or item.get("session_id") or new_session_id())
+        item["notes"] = str(self.notes_var.get())
+        self.set_item_verified(item, verified)
+        item["dirty"] = True
+        self.update_verification_action_text()
+        self.refresh()
+        if verified:
+            self.status_var.set(
+                "Marked the current label as Human Verified. The Dataset-tab toggle is synchronized."
+            )
+        else:
+            self.status_var.set(
+                "Removed Human Verified from the current label. The Dataset-tab toggle is synchronized."
+            )
+        return True
+
+    def mark_item_human_edited(self, item):
+        """Invalidate verification whenever pixels change after human review."""
+        annotation = dict(item.get("annotation") or {"origin": "manual"})
+        annotation.setdefault("origin", "manual")
+        annotation["human_edited"] = True
+        annotation["last_human_edit_at"] = utc_now_text()
+        item["annotation"] = annotation
+        self.set_item_verified(item, False)
+        if hasattr(self, "verified_var"):
+            self.verified_var.set(False)
+        item["negative"] = False
+        item["dirty"] = True
+
+    def update_draft_status(self):
+        self.update_verification_action_text()
+        if not hasattr(self, "draft_status_var"):
+            return
+        item = self.active_item()
+        if item is None:
+            self.draft_status_var.set("Capture or select a frame to create an editable model draft.")
+            return
+        annotation = item.get("annotation") if isinstance(item.get("annotation"), dict) else {}
+        if annotation.get("origin") == "model_assisted":
+            if bool(item.get("verified")):
+                message = "Model-assisted label is human verified and ready to save."
+            elif bool(annotation.get("human_edited")):
+                message = "Model draft has manual corrections; review all layers, then mark Human verified."
+            else:
+                message = "Editable model draft is active; inspect and correct all four paint layers."
+        elif bool(item.get("verified")):
+            message = "Manual label is human verified and ready to save."
+        else:
+            message = "No editable model draft on the selected frame."
+        self.draft_status_var.set(message)
+
+    def sync_metadata_from_active(self):
+        item = self.active_item()
+        if item is None:
+            return
+        self.pending_capture_session = False
+        self.session_var.set(str(item.get("session_id") or self.session_var.get()))
+        self.verified_var.set(bool(item.get("verified", False)))
+        self.notes_var.set(str(item.get("notes", "")))
+        self.update_draft_status()
+
+    def new_capture_session(self):
+        self.pending_capture_session = True
+        self.session_var.set(new_session_id())
+        self.verified_var.set(False)
+        self.update_verification_action_text()
+        self.notes_var.set("")
+        self.status_var.set(
+            f"New capture session {self.session_var.get()} assigned to {self.split_var.get()}."
+        )
+
     def on_threshold_change(self, _value=None):
-        self.threshold_text_var.set(f"{safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95):.2f}")
+        self.threshold_text_var.set(
+            f"{safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.99):.2f}"
+        )
         self.refresh()
 
     def on_live_cleanup_change(self):
@@ -1031,13 +1591,34 @@ class PidNetTrainingApp:
             self.update_model_status()
             self.refresh_command_text()
 
+    def choose_init_checkpoint(self):
+        path = filedialog.askopenfilename(
+            title="Choose compatible initialization checkpoint",
+            initialdir=str(Path(self.output_var.get()).parent),
+            filetypes=[("PyTorch checkpoint", "*.pt *.pth"), ("All files", "*.*")],
+        )
+        if path:
+            self.init_checkpoint_var.set(path)
+            self.refresh_command_text()
+
     def load_live_cleanup_from_config(self, path):
         config = load_toml_config(path)
         pidnet_config = config.get("pidnet", {})
         detector_config = config.get("detector", {})
+        crossing_config = config.get("crossing", {})
         if "threshold" in pidnet_config:
             self.test_threshold_var.set(float(pidnet_config["threshold"]))
             self.threshold_text_var.set(f"{float(pidnet_config['threshold']):.2f}")
+        if "endpoint_thresholds" in pidnet_config:
+            values = tuple(float(value) for value in pidnet_config["endpoint_thresholds"])
+            if len(values) != len(self.endpoint_threshold_vars):
+                raise ValueError(
+                    f"pidnet.endpoint_thresholds must contain {len(self.endpoint_threshold_vars)} values."
+                )
+            for variable, value in zip(self.endpoint_threshold_vars, values):
+                variable.set(value)
+        if "threshold" in crossing_config:
+            self.crossing_threshold_var.set(float(crossing_config["threshold"]))
         if "min_area_px" in detector_config:
             self.detector_min_area_var.set(int(detector_config["min_area_px"]))
         if "open_kernel" in detector_config:
@@ -1051,20 +1632,43 @@ class PidNetTrainingApp:
         self.detector_open_kernel_var.set(open_kernel)
         self.detector_close_kernel_var.set(close_kernel)
         return {
-            "threshold": safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
+            "threshold": safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.99),
             "min_area_px": safe_int(self.detector_min_area_var, 80, min_value=0, max_value=1000000),
             "open_kernel": open_kernel,
             "close_kernel": close_kernel,
         }
 
+    def preview_thresholds(self):
+        return {
+            "cable": safe_float(
+                self.test_threshold_var,
+                0.50,
+                min_value=0.05,
+                max_value=0.99,
+            ),
+            "endpoints": tuple(
+                safe_float(variable, 0.50, min_value=0.05, max_value=0.99)
+                for variable in self.endpoint_threshold_vars
+            ),
+            "crossing": safe_float(
+                self.crossing_threshold_var,
+                0.50,
+                min_value=0.05,
+                max_value=0.99,
+            ),
+        }
+
     def save_live_cleanup_to_config(self):
         params = self.live_cleanup_params()
+        thresholds = self.preview_thresholds()
         config_path = Path(self.config_var.get() or DEFAULT_CONFIG_PATH)
         try:
             replace_toml_values(
                 config_path,
                 {
-                    ("pidnet", "threshold"): params["threshold"],
+                    ("pidnet", "threshold"): thresholds["cable"],
+                    ("pidnet", "endpoint_thresholds"): thresholds["endpoints"],
+                    ("crossing", "threshold"): thresholds["crossing"],
                     ("detector", "min_area_px"): params["min_area_px"],
                     ("detector", "open_kernel"): params["open_kernel"],
                     ("detector", "close_kernel"): params["close_kernel"],
@@ -1075,7 +1679,9 @@ class PidNetTrainingApp:
             return
         self.status_var.set(
             f"Saved live PIDNet cleanup to {config_path.name}: "
-            f"threshold={params['threshold']:.2f}, min_area={params['min_area_px']}, "
+            f"thresholds={thresholds['cable']:.2f}/"
+            f"{thresholds['endpoints'][0]:.2f}/{thresholds['endpoints'][1]:.2f}/"
+            f"{thresholds['crossing']:.2f}, min_area={params['min_area_px']}, "
             f"open={params['open_kernel']}, close={params['close_kernel']}."
         )
         self.refresh_command_text()
@@ -1092,6 +1698,48 @@ class PidNetTrainingApp:
         path = Path(checkpoint_path)
         stat = path.stat()
         return str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)
+
+    def checkpoint_sha256(self, checkpoint_path):
+        signature = self.checkpoint_signature(checkpoint_path)
+        cached = self.checkpoint_hash_cache.get(signature)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        with Path(checkpoint_path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        value = digest.hexdigest()
+        self.checkpoint_hash_cache.clear()
+        self.checkpoint_hash_cache[signature] = value
+        return value
+
+    def model_draft_metadata(self):
+        checkpoint_path = Path(self.output_var.get()).expanduser().resolve()
+        signature = self.checkpoint_signature(checkpoint_path)
+        thresholds = self.preview_thresholds()
+        cleanup = self.live_cleanup_params()
+        return {
+            "origin": "model_assisted",
+            "draft_created_at": utc_now_text(),
+            "human_edited": False,
+            "checkpoint": {
+                "path": signature[0],
+                "sha256": self.checkpoint_sha256(checkpoint_path),
+                "modified_ns": signature[1],
+                "bytes": signature[2],
+            },
+            "thresholds": {
+                "cable": float(thresholds["cable"]),
+                "endpoint1": float(thresholds["endpoints"][0]),
+                "endpoint2": float(thresholds["endpoints"][1]),
+                "crossing": float(thresholds["crossing"]),
+            },
+            "body_cleanup": {
+                "min_area_px": int(cleanup["min_area_px"]),
+                "open_kernel": int(cleanup["open_kernel"]),
+                "close_kernel": int(cleanup["close_kernel"]),
+            },
+        }
 
     def update_model_status(self):
         if not hasattr(self, "model_status_var"):
@@ -1115,11 +1763,18 @@ class PidNetTrainingApp:
 
     def load_model_from_button(self):
         try:
-            self.load_segmenter(force_reload=True)
+            segmenter = self.load_segmenter(force_reload=True)
         except Exception as exc:
             self.status_var.set(f"Could not load model: {exc}")
             self.update_model_status()
             return
+        recommended = tuple(float(value) for value in segmenter.config.get("recommended_thresholds", ()))
+        if len(recommended) == OUTPUT_CHANNEL_COUNT:
+            self.test_threshold_var.set(recommended[0])
+            self.endpoint_threshold_vars[0].set(recommended[1])
+            self.endpoint_threshold_vars[1].set(recommended[2])
+            self.crossing_threshold_var.set(recommended[3])
+            self.on_threshold_change()
         self.status_var.set(f"Loaded model: {Path(self.output_var.get()).name}")
         self.update_model_status()
 
@@ -1142,7 +1797,7 @@ class PidNetTrainingApp:
 
     def open_dataset_split(self, split):
         split = str(split).strip().lower()
-        if split not in ("train", "val"):
+        if split not in DATASET_SPLITS:
             raise ValueError(f"Unsupported dataset split: {split}")
         dataset_dir = Path(self.dataset_var.get()).expanduser().resolve()
         self.load_review_folder(
@@ -1191,6 +1846,7 @@ class PidNetTrainingApp:
                     dataset_dir=dataset_dir,
                     cable_count=max(1, int(self.cable_count_var.get())),
                     search_other_splits=search_other_splits,
+                    session_id=self.session_var.get(),
                 )
             )
 
@@ -1201,6 +1857,7 @@ class PidNetTrainingApp:
         self.prediction_frame_key = None
         self.prediction_summary = ""
         self.sync_split_from_active()
+        self.sync_metadata_from_active()
         self.reset_view()
         missing_count = sum(item_mask_state(item) == "MASK MISSING" for item in loaded)
         self.status_var.set(
@@ -1210,6 +1867,9 @@ class PidNetTrainingApp:
         return True
 
     def delete_current_item(self):
+        if self.training_is_running():
+            self.status_var.set("Dataset deletion is locked while training is running.")
+            return False
         item = self.active_item()
         if item is None or not item.get("path"):
             messagebox.showerror("Cannot delete item", "Select a saved dataset or capture image first.")
@@ -1260,6 +1920,7 @@ class PidNetTrainingApp:
         try:
             for path in resolved_paths:
                 path.unlink()
+            remove_dataset_item_metadata(dataset_dir, item.get("dataset_stem") or source_path.stem)
         except OSError as exc:
             messagebox.showerror("Delete failed", f"Dataset deletion failed:\n{exc}")
             raise
@@ -1271,6 +1932,7 @@ class PidNetTrainingApp:
         self.prediction_frame_key = None
         self.prediction_summary = ""
         self.sync_split_from_active()
+        self.sync_metadata_from_active()
         self.reset_view()
         self.status_var.set(f"Deleted dataset item {removed_name} ({len(resolved_paths)} file(s)).")
         self.refresh()
@@ -1290,12 +1952,15 @@ class PidNetTrainingApp:
                     split=self.split_var.get(),
                     dataset_dir=Path(self.dataset_var.get()),
                     cable_count=max(1, int(self.cable_count_var.get())),
+                    session_id=self.session_var.get(),
                 )
             )
             added += 1
         if added and self.selected_frame_idx < 0:
             self.selected_frame_idx = 0
         if added:
+            self.sync_split_from_active()
+            self.sync_metadata_from_active()
             self.reset_view()
             self.status_var.set(f"Loaded {added} image(s). Paint cable bodies and endpoints, then save labels.")
 
@@ -1337,34 +2002,62 @@ class PidNetTrainingApp:
     def capture_current_frame(self):
         if self.latest_bgr is None:
             self.status_var.set("No live ZED frame available. Use Open Images or wait for camera preview.")
-            return
+            return False
+        # Capture freezes the current camera image for editing. A live preview
+        # must not keep hiding the newly selected frame behind the camera feed.
+        self.live_test_var.set(False)
+        self.prediction_probability = None
+        self.prediction_frame_key = None
+        self.prediction_label_mode = ""
+        self.prediction_summary = ""
         capture_dir = Path(self.dataset_var.get()).expanduser().resolve() / "captures"
         capture_dir.mkdir(parents=True, exist_ok=True)
-        filename = capture_dir / f"cable_frame_{time.strftime('%Y%m%d_%H%M%S')}_{len(self.frames):04d}.png"
+        filename = capture_dir / f"{unique_capture_stem(self.session_var.get())}.png"
+        if filename.exists():
+            raise FileExistsError(f"Unique capture path unexpectedly exists: {filename}")
         if not cv2.imwrite(str(filename), self.latest_bgr):
             raise IOError(f"Could not write captured image: {filename}")
-        self.frames.append(
-            make_frame_item(
-                self.latest_bgr,
-                path=filename,
-                split=self.split_var.get(),
-                dataset_dir=Path(self.dataset_var.get()),
-                cable_count=max(1, int(self.cable_count_var.get())),
-            )
+        current_signature = frame_signature(self.latest_bgr)
+        closest_name = None
+        closest_distance = float("inf")
+        for previous in self.frames[-100:]:
+            distance = frame_signature_distance(current_signature, frame_signature(previous["bgr"]))
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_name = Path(previous.get("path") or "loaded frame").name
+        item = make_frame_item(
+            self.latest_bgr,
+            path=filename,
+            split=self.split_var.get(),
+            dataset_dir=Path(self.dataset_var.get()),
+            cable_count=max(1, int(self.cable_count_var.get())),
+            session_id=self.session_var.get(),
         )
+        self.pending_capture_session = False
+        if closest_distance < 0.025:
+            item["near_duplicate_of"] = closest_name
+            item["near_duplicate_distance"] = closest_distance
+        self.frames.append(item)
         self.selected_frame_idx = len(self.frames) - 1
+        self.sync_metadata_from_active()
         self.reset_view()
-        self.status_var.set(
-            f"Captured {filename.name}. Paint cable, endpoints, and the independent crossing layer; "
-            "the rest is background."
+        duplicate_text = (
+            f" Possible near-duplicate of {closest_name} (distance {closest_distance:.4f}); review manually."
+            if item.get("near_duplicate_of") else ""
         )
         self.refresh()
+        self.status_var.set(
+            f"Captured {filename.name} in session {item['session_id']}. Paint the four independent layers."
+            f"{duplicate_text}"
+        )
+        return True
 
     def previous_frame(self):
         if not self.frames:
             return
         self.selected_frame_idx = (self.selected_frame_idx - 1) % len(self.frames)
         self.sync_split_from_active()
+        self.sync_metadata_from_active()
         self.reset_view()
 
     def next_frame(self):
@@ -1372,6 +2065,7 @@ class PidNetTrainingApp:
             return
         self.selected_frame_idx = (self.selected_frame_idx + 1) % len(self.frames)
         self.sync_split_from_active()
+        self.sync_metadata_from_active()
         self.reset_view()
 
     def sync_split_from_active(self):
@@ -1384,9 +2078,59 @@ class PidNetTrainingApp:
         if item is None:
             return
         if np.any(item["mask"]):
-            item["dirty"] = True
+            self.push_undo_state(item)
+            self.mark_item_human_edited(item)
         item["mask"].fill(0)
         self.status_var.set("Cleared current mask.")
+        self.refresh()
+
+    def capture_burst(self):
+        if self.burst_remaining > 0:
+            self.status_var.set(f"A capture burst is already active ({self.burst_remaining} frames remaining).")
+            return
+        if self.latest_bgr is None:
+            self.status_var.set("No live ZED frame is available for burst capture.")
+            return
+        self.burst_remaining = safe_int(self.burst_count_var, 5, min_value=2, max_value=100)
+        self._capture_burst_step()
+
+    def _capture_burst_step(self):
+        if self.burst_remaining <= 0:
+            self.status_var.set(f"Capture burst complete for session {self.session_var.get()}.")
+            return
+        self.capture_current_frame()
+        self.burst_remaining -= 1
+        interval = safe_int(self.burst_interval_ms_var, 250, min_value=50, max_value=5000)
+        self.root.after(interval, self._capture_burst_step)
+
+    def push_undo_state(self, item):
+        stack = item.setdefault("undo_stack", [])
+        stack.append(compact_item_edit_state(item))
+        del stack[:-MASK_UNDO_LIMIT]
+        item.setdefault("redo_stack", []).clear()
+
+    def undo_mask(self):
+        item = self.active_item()
+        if item is None or not item.get("undo_stack"):
+            self.status_var.set("Nothing to undo for the current frame.")
+            return
+        item.setdefault("redo_stack", []).append(compact_item_edit_state(item))
+        restore_item_edit_state(item, item["undo_stack"].pop())
+        item["dirty"] = True
+        self.verified_var.set(bool(item.get("verified", False)))
+        self.status_var.set("Undid the previous mask edit.")
+        self.refresh()
+
+    def redo_mask(self):
+        item = self.active_item()
+        if item is None or not item.get("redo_stack"):
+            self.status_var.set("Nothing to redo for the current frame.")
+            return
+        item.setdefault("undo_stack", []).append(compact_item_edit_state(item))
+        restore_item_edit_state(item, item["redo_stack"].pop())
+        item["dirty"] = True
+        self.verified_var.set(bool(item.get("verified", False)))
+        self.status_var.set("Redid the mask edit.")
         self.refresh()
 
     def apply_mask_morph(self, operation):
@@ -1414,13 +2158,17 @@ class PidNetTrainingApp:
         binary = label_pixels(item["mask"], label, self.cable_count_var.get(), multilabel=True).astype(np.uint8) * 255
         original_binary = binary.copy()
         binary = cv2.morphologyEx(binary, op_map[operation], kernel, iterations=iterations)
+        if not np.array_equal(original_binary, binary):
+            self.push_undo_state(item)
         bit = label_bit(label)
         active_pixels = (item["mask"] & bit) != 0
         item["mask"][active_pixels] = item["mask"][active_pixels] & np.uint16(~int(bit) & 0xFFFF)
         item["mask"][binary > 127] |= bit
+        if label != 1:
+            item["mask"][binary > 127] |= label_bit(1)
         after = int(np.count_nonzero(label_pixels(item["mask"], label, self.cable_count_var.get(), multilabel=True)))
         if not np.array_equal(original_binary, binary):
-            item["dirty"] = True
+            self.mark_item_human_edited(item)
         self.status_var.set(
             f"Applied mask {operation} to {label_display_name(label, self.cable_count_var.get())}: "
             f"px {before} -> {after}."
@@ -1428,6 +2176,9 @@ class PidNetTrainingApp:
         self.refresh()
 
     def save_current_label(self):
+        if self.training_is_running():
+            self.status_var.set("Dataset saving is locked while training is running.")
+            return False
         item = self.active_item()
         if item is None:
             self.status_var.set("No frame selected. Open or capture a frame first.")
@@ -1438,20 +2189,79 @@ class PidNetTrainingApp:
                 "No cable pixels are painted. This will save the whole frame as background. Save it?",
             ):
                 return False
-        item["split"] = self.split_var.get()
+            item["negative"] = True
+        else:
+            item["negative"] = False
+        if not self.pending_capture_session:
+            item["session_id"] = sanitize_stem(self.session_var.get() or item.get("session_id"))
+            self.set_item_verified(item, bool(self.verified_var.get()))
+            item["notes"] = str(self.notes_var.get())
+        if not self.pending_capture_session:
+            item["split"] = self.split_var.get()
         item["cable_count"] = max(1, int(self.cable_count_var.get()))
         image_path, mask_path = save_label_pair(item, Path(self.dataset_var.get()), index=self.selected_frame_idx)
         self.status_var.set(f"Saved {item['split']} label: {image_path.name} and {mask_path.name}")
         self.refresh_command_text()
         return True
 
+    def save_reviewed_label(self):
+        item = self.active_item()
+        if item is None:
+            self.status_var.set("Capture or select a frame before saving a reviewed label.")
+            return False
+        self.update_active_metadata()
+        if not bool(item.get("verified")):
+            self.status_var.set(
+                "Review and correct all four layers, then check Human verified before saving this label."
+            )
+            if hasattr(self, "sidebar_notebook") and hasattr(self, "annotate_tab"):
+                self.sidebar_notebook.select(self.annotate_tab)
+            return False
+        return self.save_current_label()
+
+    def save_verified_negative(self):
+        if self.training_is_running():
+            self.status_var.set("Dataset saving is locked while training is running.")
+            return False
+        item = self.active_item()
+        if item is None:
+            self.status_var.set("No frame selected. Open or capture a frame first.")
+            return False
+        if np.any(item["mask"]) and not messagebox.askyesno(
+            "Save verified negative",
+            "Clear every painted layer and save this frame as a human-verified negative example?",
+        ):
+            return False
+        if np.any(item["mask"]):
+            self.push_undo_state(item)
+        item["mask"].fill(0)
+        item["negative"] = True
+        item["annotation"] = {"origin": "manual", "human_edited": True}
+        self.set_item_verified(item, True)
+        self.verified_var.set(True)
+        if not self.pending_capture_session:
+            item["session_id"] = sanitize_stem(self.session_var.get() or item.get("session_id"))
+            item["notes"] = str(self.notes_var.get())
+        if not self.pending_capture_session:
+            item["split"] = self.split_var.get()
+        item["cable_count"] = max(1, int(self.cable_count_var.get()))
+        image_path, _mask_path = save_label_pair(item, Path(self.dataset_var.get()), index=self.selected_frame_idx)
+        self.status_var.set(f"Saved human-verified negative frame: {image_path.name}")
+        self.refresh_command_text()
+        self.refresh()
+        return True
+
     def save_all_labels(self):
+        if self.training_is_running():
+            self.status_var.set("Dataset saving is locked while training is running.")
+            return False
         if not self.frames:
             self.status_var.set("No frames to save.")
             return False
+        self.update_active_metadata()
         saved = 0
         for index, item in enumerate(self.frames):
-            if int(np.count_nonzero(item["mask"])) == 0:
+            if int(np.count_nonzero(item["mask"])) == 0 and not bool(item.get("negative", False)):
                 continue
             item["cable_count"] = max(1, int(self.cable_count_var.get()))
             save_label_pair(item, Path(self.dataset_var.get()), index=index)
@@ -1460,29 +2270,50 @@ class PidNetTrainingApp:
         skipped = len(self.frames) - saved
         self.status_var.set(
             f"Saved {saved} painted mask(s), skipped {skipped} empty mask(s). "
-            f"Dataset now has train={counts['train']} val={counts['val']}."
+            f"Dataset now has train={counts['train']} val={counts['val']} test={counts['test']}."
         )
         self.refresh_command_text()
         return saved > 0
 
     def current_pidnet_params(self):
+        thresholds = self.preview_thresholds()
         return {
-            "version": 1,
+            "version": 3,
             "dataset": str(Path(self.dataset_var.get())),
             "output": str(Path(self.output_var.get())),
-            "epochs": safe_int(self.epochs_var, 80, min_value=1),
+            "init_checkpoint": str(self.init_checkpoint_var.get()).strip(),
+            "epochs": safe_int(self.epochs_var, 120, min_value=1),
             "batch_size": safe_int(self.batch_var, 8, min_value=1),
             "imgsz": str(self.imgsz_var.get()).strip() or DEFAULT_IMAGE_SIZE,
             "base_channels": safe_int(self.base_channels_var, 24, min_value=1),
-            "cable_count": safe_int(self.cable_count_var, 2, min_value=1, max_value=4),
+            "cable_count": 2,
             "device": str(self.device_var.get() or "cuda"),
             "lr": safe_float(self.lr_var, 1e-3, min_value=1e-8),
             "weight_decay": safe_float(self.weight_decay_var, 1e-4, min_value=0.0),
-            "num_workers": safe_int(self.num_workers_var, 4, min_value=0),
+            "num_workers": safe_int(self.num_workers_var, 2, min_value=0),
+            "prefetch_factor": safe_int(self.prefetch_factor_var, 1, min_value=1),
+            "endpoint_weight": safe_float(self.endpoint_weight_var, 2.0, min_value=0.0),
             "boundary_weight": safe_float(self.boundary_weight_var, 0.20, min_value=0.0),
             "crossing_weight": safe_float(self.crossing_weight_var, 1.0, min_value=0.0),
+            "focal_gamma": safe_float(self.focal_gamma_var, 2.0, min_value=0.0),
+            "dice_weight": safe_float(self.dice_weight_var, 1.0, min_value=0.0),
+            "ema_decay": safe_float(self.ema_decay_var, 0.995, min_value=0.0, max_value=0.99999),
+            "grad_clip": safe_float(self.grad_clip_var, 5.0, min_value=0.0),
+            "early_stop": safe_int(self.early_stop_var, 24, min_value=0),
+            "min_delta": safe_float(self.min_delta_var, 1e-4, min_value=0.0),
+            "seed": safe_int(self.seed_var, 17, min_value=0),
             "amp": bool(self.amp_var.get()),
-            "test_threshold": safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
+            "channels_last": bool(self.channels_last_var.get()),
+            "tf32": bool(self.tf32_var.get()),
+            "compile": bool(self.compile_var.get()),
+            "gpu_augment": bool(self.gpu_augment_var.get()),
+            "deterministic": bool(self.deterministic_var.get()),
+            "verified_only": bool(self.verified_only_var.get()),
+            "evaluate_test": bool(self.evaluate_test_var.get()),
+            "resume_last": bool(self.resume_var.get()),
+            "test_threshold": thresholds["cable"],
+            "endpoint_thresholds": list(thresholds["endpoints"]),
+            "crossing_threshold": thresholds["crossing"],
             "config": str(Path(self.config_var.get() or DEFAULT_CONFIG_PATH)),
             "live_mask_cleanup": self.live_cleanup_params(),
             "label_mask_cleanup": {
@@ -1494,18 +2325,23 @@ class PidNetTrainingApp:
     def apply_pidnet_params(self, params):
         if not isinstance(params, dict):
             raise ValueError("PIDNet parameter file must contain a JSON object.")
+        if int(params.get("cable_count", 2)) != 2:
+            raise ValueError("This project uses exactly two endpoint sets; cable_count must be 2.")
         if "dataset" in params:
             self.dataset_var.set(str(params["dataset"]))
         if "output" in params:
             self.output_var.set(str(params["output"]))
             self.unload_segmenter()
             self.update_model_status()
+        if "init_checkpoint" in params:
+            self.init_checkpoint_var.set(str(params["init_checkpoint"]))
         for key, var in (
             ("epochs", self.epochs_var),
             ("batch_size", self.batch_var),
             ("base_channels", self.base_channels_var),
-            ("cable_count", self.cable_count_var),
             ("num_workers", self.num_workers_var),
+            ("prefetch_factor", self.prefetch_factor_var),
+            ("seed", self.seed_var),
         ):
             if key in params:
                 var.set(int(params[key]))
@@ -1513,17 +2349,47 @@ class PidNetTrainingApp:
             ("lr", self.lr_var),
             ("weight_decay", self.weight_decay_var),
             ("boundary_weight", self.boundary_weight_var),
+            ("endpoint_weight", self.endpoint_weight_var),
             ("crossing_weight", self.crossing_weight_var),
+            ("focal_gamma", self.focal_gamma_var),
+            ("dice_weight", self.dice_weight_var),
+            ("ema_decay", self.ema_decay_var),
+            ("grad_clip", self.grad_clip_var),
+            ("min_delta", self.min_delta_var),
             ("test_threshold", self.test_threshold_var),
         ):
             if key in params:
                 var.set(float(params[key]))
+        if "endpoint_thresholds" in params:
+            values = tuple(float(value) for value in params["endpoint_thresholds"])
+            if len(values) != len(self.endpoint_threshold_vars):
+                raise ValueError(
+                    f"endpoint_thresholds must contain {len(self.endpoint_threshold_vars)} values."
+                )
+            for variable, value in zip(self.endpoint_threshold_vars, values):
+                variable.set(value)
+        if "crossing_threshold" in params:
+            self.crossing_threshold_var.set(float(params["crossing_threshold"]))
         if "imgsz" in params:
             self.imgsz_var.set(str(params["imgsz"]))
         if "device" in params:
             self.device_var.set(str(params["device"]))
         if "amp" in params:
             self.amp_var.set(bool(params["amp"]))
+        for key, variable in (
+            ("channels_last", self.channels_last_var),
+            ("tf32", self.tf32_var),
+            ("compile", self.compile_var),
+            ("gpu_augment", self.gpu_augment_var),
+            ("deterministic", self.deterministic_var),
+            ("verified_only", self.verified_only_var),
+            ("evaluate_test", self.evaluate_test_var),
+            ("resume_last", self.resume_var),
+        ):
+            if key in params:
+                variable.set(bool(params[key]))
+        if "early_stop" in params:
+            self.early_stop_var.set(int(params["early_stop"]))
         if "config" in params:
             self.config_var.set(str(params["config"]))
         self.rebuild_paint_mode_buttons()
@@ -1552,7 +2418,7 @@ class PidNetTrainingApp:
         temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
         temporary_path.write_text(json.dumps(self.current_pidnet_params(), indent=2) + "\n", encoding="utf-8")
         temporary_path.replace(output_path)
-        self.status_var.set(f"Saved PIDNet parameters automatically: {output_path}")
+        self.status_var.set(f"Saved PIDNet parameters: {output_path}")
 
     def load_pidnet_params(self):
         path = filedialog.askopenfilename(
@@ -1578,8 +2444,10 @@ class PidNetTrainingApp:
         total_empty = 0
         total_heavy = 0
         total_shape_mismatch = 0
+        total_unreadable_images = 0
+        total_invalid_layers = 0
         split_stems = {}
-        for split in ("train", "val"):
+        for split in DATASET_SPLITS:
             image_dir = dataset_dir / "images" / split
             mask_dir = dataset_dir / "masks" / split
             layer_dir = dataset_dir / "masks_layers" / split
@@ -1604,13 +2472,19 @@ class PidNetTrainingApp:
             shape_mismatch = 0
             overlap_pixels = 0
             crossing_pixels = 0
+            unreadable_images = 0
+            invalid_layers = 0
+            positive_frames = np.zeros(OUTPUT_CHANNEL_COUNT, dtype=np.int64)
+            both_endpoint_frames = 0
             for image_path, mask_path in pairs:
                 image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if image is None:
+                    unreadable_images += 1
                     continue
                 try:
                     mask, mask_is_multilabel = read_dataset_mask(mask_path, max(1, int(self.cable_count_var.get())))
                 except Exception:
+                    invalid_layers += 1
                     continue
                 if image.shape[:2] != mask.shape[:2]:
                     shape_mismatch += 1
@@ -1627,23 +2501,51 @@ class PidNetTrainingApp:
                         np.count_nonzero(
                             label_pixels(
                                 mask,
-                                crossing_label_value(max(1, int(self.cable_count_var.get()))),
+                                crossing_label_value(),
                                 max(1, int(self.cable_count_var.get())),
                                 multilabel=True,
                             )
                         )
                     )
+                channel_presence = np.asarray(
+                    [
+                        np.any(
+                            label_pixels(
+                                mask,
+                                label,
+                                max(1, int(self.cable_count_var.get())),
+                                multilabel=mask_is_multilabel,
+                            )
+                        )
+                        for label in range(1, OUTPUT_CHANNEL_COUNT + 1)
+                    ],
+                    dtype=np.int64,
+                )
+                positive_frames += channel_presence
+                both_endpoint_frames += int(np.all(channel_presence[list(ENDPOINT_CHANNELS)] > 0))
             total_empty += empty
             total_heavy += heavy
             total_shape_mismatch += shape_mismatch
+            total_unreadable_images += unreadable_images
+            total_invalid_layers += invalid_layers
             lines.append(
                 f"{split}: pairs={len(pairs)} missing_masks={missing_masks} missing_images={missing_images} "
                 f"missing_layers={missing_layers} orphan_layers={orphan_layers} "
                 f"empty={empty} very_large_masks={heavy} shape_mismatch={shape_mismatch} "
-                f"overlap_px={overlap_pixels} crossing_px={crossing_pixels}"
+                f"unreadable_images={unreadable_images} invalid_layers={invalid_layers} "
+                f"overlap_px={overlap_pixels} crossing_px={crossing_pixels} "
+                f"positive_frames=body:{positive_frames[0]}/{len(pairs)},"
+                f"endpoint1:{positive_frames[1]}/{len(pairs)},endpoint2:{positive_frames[2]}/{len(pairs)},"
+                f"crossing:{positive_frames[3]}/{len(pairs)} both_endpoints:{both_endpoint_frames}/{len(pairs)}"
             )
-        split_overlap = sorted(split_stems.get("train", set()) & split_stems.get("val", set()))
-        lines.append(f"train_val_overlap={len(split_overlap)} {split_overlap}")
+        for left_index, left in enumerate(DATASET_SPLITS):
+            for right in DATASET_SPLITS[left_index + 1:]:
+                split_overlap = sorted(split_stems.get(left, set()) & split_stems.get(right, set()))
+                lines.append(f"{left}_{right}_overlap={len(split_overlap)} {split_overlap}")
+        metadata_counts, conflicts = dataset_metadata_counts(dataset_dir)
+        for split in DATASET_SPLITS:
+            lines.append(f"{split}_metadata={metadata_counts[split]}")
+        lines.append(f"session_split_conflicts={conflicts}")
         if total_pairs == 0:
             lines.append("Need saved image/mask pairs before training.")
         report = "\n".join(lines) + "\n"
@@ -1651,7 +2553,8 @@ class PidNetTrainingApp:
         self.output_text.see(tk.END)
         self.status_var.set(
             f"Dataset check complete: pairs={total_pairs}, empty={total_empty}, "
-            f"large={total_heavy}, shape_mismatch={total_shape_mismatch}."
+            f"large={total_heavy}, shape_mismatch={total_shape_mismatch}, "
+            f"unreadable={total_unreadable_images}, invalid_layers={total_invalid_layers}."
         )
 
     def training_command(self):
@@ -1664,7 +2567,7 @@ class PidNetTrainingApp:
             "--output",
             str(Path(self.output_var.get())),
             "--epochs",
-            str(safe_int(self.epochs_var, 80, min_value=1)),
+            str(safe_int(self.epochs_var, 120, min_value=1)),
             "--batch-size",
             str(safe_int(self.batch_var, 8, min_value=1)),
             "--imgsz",
@@ -1672,7 +2575,7 @@ class PidNetTrainingApp:
             "--base-channels",
             str(safe_int(self.base_channels_var, 24, min_value=1)),
             "--cable-count",
-            str(safe_int(self.cable_count_var, 2, min_value=1, max_value=4)),
+            "2",
             "--device",
             str(self.device_var.get() or "cuda"),
             "--lr",
@@ -1680,33 +2583,70 @@ class PidNetTrainingApp:
             "--weight-decay",
             f"{safe_float(self.weight_decay_var, 1e-4, min_value=0.0):.8g}",
             "--num-workers",
-            str(safe_int(self.num_workers_var, 4, min_value=0)),
+            str(safe_int(self.num_workers_var, 2, min_value=0)),
+            "--prefetch-factor",
+            str(safe_int(self.prefetch_factor_var, 1, min_value=1)),
+            "--endpoint-weight",
+            f"{safe_float(self.endpoint_weight_var, 2.0, min_value=0.0):.8g}",
             "--boundary-weight",
             f"{safe_float(self.boundary_weight_var, 0.20, min_value=0.0):.8g}",
             "--crossing-weight",
             f"{safe_float(self.crossing_weight_var, 1.0, min_value=0.0):.8g}",
+            "--focal-gamma",
+            f"{safe_float(self.focal_gamma_var, 2.0, min_value=0.0):.8g}",
+            "--dice-weight",
+            f"{safe_float(self.dice_weight_var, 1.0, min_value=0.0):.8g}",
+            "--ema-decay",
+            f"{safe_float(self.ema_decay_var, 0.995, min_value=0.0, max_value=0.99999):.8g}",
+            "--grad-clip",
+            f"{safe_float(self.grad_clip_var, 5.0, min_value=0.0):.8g}",
+            "--early-stop",
+            str(safe_int(self.early_stop_var, 24, min_value=0)),
+            "--min-delta",
+            f"{safe_float(self.min_delta_var, 1e-4, min_value=0.0):.8g}",
+            "--seed",
+            str(safe_int(self.seed_var, 17, min_value=0)),
         ]
-        command.append("--amp" if bool(self.amp_var.get()) else "--no-amp")
+        for name, enabled in (
+            ("amp", self.amp_var.get()),
+            ("channels-last", self.channels_last_var.get()),
+            ("tf32", self.tf32_var.get()),
+            ("compile", self.compile_var.get()),
+            ("gpu-augment", self.gpu_augment_var.get()),
+            ("deterministic", self.deterministic_var.get()),
+            ("verified-only", self.verified_only_var.get()),
+            ("evaluate-test", self.evaluate_test_var.get()),
+        ):
+            command.append(f"--{name}" if bool(enabled) else f"--no-{name}")
+        if bool(self.resume_var.get()):
+            output = Path(self.output_var.get())
+            last_path = output.with_name(f"{output.stem}_last{output.suffix}")
+            command.extend(("--resume", str(last_path)))
+        elif str(self.init_checkpoint_var.get()).strip():
+            command.extend(("--init-checkpoint", str(Path(self.init_checkpoint_var.get()))))
         return command
 
     def refresh_command_text(self):
         if not hasattr(self, "command_text"):
             return
         cleanup_params = self.live_cleanup_params()
+        thresholds = self.preview_thresholds()
         counts = count_labeled_pairs(Path(self.dataset_var.get()))
-        cable_count = safe_int(self.cable_count_var, 2, min_value=1, max_value=4)
-        convention = (
-            "Mask labels: 0=background, labels 1.."
-            f"{cable_count}=cable body layers merged as cable, labels {cable_count + 1}.."
-            f"{2 * cable_count}=separate endpoint layers endpoints_1..endpoints_{cable_count}, "
-            f"label {crossing_label_value(cable_count)}=crossing."
-        )
+        metadata_counts, conflicts = dataset_metadata_counts(Path(self.dataset_var.get()))
+        convention = "Mask layers: 1=generic cable, 2=Cable 1 endpoints, 3=Cable 2 endpoints, 4=RGB crossing proposal."
         text = (
-            f"Dataset: train={counts['train']} val={counts['val']}\n"
-            f"{convention} All layers are stored as independent bits in masks_layers/*.npz; masks/*.png is the flat preview mask. Old 255 masks load as cable.\n"
-            "Training target: RGB -> cable mask + separated endpoint masks + crossing mask. Crossing uses its own class-balanced loss.\n"
+            f"Dataset: train={counts['train']} val={counts['val']} locked_test={counts['test']} | "
+            f"verified={metadata_counts['train']['verified']}/{metadata_counts['val']['verified']}/{metadata_counts['test']['verified']} | "
+            f"sessions={metadata_counts['train']['sessions']}/{metadata_counts['val']['sessions']}/{metadata_counts['test']['sessions']}\n"
+            f"{convention} Layers are stored as independent bits in masks_layers/*.npz.\n"
+            "Training uses independent focal+Dice losses for cable, endpoint 1, endpoint 2, and crossing; "
+            "the boundary target is the generic cable only.\n"
+            f"Session split conflicts: {len(conflicts)}\n"
             f"Checkpoint: {Path(self.output_var.get())}\n"
-            f"Live cleanup preview: threshold={cleanup_params['threshold']:.2f}, min_area={cleanup_params['min_area_px']}, "
+            f"Live thresholds: cable={thresholds['cable']:.2f}, "
+            f"endpoints={thresholds['endpoints'][0]:.2f}/{thresholds['endpoints'][1]:.2f}, "
+            f"crossing={thresholds['crossing']:.2f}\n"
+            f"Live cleanup preview: min_area={cleanup_params['min_area_px']}, "
             f"open={cleanup_params['open_kernel']}, close={cleanup_params['close_kernel']}\n"
             "Train: use the Train PIDNet-S on CUDA button; the GUI passes these settings to the trainer.\n"
             "PyCharm live run: press Run on main.py with no script parameters. main.py reads config.toml "
@@ -1716,19 +2656,40 @@ class PidNetTrainingApp:
         self.command_text.insert(tk.END, text)
 
     def start_training(self):
-        if self.train_process is not None and self.train_process.poll() is None:
+        if self.training_is_running():
             self.status_var.set("Training is already running.")
             return
         self.save_all_labels()
         counts = count_labeled_pairs(Path(self.dataset_var.get()))
-        if counts["train"] < 1:
-            self.status_var.set("Need at least one saved training mask before training.")
+        metadata_counts, conflicts = dataset_metadata_counts(Path(self.dataset_var.get()))
+        required_key = "verified" if bool(self.verified_only_var.get()) else "items"
+        if counts["train"] < 1 or metadata_counts["train"][required_key] < 1:
+            self.status_var.set("Need at least one saved human-verified training mask before training.")
+            return
+        if counts["val"] < 1 or metadata_counts["val"][required_key] < 1:
+            self.status_var.set("Need at least one saved human-verified validation mask before training.")
+            return
+        if conflicts:
+            self.status_var.set(f"Capture sessions span multiple splits: {sorted(conflicts)}")
+            return
+        if bool(self.resume_var.get()):
+            output = Path(self.output_var.get())
+            last_path = output.with_name(f"{output.stem}_last{output.suffix}")
+            if not last_path.exists():
+                self.status_var.set(f"Resume requested, but the last checkpoint does not exist: {last_path}")
+                return
+        elif str(self.init_checkpoint_var.get()).strip() and not Path(self.init_checkpoint_var.get()).exists():
+            self.status_var.set(f"Initialization checkpoint does not exist: {self.init_checkpoint_var.get()}")
             return
         command = self.training_command()
         self.train_progress_var.set(0.0)
         self.train_summary_var.set("Training starting.")
+        self.training_termination = None
         self.output_text.delete("1.0", tk.END)
-        self.output_text.insert(tk.END, "Starting PIDNet-S training on CUDA from the GUI settings.\n\n")
+        self.output_text.insert(
+            tk.END,
+            f"Starting PIDNet-S training on {self.device_var.get() or 'cuda'} from the GUI settings.\n\n",
+        )
         try:
             self.train_process = subprocess.Popen(
                 command,
@@ -1742,7 +2703,7 @@ class PidNetTrainingApp:
             self.status_var.set(f"Could not start training: {exc}")
             return
         threading.Thread(target=self._read_training_output, daemon=True).start()
-        self.status_var.set("Training started. Watch the output panel for loss and validation IoU.")
+        self.status_var.set("Training started. Watch the output panel for per-head loss and validation score.")
 
     def _read_training_output(self):
         process = self.train_process
@@ -1751,36 +2712,60 @@ class PidNetTrainingApp:
         for line in process.stdout:
             self.output_queue.put(line)
         code = process.wait()
-        self.output_queue.put(f"\nTraining finished with exit code {code}.\n")
+        # Keep the completion marker at the beginning of the queued line so the
+        # progress parser can reliably recognize it and finalize the UI state.
+        self.output_queue.put(f"Training finished with exit code {code}.\n")
 
     def update_training_progress_from_line(self, line):
+        marker_line = line.lstrip("\r\n")
         epoch_match = re.search(
-            r"epoch\s+(\d+)/(\d+)\s+loss\s+([0-9.eE+-]+)\s+val_iou\s+([0-9.eE+-]+)\s+val_dice\s+([0-9.eE+-]+)",
+            r"epoch\s+(\d+)/(\d+)\s+loss\s+([0-9.eE+-]+)\s+val_score\s+([0-9.eE+-]+)\s+"
+            r"val_iou\s+([0-9.eE+-]+)\s+val_dice\s+([0-9.eE+-]+)",
             line,
         )
         if epoch_match:
             epoch = int(epoch_match.group(1))
             total = max(1, int(epoch_match.group(2)))
             loss = float(epoch_match.group(3))
-            iou = float(epoch_match.group(4))
-            dice = float(epoch_match.group(5))
+            score = float(epoch_match.group(4))
+            iou = float(epoch_match.group(5))
+            dice = float(epoch_match.group(6))
             self.train_progress_var.set(100.0 * epoch / total)
-            self.train_summary_var.set(f"Epoch {epoch}/{total} | loss {loss:.4f} | val IoU {iou:.4f} | Dice {dice:.4f}")
+            self.train_summary_var.set(
+                f"Epoch {epoch}/{total} | loss {loss:.4f} | score {score:.4f} | IoU {iou:.4f} | Dice {dice:.4f}"
+            )
             return
-        saved_match = re.search(r"saved\s+(.+?)\s+val_iou=([0-9.eE+-]+)", line)
+        saved_match = re.search(r"saved\s+(.+?)\s+val_score=([0-9.eE+-]+)", line)
         if saved_match:
-            self.train_summary_var.set(f"Saved best checkpoint | val IoU {float(saved_match.group(2)):.4f}")
+            self.train_summary_var.set(f"Saved best checkpoint | score {float(saved_match.group(2)):.4f}")
             return
-        if line.startswith("Training on "):
-            self.train_summary_var.set(line.strip())
+        if marker_line.startswith("Training on "):
+            self.train_summary_var.set(marker_line.strip())
             return
-        if line.startswith("Training finished"):
-            code_match = re.search(r"exit code\s+(-?\d+)", line)
+        if marker_line.startswith("EARLY STOP:"):
+            stopped_match = re.search(r"Stopped at epoch\s+(\d+)", marker_line)
+            stopped_epoch = int(stopped_match.group(1)) if stopped_match else None
+            self.training_termination = "early_stop"
+            suffix = f" at epoch {stopped_epoch}" if stopped_epoch is not None else ""
+            self.train_summary_var.set(
+                f"Training ended by early stopping{suffix}; see the log for the exact plateau criterion."
+            )
+            return
+        if marker_line.startswith("TRAINING COMPLETE:"):
+            self.training_termination = "maximum_epochs"
+            self.train_progress_var.set(100.0)
+            self.train_summary_var.set(marker_line.strip())
+            return
+        if marker_line.startswith("Training finished"):
+            code_match = re.search(r"exit code\s+(-?\d+)", marker_line)
             code = int(code_match.group(1)) if code_match else 0
             if code == 0:
-                self.train_progress_var.set(100.0)
-                self.train_summary_var.set("Training finished.")
+                if self.training_termination != "early_stop":
+                    self.train_progress_var.set(100.0)
+                    if self.training_termination != "maximum_epochs":
+                        self.train_summary_var.set("Training finished successfully.")
             else:
+                self.training_termination = "process_error"
                 self.train_summary_var.set(f"Training stopped with exit code {code}.")
 
     def poll_training_output(self):
@@ -1792,19 +2777,22 @@ class PidNetTrainingApp:
             self.output_text.insert(tk.END, line)
             self.output_text.see(tk.END)
             self.update_training_progress_from_line(line)
-            if line.startswith("Training finished"):
+            if line.lstrip("\r\n").startswith("Training finished"):
                 self.unload_segmenter()
                 self.update_model_status()
-                self.status_var.set(line.strip())
+                self.status_var.set(self.train_summary_var.get())
         self.root.after(100, self.poll_training_output)
 
     def stop_training(self):
-        if self.train_process is None or self.train_process.poll() is not None:
+        if not self.training_is_running():
             self.status_var.set("No training process is running.")
             return
         self.train_process.terminate()
         self.train_summary_var.set("Training stop requested.")
         self.status_var.set("Requested training stop.")
+
+    def training_is_running(self):
+        return self.train_process is not None and self.train_process.poll() is None
 
     def active_frame_key(self):
         item = self.active_item()
@@ -1824,6 +2812,7 @@ class PidNetTrainingApp:
 
     def cleaned_prediction_label_mask(self, probability, include_endpoints=True):
         params = self.live_cleanup_params()
+        thresholds = self.preview_thresholds()
         probability = np.asarray(probability, dtype=np.float32)
         configured_cable_count = max(1, int(self.cable_count_var.get()))
         expected_channels = OUTPUT_CHANNEL_COUNT
@@ -1835,18 +2824,21 @@ class PidNetTrainingApp:
             raise ValueError(f"Unsupported PIDNet label mode: {self.prediction_label_mode!r}")
         labels = np.zeros(probability.shape[:2], dtype=np.uint8)
         raw_labels = np.zeros(probability.shape[:2], dtype=np.uint8)
-        raw = (probability[:, :, 0] >= params["threshold"]).astype(np.uint8) * 255
+        raw = (probability[:, :, 0] >= thresholds["cable"]).astype(np.uint8) * 255
         cleaned, component_count = apply_binary_cleanup(raw, params)
         raw_labels[raw > 0] = 1
         labels[cleaned > 0] = 1
         if bool(include_endpoints):
             for endpoint_index in range(configured_cable_count):
-                endpoint_raw = probability[:, :, 1 + endpoint_index] >= params["threshold"]
+                endpoint_raw = (
+                    probability[:, :, 1 + endpoint_index]
+                    >= thresholds["endpoints"][endpoint_index]
+                )
                 endpoint_label = endpoint_label_value(endpoint_index + 1, configured_cable_count)
                 raw_labels[endpoint_raw] = endpoint_label
                 labels[endpoint_raw] = endpoint_label
         crossing_channel = CROSSING_CHANNEL
-        crossing_raw = probability[:, :, crossing_channel] >= params["threshold"]
+        crossing_raw = probability[:, :, crossing_channel] >= thresholds["crossing"]
         crossing_label = crossing_label_value(configured_cable_count)
         raw_labels[crossing_raw] = crossing_label
         labels[crossing_raw] = crossing_label
@@ -1866,6 +2858,30 @@ class PidNetTrainingApp:
         return np.ascontiguousarray(
             np.max(probability[:, :, 1:1 + cable_count], axis=2),
             dtype=np.float32,
+        )
+
+    def endpoint_prediction_mask(self, probability):
+        masks = self.endpoint_prediction_masks(probability)
+        result = np.zeros(masks[0].shape, dtype=bool)
+        for mask in masks:
+            result |= mask
+        return np.ascontiguousarray(result)
+
+    def endpoint_prediction_masks(self, probability):
+        probability = np.asarray(probability, dtype=np.float32)
+        cable_count = max(1, int(self.cable_count_var.get()))
+        if probability.ndim != 3 or probability.shape[2] != OUTPUT_CHANNEL_COUNT:
+            raise ValueError(
+                f"PIDNet prediction must have {OUTPUT_CHANNEL_COUNT} channels; got {probability.shape}."
+            )
+        thresholds = self.preview_thresholds()["endpoints"]
+        if cable_count != len(thresholds):
+            raise ValueError(
+                f"Preview has {len(thresholds)} endpoint thresholds for {cable_count} cables."
+            )
+        return tuple(
+            np.ascontiguousarray(probability[:, :, 1 + endpoint_index] >= threshold)
+            for endpoint_index, threshold in enumerate(thresholds)
         )
 
     def crossing_probability(self, probability):
@@ -1932,17 +2948,17 @@ class PidNetTrainingApp:
         bgr = self.active_bgr()
         if bgr is None:
             self.status_var.set("No frame to test. Open an image or capture from ZED first.")
-            return
+            return False
         try:
             segmenter = self.load_segmenter()
         except Exception as exc:
             self.status_var.set(f"Could not load PIDNet checkpoint: {exc}")
-            return
+            return False
         if self.active_item() is None:
             self.live_test_var.set(True)
-            self.update_live_prediction_if_needed(force=True)
+            updated = self.update_live_prediction_if_needed(force=True)
             self.refresh()
-            return
+            return bool(updated)
         try:
             item = self.active_item()
             probability = self.segmenter_probability(
@@ -1953,60 +2969,99 @@ class PidNetTrainingApp:
             )
         except Exception as exc:
             self.status_var.set(f"Could not test PIDNet checkpoint: {exc}")
-            return
+            return False
 
         self.prediction_probability = probability
         self.prediction_frame_key = self.active_frame_key()
         self.prediction_label_mode = str(getattr(segmenter, "label_mode", "")).strip().lower()
         predicted, _raw_predicted, component_count = self.cleaned_prediction_mask(probability)
-        if item is not None and np.any(item["mask"]):
+        if item is not None:
             cable_count = max(1, int(self.cable_count_var.get()))
-            body_target = body_label_mask(item["mask"], cable_count, multilabel=True)
-            endpoint_target = endpoint_label_mask(item["mask"], cable_count, multilabel=True)
-            endpoint_probability = self.endpoint_probability_union(probability)
-            endpoint_text = ""
-            if np.any(endpoint_target) and endpoint_probability.shape == endpoint_target.shape:
-                endpoint_metrics = binary_mask_metrics(
-                    endpoint_probability >= safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
-                    endpoint_target,
-                )
-                endpoint_text = f" | end IoU {endpoint_metrics['iou']:.3f}"
-            crossing_target = crossing_label_mask(item["mask"], cable_count, multilabel=True)
-            crossing_probability = self.crossing_probability(probability)
-            crossing_pixels = int(np.count_nonzero(crossing_probability >= safe_float(
-                self.test_threshold_var,
-                0.50,
-                min_value=0.05,
-                max_value=0.95,
-            )))
-            crossing_text = f" | cross {crossing_pixels}px"
-            if np.any(crossing_target):
-                crossing_metrics = binary_mask_metrics(
-                    crossing_probability >= safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95),
-                    crossing_target,
-                )
-                crossing_text = f" | cross IoU {crossing_metrics['iou']:.3f} ({crossing_pixels}px)"
-            if np.any(body_target):
-                metrics = binary_mask_metrics(predicted, body_target)
-                self.prediction_summary = (
-                    f"IoU {metrics['iou']:.3f} Dice {metrics['dice']:.3f} | "
-                    f"pred {metrics['predicted']} label {metrics['target']} comp {component_count}"
-                    f"{endpoint_text}{crossing_text}"
-                )
-            elif np.any(endpoint_target):
-                self.prediction_summary = (
-                    f"cleaned cable pixels {int(np.count_nonzero(predicted))} comp {component_count} | "
-                    "paint cable bodies for IoU/Dice"
-                )
-            else:
-                self.prediction_summary = (
-                    f"cleaned cable pixels {int(np.count_nonzero(predicted))} comp {component_count} | "
-                    "paint endpoint labels for endpoint preview"
-                )
+            targets = self.target_masks_by_channel(item["mask"], multilabel=True)
+            predictions = self.prediction_masks_by_channel(probability)
+            metrics = [binary_mask_metrics(predicted_mask, target) for predicted_mask, target in zip(predictions, targets)]
+            self.prediction_summary = (
+                f"IoU body/e1/e2/cross {metrics[0]['iou']:.3f}/{metrics[1]['iou']:.3f}/"
+                f"{metrics[2]['iou']:.3f}/{metrics[3]['iou']:.3f} | pred px "
+                f"{metrics[0]['predicted']}/{metrics[1]['predicted']}/{metrics[2]['predicted']}/"
+                f"{metrics[3]['predicted']} | body comp {component_count}"
+            )
         else:
             self.prediction_summary = f"cleaned cable pixels {int(np.count_nonzero(predicted))} comp {component_count}"
         self.status_var.set(f"Tested PIDNet checkpoint on current frame: {self.prediction_summary}")
         self.refresh()
+        return True
+
+    def predict_current_capture_as_draft(self):
+        """Freeze/select a capture, infer once, and enter normal editable annotation mode."""
+        if self.training_is_running():
+            self.status_var.set("Wait for training to finish before loading its checkpoint for a prediction draft.")
+            return False
+
+        # Leaving live preview reveals an already selected capture. If there is
+        # no captured frame yet, freeze the current ZED image first.
+        if self.active_item() is None and self.frames:
+            self.live_test_var.set(False)
+            self.prediction_probability = None
+            self.prediction_frame_key = None
+            self.prediction_label_mode = ""
+            self.prediction_summary = ""
+        if self.active_item() is None:
+            if self.latest_bgr is None:
+                self.status_var.set("No current capture is available. Wait for ZED or open an image first.")
+                return False
+            if not self.capture_current_frame():
+                return False
+
+        if not self.test_current_frame():
+            return False
+        return self.use_prediction_as_draft(run_if_missing=False)
+
+    def use_prediction_as_draft(self, run_if_missing=True):
+        item = self.active_item()
+        if item is None:
+            self.status_var.set("Select a captured or saved frame before applying a prediction draft.")
+            return False
+        if bool(run_if_missing) and (
+            self.prediction_probability is None or self.prediction_frame_key != self.active_frame_key()
+        ):
+            if not self.test_current_frame():
+                return False
+        if self.prediction_probability is None or self.prediction_frame_key != self.active_frame_key():
+            return False
+        predicted_channels = self.prediction_masks_by_channel(self.prediction_probability)
+        draft = prediction_channels_to_draft(predicted_channels, item["mask"].shape)
+        if np.any(item["mask"]) and not messagebox.askyesno(
+            "Replace current annotation",
+            "Replace the current paint layers with this model prediction?\n\n"
+            "The existing annotation will remain available through Undo.",
+        ):
+            self.status_var.set("Kept the current annotation; the prediction remains available in Model preview.")
+            return False
+        draft_metadata = self.model_draft_metadata()
+        self.push_undo_state(item)
+        item["mask"] = draft
+        item["annotation"] = draft_metadata
+        self.set_item_verified(item, False)
+        item["negative"] = False
+        item["dirty"] = True
+        self.verified_var.set(False)
+        # The prediction has now become the annotation. Clear the heatmap so
+        # both canvases show the same editable layers used by manual painting.
+        self.live_test_var.set(False)
+        self.prediction_probability = None
+        self.prediction_frame_key = None
+        self.prediction_label_mode = ""
+        self.prediction_summary = ""
+        if hasattr(self, "sidebar_notebook") and hasattr(self, "annotate_tab"):
+            self.sidebar_notebook.select(self.annotate_tab)
+        self.update_draft_status()
+        self.refresh()
+        self.status_var.set(
+            "Created an unverified editable draft from the current prediction. "
+            "Correct it on the source image, review all four layers, then mark Human verified and save."
+        )
+        return True
 
     def toggle_live_segmentation(self):
         if self.live_test_var.get():
@@ -2049,10 +3104,11 @@ class PidNetTrainingApp:
         self.prediction_frame_key = ("live", tuple(bgr.shape[:2]))
         self.prediction_label_mode = str(getattr(segmenter, "label_mode", "")).strip().lower()
         predicted, _raw_predicted, component_count = self.cleaned_prediction_mask(probability)
-        endpoint_probability = self.endpoint_probability_union(probability)
-        endpoint_pixels = int(np.count_nonzero(endpoint_probability >= safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95)))
+        endpoint_pixels = int(np.count_nonzero(self.endpoint_prediction_mask(probability)))
         crossing_probability = self.crossing_probability(probability)
-        crossing_pixels = int(np.count_nonzero(crossing_probability >= safe_float(self.test_threshold_var, 0.50, min_value=0.05, max_value=0.95)))
+        crossing_pixels = int(np.count_nonzero(
+            crossing_probability >= self.preview_thresholds()["crossing"]
+        ))
         self.prediction_summary = (
             f"live cable pixels {int(np.count_nonzero(predicted))} endpoints {endpoint_pixels} "
             f"crossing {crossing_pixels} comp {component_count}"
@@ -2060,28 +3116,44 @@ class PidNetTrainingApp:
         self.live_test_last_time = now
         return True
 
+    def target_masks_by_channel(self, mask, multilabel):
+        cable_count = max(1, int(self.cable_count_var.get()))
+        return (
+            body_label_mask(mask, cable_count, multilabel=multilabel),
+            label_pixels(mask, endpoint_label_value(1), cable_count, multilabel=multilabel),
+            label_pixels(mask, endpoint_label_value(2), cable_count, multilabel=multilabel),
+            crossing_label_mask(mask, cable_count, multilabel=multilabel),
+        )
+
+    def prediction_masks_by_channel(self, probability):
+        body, _raw_body, _component_count = self.cleaned_prediction_mask(probability)
+        endpoint1, endpoint2 = self.endpoint_prediction_masks(probability)
+        crossing = self.crossing_probability(probability) >= self.preview_thresholds()["crossing"]
+        return body, endpoint1, endpoint2, crossing
+
     def test_dataset_split(self, split):
+        split = str(split).strip().lower()
+        if split == "test" and not messagebox.askyesno(
+            "Locked test set",
+            "Evaluate the locked test set now? Do not use this result to tune thresholds, training, or architecture.",
+        ):
+            return
         try:
             segmenter = self.load_segmenter()
         except Exception as exc:
             self.status_var.set(f"Could not load PIDNet checkpoint: {exc}")
             return
-        pairs = dataset_image_mask_pairs(Path(self.dataset_var.get()), split)
+        pairs = dataset_image_mask_pairs(Path(self.dataset_var.get()), split, verified_only=True)
         if not pairs:
             self.status_var.set(f"No saved {split} image/mask pairs to test.")
             return
 
         params = self.live_cleanup_params()
-        intersection = 0
-        union = 0
-        dice_num = 0
-        dice_den = 0
-        endpoint_intersection = 0
-        endpoint_union = 0
-        endpoint_tested = 0
-        crossing_intersection = 0
-        crossing_union = 0
-        crossing_tested = 0
+        thresholds = self.preview_thresholds()
+        intersection = np.zeros(OUTPUT_CHANNEL_COUNT, dtype=np.int64)
+        union = np.zeros(OUTPUT_CHANNEL_COUNT, dtype=np.int64)
+        predicted_count = np.zeros(OUTPUT_CHANNEL_COUNT, dtype=np.int64)
+        target_count = np.zeros(OUTPUT_CHANNEL_COUNT, dtype=np.int64)
         tested = 0
         cable_count = max(1, int(self.cable_count_var.get()))
         for image_path, mask_path in pairs:
@@ -2092,48 +3164,102 @@ class PidNetTrainingApp:
             mask, mask_is_multilabel = read_dataset_mask(mask_path, cable_count)
             probability = self.segmenter_probability(segmenter, bgr, mask=mask, mask_is_multilabel=mask_is_multilabel)
             self.prediction_label_mode = str(getattr(segmenter, "label_mode", "")).strip().lower()
-            predicted, _raw_predicted, _component_count = self.cleaned_prediction_mask(probability)
-            target = body_label_mask(mask, cable_count, multilabel=mask_is_multilabel)
-            if predicted.shape != target.shape:
-                target = cv2.resize(target.astype(np.uint8), (predicted.shape[1], predicted.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
-            inter = int(np.count_nonzero(predicted & target))
-            pred_count = int(np.count_nonzero(predicted))
-            target_count = int(np.count_nonzero(target))
-            intersection += inter
-            union += int(np.count_nonzero(predicted | target))
-            dice_num += 2 * inter
-            dice_den += pred_count + target_count
-            endpoint_target = endpoint_label_mask(mask, cable_count, multilabel=mask_is_multilabel)
-            endpoint_probability = self.endpoint_probability_union(probability)
-            if np.any(endpoint_target) and endpoint_probability.shape == endpoint_target.shape:
-                endpoint_predicted = endpoint_probability >= params["threshold"]
-                endpoint_intersection += int(np.count_nonzero(endpoint_predicted & endpoint_target))
-                endpoint_union += int(np.count_nonzero(endpoint_predicted | endpoint_target))
-                endpoint_tested += 1
-            crossing_target = crossing_label_mask(mask, cable_count, multilabel=mask_is_multilabel)
-            crossing_probability = self.crossing_probability(probability)
-            if np.any(crossing_target) and crossing_probability.shape == crossing_target.shape:
-                crossing_predicted = crossing_probability >= params["threshold"]
-                crossing_intersection += int(np.count_nonzero(crossing_predicted & crossing_target))
-                crossing_union += int(np.count_nonzero(crossing_predicted | crossing_target))
-                crossing_tested += 1
+            predicted_channels = self.prediction_masks_by_channel(probability)
+            target_channels = self.target_masks_by_channel(mask, mask_is_multilabel)
+            for channel, (predicted, target) in enumerate(zip(predicted_channels, target_channels)):
+                if predicted.shape != target.shape:
+                    target = cv2.resize(
+                        target.astype(np.uint8),
+                        (predicted.shape[1], predicted.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    ) > 0
+                intersection[channel] += int(np.count_nonzero(predicted & target))
+                union[channel] += int(np.count_nonzero(predicted | target))
+                predicted_count[channel] += int(np.count_nonzero(predicted))
+                target_count[channel] += int(np.count_nonzero(target))
             tested += 1
 
         if tested == 0:
             self.status_var.set(f"Could not read any saved {split} pairs.")
             return
-        iou = intersection / max(union, 1)
-        dice = dice_num / max(dice_den, 1)
-        endpoint_text = ""
-        if endpoint_tested > 0:
-            endpoint_text = f" | endpoint IoU {endpoint_intersection / max(endpoint_union, 1):.4f}"
-        crossing_text = ""
-        if crossing_tested > 0:
-            crossing_text = f" | crossing IoU {crossing_intersection / max(crossing_union, 1):.4f}"
+        iou = intersection / np.maximum(union, 1)
+        dice = 2.0 * intersection / np.maximum(predicted_count + target_count, 1)
         line = (
-            f"{split} test: {tested} images | threshold {params['threshold']:.2f} "
+            f"{split} test: {tested} images | thresholds "
+            f"{thresholds['cable']:.2f}/"
+            f"{thresholds['endpoints'][0]:.2f}/{thresholds['endpoints'][1]:.2f}/"
+            f"{thresholds['crossing']:.2f} "
             f"open {params['open_kernel']} close {params['close_kernel']} min_area {params['min_area_px']} "
-            f"| body IoU {iou:.4f} | Dice {dice:.4f}{endpoint_text}{crossing_text}\n"
+            f"| body IoU/Dice {iou[0]:.4f}/{dice[0]:.4f} "
+            f"| endpoint1 IoU/Dice {iou[1]:.4f}/{dice[1]:.4f} "
+            f"| endpoint2 IoU/Dice {iou[2]:.4f}/{dice[2]:.4f} "
+            f"| crossing IoU/Dice {iou[3]:.4f}/{dice[3]:.4f}\n"
+        )
+        self.output_text.insert(tk.END, line)
+        self.output_text.see(tk.END)
+        self.status_var.set(line.strip())
+
+    def calibrate_validation_thresholds(self):
+        try:
+            segmenter = self.load_segmenter()
+        except Exception as exc:
+            self.status_var.set(f"Could not load PIDNet checkpoint: {exc}")
+            return
+        pairs = dataset_image_mask_pairs(Path(self.dataset_var.get()), "val", verified_only=True)
+        if not pairs:
+            self.status_var.set("No validation image/mask pairs to calibrate.")
+            return
+        grid = np.linspace(0.05, 0.95, 19, dtype=np.float32)
+        intersection = np.zeros((OUTPUT_CHANNEL_COUNT, len(grid)), dtype=np.int64)
+        union = np.zeros_like(intersection)
+        cleanup = self.live_cleanup_params()
+        cable_count = max(1, int(self.cable_count_var.get()))
+        tested = 0
+        for image_path, mask_path in pairs:
+            bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if bgr is None:
+                continue
+            mask, multilabel = read_dataset_mask(mask_path, cable_count)
+            probability = self.segmenter_probability(segmenter, bgr, mask=mask, mask_is_multilabel=multilabel)
+            target_channels = self.target_masks_by_channel(mask, multilabel)
+            for channel in range(OUTPUT_CHANNEL_COUNT):
+                target = target_channels[channel]
+                for threshold_index, threshold in enumerate(grid):
+                    raw = probability[:, :, channel] >= float(threshold)
+                    if channel == 0:
+                        cleaned, _component_count = apply_binary_cleanup(
+                            raw.astype(np.uint8) * 255,
+                            cleanup,
+                        )
+                        predicted = cleaned > 0
+                    else:
+                        predicted = raw
+                    if target.shape != predicted.shape:
+                        resized_target = cv2.resize(
+                            target.astype(np.uint8),
+                            (predicted.shape[1], predicted.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        ) > 0
+                    else:
+                        resized_target = target
+                    intersection[channel, threshold_index] += int(np.count_nonzero(predicted & resized_target))
+                    union[channel, threshold_index] += int(np.count_nonzero(predicted | resized_target))
+            tested += 1
+        if tested == 0:
+            self.status_var.set("Could not read validation frames for calibration.")
+            return
+        iou = intersection / np.maximum(union, 1)
+        indices = [int(np.argmax(iou[channel] - 1e-9 * np.abs(grid - 0.5))) for channel in range(OUTPUT_CHANNEL_COUNT)]
+        calibrated = [float(grid[index]) for index in indices]
+        self.test_threshold_var.set(calibrated[0])
+        self.endpoint_threshold_vars[0].set(calibrated[1])
+        self.endpoint_threshold_vars[1].set(calibrated[2])
+        self.crossing_threshold_var.set(calibrated[3])
+        self.on_threshold_change()
+        line = (
+            f"Validation calibration ({tested} frames): thresholds "
+            f"{'/'.join(f'{value:.2f}' for value in calibrated)} | IoU "
+            f"{'/'.join(f'{iou[channel, indices[channel]]:.4f}' for channel in range(OUTPUT_CHANNEL_COUNT))}\n"
         )
         self.output_text.insert(tk.END, line)
         self.output_text.see(tk.END)
@@ -2179,14 +3305,40 @@ class PidNetTrainingApp:
             self.photo_refs[name] = photo
             canvas.delete("all")
             canvas.create_image(0, 0, image=photo, anchor=tk.NW)
+        self.update_draft_status()
         self.update_status_counts()
         self.refresh_command_text()
+
+    def visible_label_values(self):
+        mapping = {
+            "cable": 1,
+            "endpoint1": endpoint_label_value(1),
+            "endpoint2": endpoint_label_value(2),
+            "crossing": crossing_label_value(),
+        }
+        return {
+            label
+            for name, label in mapping.items()
+            if bool(self.label_visibility_vars[name].get())
+        }
+
+    def filtered_label_mask(self, mask, multilabel=True):
+        visible = self.visible_label_values()
+        if bool(multilabel):
+            result = np.zeros_like(np.asarray(mask, dtype=np.uint16))
+            for label in visible:
+                bit = np.uint16(label_bit(label))
+                result |= np.asarray(mask, dtype=np.uint16) & bit
+            return result
+        result = np.asarray(mask).copy()
+        result[~np.isin(result, list(visible))] = 0
+        return result
 
     def make_overlay_panel(self, bgr, mask):
         panel = bgr.copy()
         draw_label_mask(
             panel,
-            mask,
+            self.filtered_label_mask(mask, multilabel=True),
             alpha=0.55,
             cable_count=max(1, int(self.cable_count_var.get())),
             multilabel=True,
@@ -2204,7 +3356,13 @@ class PidNetTrainingApp:
 
     def make_mask_panel(self, bgr, mask):
         panel = np.full_like(bgr, 18)
-        draw_label_mask(panel, mask, alpha=1.0, cable_count=max(1, int(self.cable_count_var.get())), multilabel=True)
+        draw_label_mask(
+            panel,
+            self.filtered_label_mask(mask, multilabel=True),
+            alpha=1.0,
+            cable_count=max(1, int(self.cable_count_var.get())),
+            multilabel=True,
+        )
         if not np.any(mask):
             state = item_mask_state(self.active_item())
             if state == "MASK MISSING":
@@ -2232,38 +3390,52 @@ class PidNetTrainingApp:
             return self.make_mask_panel(bgr, mask)
 
         params = self.live_cleanup_params()
-        threshold = params["threshold"]
+        thresholds = self.preview_thresholds()
         cable_count = max(1, int(self.cable_count_var.get()))
-        predicted_labels, raw_predicted_labels, component_count = self.cleaned_prediction_label_mask(probability)
-        predicted, raw_predicted, _cable_component_count = self.cleaned_prediction_mask(probability)
-        label = body_label_mask(mask, cable_count, multilabel=True)
-        if label.shape != predicted.shape:
-            label = cv2.resize(label.astype(np.uint8), (predicted.shape[1], predicted.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
-
-        probability_union = self.labeled_probability_union(probability)
-        heat = cv2.applyColorMap(np.clip(probability_union * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        predicted_labels, _raw_predicted_labels, component_count = self.cleaned_prediction_label_mask(probability)
+        predicted_channels = self.prediction_masks_by_channel(probability)
+        target_channels = self.target_masks_by_channel(mask, multilabel=True)
+        selected = str(self.prediction_channel_var.get() or "combined")
+        channel_map = {"cable": 0, "endpoint1": 1, "endpoint2": 2, "crossing": 3}
+        if selected == "combined":
+            heat_probability = self.labeled_probability_union(probability)
+        else:
+            heat_probability = np.asarray(probability, dtype=np.float32)[:, :, channel_map[selected]]
+        heat = cv2.applyColorMap(np.clip(heat_probability * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
         panel = cv2.addWeighted(bgr, 0.72, heat, 0.28, 0.0)
-        draw_label_mask(panel, predicted_labels, alpha=0.94, cable_count=cable_count, outline=True)
-        crossing_predicted = self.crossing_probability(probability) >= threshold
-        crossing_target = crossing_label_mask(mask, cable_count, multilabel=True)
-        if np.any(label):
-            false_positive = predicted & ~label
-            false_negative = ~predicted & label
+        visible_prediction = self.filtered_label_mask(predicted_labels, multilabel=False)
+        draw_label_mask(panel, visible_prediction, alpha=0.94, cable_count=cable_count, outline=True)
+        if selected in channel_map:
+            channel = channel_map[selected]
+            predicted = predicted_channels[channel]
+            target = target_channels[channel]
+            if target.shape != predicted.shape:
+                target = cv2.resize(
+                    target.astype(np.uint8),
+                    (predicted.shape[1], predicted.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ) > 0
+            true_positive = predicted & target
+            false_positive = predicted & ~target
+            false_negative = ~predicted & target
+            draw_stroke_mask(panel, true_positive.astype(np.uint8) * 255, (40, 220, 40), alpha=0.32)
             draw_mask_contours(panel, false_positive.astype(np.uint8) * 255, (40, 40, 255), thickness=2)
             draw_mask_contours(panel, false_negative.astype(np.uint8) * 255, (255, 80, 40), thickness=2)
-            if np.any(crossing_target):
-                crossing_extra = crossing_predicted & ~crossing_target
-                crossing_missed = ~crossing_predicted & crossing_target
-                draw_mask_contours(panel, crossing_extra.astype(np.uint8) * 255, (40, 40, 255), thickness=3)
-                draw_mask_contours(panel, crossing_missed.astype(np.uint8) * 255, (255, 80, 40), thickness=3)
-            legend = "cable green | endpoints magenta/cyan | crossing yellow | red extra | blue missed"
+            metrics = binary_mask_metrics(predicted, target)
+            legend = (
+                f"{selected}: green TP | red FP | blue FN | "
+                f"IoU {metrics['iou']:.3f} Dice {metrics['dice']:.3f}"
+            )
         else:
-            removed = raw_predicted & ~predicted
+            predicted_body, raw_body, _body_component_count = self.cleaned_prediction_mask(probability)
+            removed = raw_body & ~predicted_body
             draw_stroke_mask(panel, removed.astype(np.uint8) * 255, (64, 64, 180), alpha=0.42)
-            legend = "cable green | endpoints magenta/cyan | crossing yellow | dim red removed"
+            legend = "combined heatmap | select one channel for TP/FP/FN diagnostics"
         cv2.putText(
             panel,
-            f"thr {threshold:.2f} open {params['open_kernel']} close {params['close_kernel']} min {params['min_area_px']}",
+            f"channel {selected} | thresholds {thresholds['cable']:.2f}/{thresholds['endpoints'][0]:.2f}/"
+            f"{thresholds['endpoints'][1]:.2f}/{thresholds['crossing']:.2f} | open {params['open_kernel']} "
+            f"close {params['close_kernel']} min {params['min_area_px']}",
             (24, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.62,
@@ -2272,7 +3444,9 @@ class PidNetTrainingApp:
             cv2.LINE_AA,
         )
         cv2.putText(panel, legend, (24, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-        summary = self.prediction_summary or f"components {component_count} | cleaned px {int(np.count_nonzero(predicted))}"
+        summary = self.prediction_summary or (
+            f"components {component_count} | cleaned body px {int(np.count_nonzero(predicted_channels[0]))}"
+        )
         cv2.putText(panel, summary[:80], (24, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
         return panel
 
@@ -2301,13 +3475,22 @@ class PidNetTrainingApp:
                 f"cable={int(np.count_nonzero(body_label_mask(item['mask'], cable_count, multilabel=True)))}"
             ]
             counts.extend(
-                f"endpoints_{index}={int(np.count_nonzero(label_pixels(item['mask'], endpoint_label_value(index, cable_count), cable_count, multilabel=True)))}"
+                f"endpoints_{index}={int(np.count_nonzero(label_pixels(item['mask'], endpoint_label_value(index), cable_count, multilabel=True)))}"
                 for index in range(1, cable_count + 1)
             )
             counts.append(
-                f"crossing={int(np.count_nonzero(label_pixels(item['mask'], crossing_label_value(cable_count), cable_count, multilabel=True)))}"
+                f"crossing={int(np.count_nonzero(label_pixels(item['mask'], crossing_label_value(), cable_count, multilabel=True)))}"
             )
             label_counts = " | " + " ".join(counts)
+            duplicate_text = (
+                f" | near-duplicate={item['near_duplicate_of']} d={item['near_duplicate_distance']:.4f}"
+                if item.get("near_duplicate_of") else ""
+            )
+            label_counts += (
+                f" | session={item.get('session_id')} verified={bool(item.get('verified'))} "
+                f"negative={bool(item.get('negative'))}"
+                f"{duplicate_text}"
+            )
         drag_mode = "draw" if self.draw_when_zoomed_var.get() else "pan"
         test_text = ""
         if self.live_test_var.get() and item is None:
@@ -2458,6 +3641,9 @@ class PidNetTrainingApp:
     def on_left_down(self, event):
         canvas_index = self.canvases.index(event.widget)
         if canvas_index == 0 and self.should_paint_with_left_drag() and self.point_is_inside_display(event.widget, event.x, event.y):
+            item = self.active_item()
+            if item is not None:
+                self.push_undo_state(item)
             self.drawing = True
             self.last_image_xy = self.panel_to_image_xy(event.widget, event.x, event.y)
             self.paint_at(*self.last_image_xy)
@@ -2548,15 +3734,20 @@ class PidNetTrainingApp:
         pixels = np.asarray(brush, dtype=np.uint8) > 0
         if not np.any(pixels):
             return
+        previous = item["mask"][pixels].copy()
         mode = str(self.mode_var.get())
         if mode == "erase":
             item["mask"][pixels] = 0
         elif mode == "erase_crossing":
-            bit = label_bit(crossing_label_value(self.cable_count_var.get()))
+            bit = label_bit(crossing_label_value())
             item["mask"][pixels] &= np.uint16(~int(bit) & 0xFFFF)
         else:
-            item["mask"][pixels] |= label_bit(self.active_label_value())
-        item["dirty"] = True
+            active_label = self.active_label_value()
+            item["mask"][pixels] |= label_bit(active_label)
+            if active_label != 1:
+                item["mask"][pixels] |= label_bit(1)
+        if not np.array_equal(previous, item["mask"][pixels]):
+            self.mark_item_human_edited(item)
 
     def request_close(self):
         if not self.confirm_discard_unsaved("close the labeling GUI"):

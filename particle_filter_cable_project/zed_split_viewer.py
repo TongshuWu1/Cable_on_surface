@@ -56,9 +56,8 @@ UI_ACCENT_2 = (0.250, 0.780, 0.520)
 VISIBLE_COLOR = (0.25, 1.00, 0.48)
 EXTENDED_COLOR = (1.00, 0.82, 0.16)
 OCCLUDED_COLOR = (1.00, 0.18, 0.20)
-CROSSING_ONLY_COLOR = (0.10, 0.78, 1.00)
-CONTACT_COLOR = (0.20, 1.00, 0.35)
 CABLE_SAMPLE_COLOR = (1.00, 0.58, 0.08)
+CROSSING_SAMPLE_COLOR = (0.05, 0.35, 1.00)
 PARTICLE_MAP_COLOR = (1.00, 1.00, 1.00)
 PARTICLE_SPREAD_COLOR = (0.80, 0.52, 1.00)
 START_NODE_COLOR = (0.00, 0.78, 1.00)
@@ -74,6 +73,7 @@ ENDPOINT_GROUP_COLORS = (
 def endpoint_group_color(index):
     index = max(0, int(index))
     return ENDPOINT_GROUP_COLORS[index % len(ENDPOINT_GROUP_COLORS)]
+
 
 POINT_VERTEX_SHADER = """
 #version 330 core
@@ -128,25 +128,29 @@ class ZedDepthGLViewer:
         self.pending_vertices = None
         self.pending_status = "waiting for frames"
         self.pending_cable_points = None
+        self.pending_cable_point_colors = None
+        self.pending_crossing_points = None
+        self.pending_crossing_proposal_count = None
         self.pending_cable_nodes = None
         self.pending_cable_valid = None
         self.pending_cable_visible = None
         self.pending_cable_extended_visible = None
         self.pending_cable_runs = None
         self.pending_cable_runs_update = False
-        self.pending_contact_observations = None
         self.pending_particle_diagnostics = None
         self.pending_coordinate_frame = None
         self.rgb_image = None
         self.vertices = np.empty((0, 6), dtype=np.float32)
         self.vertex_count = 0
         self.cable_points = np.empty((0, 3), dtype=np.float32)
+        self.cable_point_colors = np.empty((0, 3), dtype=np.float32)
+        self.crossing_points = np.empty((0, 3), dtype=np.float32)
+        self.crossing_proposal_count = 0
         self.cable_nodes = np.empty((0, 3), dtype=np.float32)
         self.cable_valid = np.empty(0, dtype=bool)
         self.cable_visible = np.empty(0, dtype=bool)
         self.cable_extended_visible = np.empty(0, dtype=bool)
         self.cable_runs = None
-        self.contact_observations = tuple()
         self.particle_diagnostics = tuple()
         self.show_particle_diagnostics = True
         self.coordinate_frame = "camera"
@@ -317,11 +321,15 @@ class ZedDepthGLViewer:
         visible_nodes=None,
         extended_visible_nodes=None,
         cable_runs=None,
-        contact_observations=(),
         particle_diagnostics=(),
+        crossing_points=(),
+        crossing_proposal_count=0,
         coordinate_frame="camera",
+        cable_point_colors=None,
     ):
         cable_points = self._as_points(cable_points)
+        cable_point_colors = self._as_point_colors(cable_point_colors, len(cable_points))
+        crossing_points = self._as_points(crossing_points)
         cable_nodes = self._as_node_points(cable_nodes)
         valid_nodes = self._as_node_mask(valid_nodes, len(cable_nodes), False)
         visible_nodes = self._as_node_mask(visible_nodes, len(cable_nodes), valid_nodes)
@@ -332,13 +340,15 @@ class ZedDepthGLViewer:
 
         with self.lock:
             self.pending_cable_points = cable_points
+            self.pending_cable_point_colors = cable_point_colors
+            self.pending_crossing_points = crossing_points
+            self.pending_crossing_proposal_count = max(0, int(crossing_proposal_count))
             self.pending_cable_nodes = cable_nodes
             self.pending_cable_valid = valid_nodes
             self.pending_cable_visible = visible_nodes
             self.pending_cable_extended_visible = extended_visible_nodes
             self.pending_cable_runs = cable_runs
             self.pending_cable_runs_update = True
-            self.pending_contact_observations = tuple(contact_observations or ())
             self.pending_particle_diagnostics = particle_diagnostics
             self.pending_coordinate_frame = str(coordinate_frame)
 
@@ -381,25 +391,29 @@ class ZedDepthGLViewer:
             pending_vertices = self.pending_vertices
             pending_status = self.pending_status
             cable_points = self.pending_cable_points
+            cable_point_colors = self.pending_cable_point_colors
+            crossing_points = self.pending_crossing_points
+            crossing_proposal_count = self.pending_crossing_proposal_count
             cable_nodes = self.pending_cable_nodes
             cable_valid = self.pending_cable_valid
             cable_visible = self.pending_cable_visible
             cable_extended_visible = self.pending_cable_extended_visible
             cable_runs = self.pending_cable_runs
             cable_runs_update = self.pending_cable_runs_update
-            contact_observations = self.pending_contact_observations
             particle_diagnostics = self.pending_particle_diagnostics
             coordinate_frame = self.pending_coordinate_frame
             self.pending_rgb_image = None
             self.pending_vertices = None
             self.pending_cable_points = None
+            self.pending_cable_point_colors = None
+            self.pending_crossing_points = None
+            self.pending_crossing_proposal_count = None
             self.pending_cable_nodes = None
             self.pending_cable_valid = None
             self.pending_cable_visible = None
             self.pending_cable_extended_visible = None
             self.pending_cable_runs = None
             self.pending_cable_runs_update = False
-            self.pending_contact_observations = None
             self.pending_particle_diagnostics = None
             self.pending_coordinate_frame = None
 
@@ -407,6 +421,11 @@ class ZedDepthGLViewer:
             self.rgb_image = rgb_image
         if cable_points is not None:
             self.cable_points = cable_points
+            self.cable_point_colors = cable_point_colors
+        if crossing_points is not None:
+            self.crossing_points = crossing_points
+        if crossing_proposal_count is not None:
+            self.crossing_proposal_count = int(crossing_proposal_count)
         if cable_nodes is not None:
             self.cable_nodes = cable_nodes
         if cable_valid is not None:
@@ -417,8 +436,6 @@ class ZedDepthGLViewer:
             self.cable_extended_visible = cable_extended_visible
         if cable_runs_update:
             self.cable_runs = cable_runs
-        if contact_observations is not None:
-            self.contact_observations = contact_observations
         if particle_diagnostics is not None:
             self.particle_diagnostics = particle_diagnostics
         if coordinate_frame is not None:
@@ -612,10 +629,30 @@ class ZedDepthGLViewer:
 
         if len(self.cable_points) > 0:
             glPointSize(7.0)
-            glColor3f(*CABLE_SAMPLE_COLOR)
             glEnableClientState(GL_VERTEX_ARRAY)
             glVertexPointer(3, GL_FLOAT, 0, np.ascontiguousarray(self.cable_points, dtype=np.float32))
+            use_point_colors = len(self.cable_point_colors) == len(self.cable_points)
+            if use_point_colors:
+                glEnableClientState(GL_COLOR_ARRAY)
+                glColorPointer(
+                    3,
+                    GL_FLOAT,
+                    0,
+                    np.ascontiguousarray(self.cable_point_colors, dtype=np.float32),
+                )
+            else:
+                glColor3f(*CABLE_SAMPLE_COLOR)
             glDrawArrays(GL_POINTS, 0, len(self.cable_points))
+            if use_point_colors:
+                glDisableClientState(GL_COLOR_ARRAY)
+            glDisableClientState(GL_VERTEX_ARRAY)
+
+        if len(self.crossing_points) > 0:
+            glPointSize(11.0)
+            glColor3f(*CROSSING_SAMPLE_COLOR)
+            glEnableClientState(GL_VERTEX_ARRAY)
+            glVertexPointer(3, GL_FLOAT, 0, np.ascontiguousarray(self.crossing_points, dtype=np.float32))
+            glDrawArrays(GL_POINTS, 0, len(self.crossing_points))
             glDisableClientState(GL_VERTEX_ARRAY)
 
         if self.show_particle_diagnostics:
@@ -649,8 +686,6 @@ class ZedDepthGLViewer:
             glEnd()
 
             self._draw_endpoint_markers(endpoint_runs)
-
-        self._draw_contact_observations()
 
         glEnable(GL_DEPTH_TEST)
 
@@ -709,42 +744,6 @@ class ZedDepthGLViewer:
         glVertexPointer(3, GL_FLOAT, 0, vertices)
         glDrawArrays(GL_LINES, 0, len(vertices))
         glDisableClientState(GL_VERTEX_ARRAY)
-
-    def _draw_contact_observations(self):
-        for observation in self.contact_observations:
-            q1 = np.asarray(getattr(observation, "q1_xyz", ()), dtype=np.float32).reshape(-1)
-            q2 = np.asarray(getattr(observation, "q2_xyz", ()), dtype=np.float32).reshape(-1)
-            if len(q1) < 3 or len(q2) < 3 or not np.all(np.isfinite((q1[:3], q2[:3]))):
-                continue
-            color = CONTACT_COLOR if bool(getattr(observation, "verified_contact", False)) else CROSSING_ONLY_COLOR
-            glLineWidth(5.0)
-            glColor3f(*color)
-            glBegin(GL_LINES)
-            glVertex3f(float(q1[0]), float(q1[1]), float(q1[2]))
-            glVertex3f(float(q2[0]), float(q2[1]), float(q2[2]))
-            glEnd()
-            glPointSize(18.0)
-            glBegin(GL_POINTS)
-            glVertex3f(float(q1[0]), float(q1[1]), float(q1[2]))
-            glVertex3f(float(q2[0]), float(q2[1]), float(q2[2]))
-            glEnd()
-            midpoint = 0.5 * (q1[:3] + q2[:3])
-            calibrated = bool(getattr(observation, "diameter_calibrated", False))
-            value = float(getattr(
-                observation,
-                "gap_m" if calibrated else "centerline_distance_m",
-                np.nan,
-            ))
-            quantity = "gap" if calibrated else "center"
-            state = "CONTACT" if bool(getattr(observation, "verified_contact", False)) else "RGB CROSSING"
-            text = (
-                f"{state} {quantity}={1000.0 * value:.1f}mm "
-                f"s=({getattr(observation, 's1_m', np.nan):.3f},"
-                f"{getattr(observation, 's2_m', np.nan):.3f})m"
-            )
-            self._draw_text_3d(
-                midpoint[0], midpoint[1], midpoint[2], text, color, GLUT_BITMAP_HELVETICA_12
-            )
 
     def _draw_endpoint_markers(self, endpoint_runs):
         if not endpoint_runs:
@@ -941,7 +940,15 @@ class ZedDepthGLViewer:
         if width >= 860 and self.particle_diagnostics:
             top_count = sum(int(group["top_particle_count"]) for group in self.particle_diagnostics)
             state = str(top_count) if self.show_particle_diagnostics else "off"
-            self._draw_metric(metric_x, metric_y, "TOP SET", state, PARTICLE_SPREAD_COLOR)
+            metric_x = self._draw_metric(metric_x, metric_y, "TOP SET", state, PARTICLE_SPREAD_COLOR)
+        if width >= 720:
+            self._draw_metric(
+                metric_x,
+                metric_y,
+                "RGB CROSS",
+                self.crossing_proposal_count,
+                CROSSING_SAMPLE_COLOR,
+            )
 
         footer_h = 34
         self._draw_rect_2d(0, 0, width, footer_h, (0.018, 0.021, 0.025))
@@ -1238,6 +1245,9 @@ class ZedDepthGLViewer:
     def _prepare_particle_diagnostics(cls, diagnostics):
         if diagnostics is None:
             return tuple()
+        # LEGACY COMPATIBILITY: older standalone viewer callers passed one
+        # diagnostics object.  The live two-cable application always supplies
+        # explicit ``(cable_id, diagnostics)`` pairs.
         if hasattr(diagnostics, "top_particle_points_xyz"):
             diagnostics = ((0, diagnostics),)
         output = []
@@ -1250,20 +1260,23 @@ class ZedDepthGLViewer:
                 cable_id = int(cable_id)
             except (TypeError, ValueError):
                 cable_id = int(fallback_id)
-            average = np.asarray(getattr(values, "average_points_xyz", ()), dtype=np.float32)
+            representative = np.asarray(
+                getattr(values, "representative_points_xyz", ()),
+                dtype=np.float32,
+            )
             map_nodes = np.asarray(getattr(values, "map_points_xyz", ()), dtype=np.float32)
             top_particles = np.asarray(getattr(values, "top_particle_points_xyz", ()), dtype=np.float32)
             principal_std = np.asarray(getattr(values, "node_principal_std_xyz", ()), dtype=np.float32)
             if (
-                average.ndim != 2
-                or average.shape[1] < 3
-                or map_nodes.shape != average.shape
+                representative.ndim != 2
+                or representative.shape[1] < 3
+                or map_nodes.shape != representative.shape
                 or top_particles.ndim != 3
-                or top_particles.shape[1:] != average.shape
-                or principal_std.shape != average.shape
+                or top_particles.shape[1:] != representative.shape
+                or principal_std.shape != representative.shape
             ):
                 continue
-            average = np.ascontiguousarray(average[:, :3], dtype=np.float32)
+            representative = np.ascontiguousarray(representative[:, :3], dtype=np.float32)
             map_nodes = np.ascontiguousarray(map_nodes[:, :3], dtype=np.float32)
             top_particles = np.ascontiguousarray(top_particles[:, :, :3], dtype=np.float32)
             principal_std = np.ascontiguousarray(principal_std[:, :3], dtype=np.float32)
@@ -1271,14 +1284,17 @@ class ZedDepthGLViewer:
                 continue
 
             spread_axis = 2.0 * principal_std
-            spread_segments = np.stack((average - spread_axis, average + spread_axis), axis=1)
+            spread_segments = np.stack(
+                (representative - spread_axis, representative + spread_axis),
+                axis=1,
+            )
             direction_delta = np.asarray(
                 getattr(values, "endpoint_direction_delta_deg", (np.nan, np.nan)),
                 dtype=np.float32,
             ).reshape(-1)
             start_delta = float(direction_delta[0]) if len(direction_delta) > 0 else np.nan
             end_delta = float(direction_delta[1]) if len(direction_delta) > 1 else np.nan
-            map_error = float(getattr(values, "map_to_average_node_error_m", np.nan))
+            map_error = float(getattr(values, "map_to_representative_node_error_m", np.nan))
             mean_spread = float(getattr(values, "mean_node_spread_m", np.nan))
             max_spread = float(getattr(values, "max_node_spread_m", np.nan))
             tangents = np.asarray(getattr(values, "endpoint_tangents_xyz", ()), dtype=np.float32)
@@ -1295,16 +1311,21 @@ class ZedDepthGLViewer:
                 for endpoint_index, node_index in ((0, 0), (1, -1)):
                     confidence = float(tangent_confidence[endpoint_index]) if len(tangent_confidence) > endpoint_index else 0.0
                     length = 0.025 + 0.050 * np.clip(confidence, 0.0, 1.0)
-                    tangent_segments.append((average[node_index], average[node_index] + length * tangents[endpoint_index]))
+                    tangent_segments.append((
+                        representative[node_index],
+                        representative[node_index] + length * tangents[endpoint_index],
+                    ))
             tangent_lines = (
                 np.ascontiguousarray(np.asarray(tangent_segments, dtype=np.float32).reshape(-1, 3))
                 if tangent_segments
                 else np.empty((0, 3), dtype=np.float32)
             )
-            mean_ownership = float(getattr(values, "mean_ownership_responsibility", np.nan))
-            ownership_entropy = float(getattr(values, "ownership_entropy", np.nan))
+            mean_support = float(getattr(values, "mean_support_affinity", np.nan))
+            supported_fraction = float(getattr(values, "supported_sample_fraction", np.nan))
             visible_fraction = float(getattr(values, "visible_segment_fraction", np.nan))
+            local_ratio = float(getattr(values, "local_proposal_ratio", np.nan))
             conditioned_ratio = float(getattr(values, "endpoint_conditioned_proposal_ratio", np.nan))
+            random_ratio = float(getattr(values, "global_random_particle_ratio", np.nan))
             tangent_mean = (
                 float(np.mean(tangent_confidence[np.isfinite(tangent_confidence)]))
                 if np.any(np.isfinite(tangent_confidence))
@@ -1313,14 +1334,18 @@ class ZedDepthGLViewer:
             tangent_count = int(np.sum(tangent_support)) if len(tangent_support) else 0
             label = (
                 f"PF{cable_id + 1} TOP={len(top_particles)} "
-                f"MAP-AVG={cls._format_mm_compact(map_error)} "
+                f"MAP-MED={cls._format_mm_compact(map_error)} "
                 f"spread={cls._format_mm_compact(mean_spread)}/{cls._format_mm_compact(max_spread)} "
                 f"dir={cls._format_angle_compact(start_delta)}/{cls._format_angle_compact(end_delta)} "
                 f"tan={cls._format_fraction_compact(tangent_mean)}/{tangent_count} "
-                f"own={cls._format_fraction_compact(mean_ownership)} H={cls._format_fraction_compact(ownership_entropy)} "
-                f"vis={cls._format_fraction_compact(visible_fraction)} cond={cls._format_fraction_compact(conditioned_ratio)}"
+                f"support={cls._format_fraction_compact(mean_support)} "
+                f"coverage={cls._format_fraction_compact(supported_fraction)} "
+                f"vis={cls._format_fraction_compact(visible_fraction)} "
+                f"proposal={cls._format_fraction_compact(local_ratio)}/"
+                f"{cls._format_fraction_compact(conditioned_ratio)}/"
+                f"{cls._format_fraction_compact(random_ratio)}"
             )
-            anchor = average[len(average) // 2].copy()
+            anchor = representative[len(representative) // 2].copy()
             anchor[1] += 0.018
             output.append({
                 "cable_id": cable_id,
@@ -1365,6 +1390,16 @@ class ZedDepthGLViewer:
         points = points[:, :3]
         valid = np.all(np.isfinite(points), axis=1)
         return np.ascontiguousarray(points[valid], dtype=np.float32)
+
+    @staticmethod
+    def _as_point_colors(colors, point_count):
+        if colors is None:
+            return np.empty((0, 3), dtype=np.float32)
+        colors = np.asarray(colors, dtype=np.float32)
+        if colors.ndim != 2 or colors.shape != (int(point_count), 3):
+            return np.empty((0, 3), dtype=np.float32)
+        colors = np.where(np.isfinite(colors), colors, 0.0)
+        return np.ascontiguousarray(np.clip(colors, 0.0, 1.0), dtype=np.float32)
 
     @staticmethod
     def _as_node_points(points):

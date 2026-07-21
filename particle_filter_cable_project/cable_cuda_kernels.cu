@@ -143,6 +143,57 @@ extern "C" __global__ void particle_point_distances_kernel(
     nearest_segments[output_index] = best_segment;
 }
 
+extern "C" __global__ void particle_support_distances_kernel(
+    const float* particles,
+    const float* points,
+    float* squared_distances,
+    int cable_count,
+    int particle_count,
+    int node_count,
+    int point_count,
+    int samples_per_segment
+) {
+    const int output_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int segment_count = node_count - 1;
+    const int samples_per_chain = segment_count * samples_per_segment;
+    const int total = cable_count * particle_count * samples_per_chain;
+    if (
+        output_index >= total
+        || node_count < 2
+        || node_count > kMaxNodes
+        || point_count < 1
+        || samples_per_segment < 1
+    ) {
+        return;
+    }
+
+    const int chain_sample_index = output_index % samples_per_chain;
+    const int particle_flat = output_index / samples_per_chain;
+    const int particle_index = particle_flat % particle_count;
+    const int cable_index = particle_flat / particle_count;
+    const int segment_index = chain_sample_index / samples_per_segment;
+    const int sample_index = chain_sample_index - segment_index * samples_per_segment;
+    const float parameter = (static_cast<float>(sample_index) + 0.5f)
+        / static_cast<float>(samples_per_segment);
+
+    const float* chain = particles
+        + ((cable_index * particle_count + particle_index) * node_count * 3);
+    const float* start = chain + 3 * segment_index;
+    const float* end = start + 3;
+    const float sx = start[0] + parameter * (end[0] - start[0]);
+    const float sy = start[1] + parameter * (end[1] - start[1]);
+    const float sz = start[2] + parameter * (end[2] - start[2]);
+
+    float best_squared = 3.402823466e+38F;
+    for (int point_index = 0; point_index < point_count; ++point_index) {
+        const float dx = sx - points[3 * point_index];
+        const float dy = sy - points[3 * point_index + 1];
+        const float dz = sz - points[3 * point_index + 2];
+        best_squared = fminf(best_squared, dx * dx + dy * dy + dz * dz);
+    }
+    squared_distances[output_index] = best_squared;
+}
+
 extern "C" __global__ void gather_indexed_points_kernel(
     const unsigned char* point_cloud,
     int point_step_bytes,

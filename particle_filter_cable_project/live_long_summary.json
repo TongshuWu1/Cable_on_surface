@@ -1,0 +1,224 @@
+{
+  "all_tracking_results": 150,
+  "discarded_warmup_results": 10,
+  "log": "C:\\Users\\wts28\\Documents\\PHD\\Cable_on_surface\\particle_filter_cable_project\\live_long_20260720-185905.stdout.log",
+  "steady_state": {
+    "assignment": {
+      "max": 0.5,
+      "mean": 0.5,
+      "median": 0.5,
+      "min": 0.5,
+      "p95": 0.5
+    },
+    "assignment_entropy": {
+      "max": 0.36,
+      "mean": 0.3262857142857143,
+      "median": 0.33,
+      "min": 0.28,
+      "p95": 0.35
+    },
+    "capture_fps": {
+      "max": 63.0,
+      "mean": 59.966428571428565,
+      "median": 60.0,
+      "min": 55.2,
+      "p95": 61.0
+    },
+    "capture_ms": {
+      "max": 7.0,
+      "mean": 3.1585714285714284,
+      "median": 3.1,
+      "min": 1.6,
+      "p95": 4.309999999999996
+    },
+    "crossing_hypothesis_counts": {
+      "pf1_pf2": 0,
+      "pf1_self": 0,
+      "pf2_self": 0,
+      "unexplained": 140
+    },
+    "crossing_proposals": {
+      "max": 2.0,
+      "mean": 2.0,
+      "median": 2.0,
+      "min": 2.0,
+      "p95": 2.0
+    },
+    "detector_ms": {
+      "max": 71.8,
+      "mean": 25.670714285714286,
+      "median": 24.8,
+      "min": 19.4,
+      "p95": 29.96499999999998
+    },
+    "effective_sample_size": {
+      "max": 999999995904.0,
+      "mean": 53573740756.64286,
+      "median": 691.0,
+      "min": 622.0,
+      "p95": 499999997969.14996
+    },
+    "endpoint_tangent_confidence": {
+      "max": 0.69,
+      "mean": 0.6627142857142857,
+      "median": 0.66,
+      "min": 0.64,
+      "p95": 0.68
+    },
+    "frame": {
+      "max": 9398.0,
+      "mean": 5175.364285714286,
+      "median": 5175.0,
+      "min": 952.0,
+      "p95": 8977.05
+    },
+    "gui_fps": {
+      "max": 28.1,
+      "mean": 24.772857142857145,
+      "median": 24.6,
+      "min": 15.8,
+      "p95": 27.0
+    },
+    "lag_frames": {
+      "max": 30.0,
+      "mean": 13.892857142857142,
+      "median": 14.0,
+      "min": 10.0,
+      "p95": 17.049999999999983
+    },
+    "lag_ms": {
+      "max": 563.0,
+      "mean": 256.8857142857143,
+      "median": 250.0,
+      "min": 172.0,
+      "p95": 312.0
+    },
+    "map_to_medoid_mm": {
+      "max": 31.8,
+      "mean": 10.07,
+      "median": 11.95,
+      "min": 0.0,
+      "p95": 17.614999999999995
+    },
+    "max_spread_mm": {
+      "max": 99.9,
+      "mean": 22.70642857142857,
+      "median": 19.05,
+      "min": 6.6,
+      "p95": 68.45999999999992
+    },
+    "mean_node_speed_mps": {
+      "max": 1.71,
+      "mean": 0.025714285714285714,
+      "median": 0.01,
+      "min": -0.12,
+      "p95": 0.02
+    },
+    "mean_spread_mm": {
+      "max": 46.6,
+      "mean": 11.787142857142857,
+      "median": 10.2,
+      "min": 3.9,
+      "p95": 33.11999999999999
+    },
+    "measurement_fit_ms": {
+      "max": 31.2,
+      "mean": 13.204285714285714,
+      "median": 12.9,
+      "min": 9.0,
+      "p95": 16.054999999999982
+    },
+    "particle_filter_ms": {
+      "max": 149.8,
+      "mean": 60.08785714285714,
+      "median": 58.1,
+      "min": 48.1,
+      "p95": 68.97999999999998
+    },
+    "pf_consensus_ms": {
+      "max": 37.8,
+      "mean": 9.117142857142857,
+      "median": 8.149999999999999,
+      "min": 4.3,
+      "p95": 16.205
+    },
+    "pf_crossing_ms": {
+      "max": 25.2,
+      "mean": 9.915,
+      "median": 8.8,
+      "min": 5.3,
+      "p95": 17.019999999999992
+    },
+    "pf_estimate_ms": {
+      "max": 18.6,
+      "mean": 7.156428571428571,
+      "median": 6.55,
+      "min": 3.6,
+      "p95": 13.405
+    },
+    "pf_predict_ms": {
+      "max": 44.9,
+      "mean": 12.655000000000001,
+      "median": 12.350000000000001,
+      "min": 7.4,
+      "p95": 17.704999999999995
+    },
+    "pf_prepare_ms": {
+      "max": 34.3,
+      "mean": 10.705714285714285,
+      "median": 10.149999999999999,
+      "min": 7.8,
+      "p95": 12.314999999999996
+    },
+    "pf_tangent_ms": {
+      "max": 42.6,
+      "mean": 15.579999999999998,
+      "median": 15.25,
+      "min": 9.1,
+      "p95": 20.505
+    },
+    "raw_residual_mm": {
+      "max": 37.2,
+      "mean": 18.41,
+      "median": 18.3,
+      "min": 13.3,
+      "p95": 21.005
+    },
+    "samples": 140,
+    "support_to_prior_mm": {
+      "max": 38.8,
+      "mean": 18.13,
+      "median": 17.95,
+      "min": 13.0,
+      "p95": 20.704999999999995
+    },
+    "tracking_fps": {
+      "max": 13.0,
+      "mean": 11.157142857142857,
+      "median": 11.6,
+      "min": 4.9,
+      "p95": 12.0
+    },
+    "ui_ms": {
+      "max": 46.8,
+      "mean": 27.840714285714284,
+      "median": 27.7,
+      "min": 21.5,
+      "p95": 32.01499999999999
+    },
+    "visible_segment_fraction": {
+      "max": 1.0,
+      "mean": 1.0,
+      "median": 1.0,
+      "min": 1.0,
+      "p95": 1.0
+    },
+    "worker_ms": {
+      "max": 278.0,
+      "mean": 109.39,
+      "median": 105.4,
+      "min": 94.6,
+      "p95": 124.905
+    }
+  }
+}
