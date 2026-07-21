@@ -46,6 +46,14 @@ crossing components per frame, so four live proposals retain one spare slot.
 These proposals enter only the explicitly gated RGB crossing likelihood; they
 never declare physical contact or modify the motion model.
 
+Endpoint channels identify the two PFs, but crossing-axis identity remains a
+latent variable. Each PF evaluates both observed axes and takes the better
+axis likelihood per proposal; it never uses a straight endpoint chord or a
+previous PF path to assign an axis. The likelihood samples that selected axis
+18 px on both sides of the centroid with an 8 px error scale. These explicit
+image-space continuation parameters reject a locally aligned particle that
+turns onto the other cable immediately after the crossing.
+
 ## Live estimator sweeps
 
 The earlier 28--50 second sweeps used the retired joint-coverage likelihood and
@@ -60,7 +68,8 @@ Values retained for the first controlled independent-PF experiment are:
 | Medoid set | 30 | 80 was slower and more diffuse |
 | Node/direction noise | 0.010 m / 0.025 | best residual/spread compromise |
 | Dense path support | weight 1.00, 5 samples/segment | dominant per-PF particle-to-cloud term; requires new ablation |
-| Union final selector | top 30, weight 1.00 | bounded final representative search; weights and motion remain independent |
+| Union final selector | top 30, weight 1.00, Huber 0.030 m | top-K representative search; loss stays informative beyond the Huber transition; weights and motion remain independent |
+| Spatial observation filter | radius 0.015 m, 2 neighbors | conservative observation-only starting value; independently ablated and not yet accuracy-calibrated |
 | Depth mode | NEURAL with fill | NEURAL_PLUS was slower and less accurate; no-fill was worse |
 | Measurement confidence | 90, map every 2 frames | stricter 80/every-frame was slower and worse |
 | Display cloud | 20,000 points every 4 frames | reduced capture cost without changing PF measurements |
@@ -69,8 +78,10 @@ No live accuracy claim is recorded for the new formulation until a fixed SVO
 suite has been replayed. CPU/CUDA equivalence, independent random streams,
 absence of global coverage from the per-PF likelihood, union-selector behavior,
 and synthetic branch ambiguity are covered by automated tests. The runtime
-fields `union-rank`, `rms`, `cov`, and `gain` expose the selector directly for
-controlled feature ablations.
+fields `rawobs`, `reject`, `union-rank`, `rms`, `max`, `huber`, `cov`, and
+`gain` expose observation filtering and final selection directly for controlled
+feature ablations. Accepted points remain orange and rejected points red; PF
+distance never changes either evidence class.
 
 Reproduce the log summary with:
 

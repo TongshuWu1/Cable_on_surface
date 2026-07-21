@@ -108,12 +108,13 @@ class CableParticleFilterConfig:
     support_visibility_distance_m: float = 0.030
     crossing_position_sigma_px: float = 14.0
     crossing_angle_sigma_deg: float = 20.0
+    crossing_continuation_sigma_px: float = 8.0
     crossing_log_reward: float = 4.0
     union_coverage_top_particle_count: int = 30
     union_coverage_weight: float = 1.0
+    union_huber_delta_m: float = 0.030
     max_prediction_frames: int = 12
     max_motion_noise_scale: float = 4.0
-    point_support_diagnostics_enabled: bool = True
     particle_diagnostics_enabled: bool = True
 
 
@@ -150,7 +151,6 @@ class CableParticleFilterResult:
     segment_length_m: float
     measurement_point_count: int = 0
     support_points_xyz: np.ndarray | None = None
-    support_point_affinities: np.ndarray | None = None
     visible_segments: np.ndarray | None = None
     visible_nodes: np.ndarray | None = None
     local_proposal_ratio: float = 0.0
@@ -170,12 +170,15 @@ class CableParticleFilterResult:
     crossing_reward: float = 0.0
     crossing_distance_px: float = np.nan
     crossing_angle_error_deg: float = np.nan
+    crossing_continuation_error_px: float = np.nan
     crossing_closest_xy: np.ndarray | None = None
     crossing_target_xy: np.ndarray | None = None
     crossing_axis_xy: np.ndarray | None = None
     union_coverage_selected: bool = False
     union_coverage_rank: int = 0
     union_coverage_rms_m: float = np.nan
+    union_coverage_max_m: float = np.nan
+    union_huber_cost_m2: float = np.nan
     union_coverage_fraction: float = np.nan
     union_coverage_rms_gain_m: float = np.nan
     union_coverage_fraction_gain: float = np.nan
@@ -187,9 +190,11 @@ class CableParticleFilterResult:
 class UnionCoverageSelection:
     selected_particle_indices: tuple
     selected_ranks: tuple
-    robust_coverage_rms_m: float
+    huber_cost_m2: float
+    unexplained_rms_m: float
+    max_unexplained_distance_m: float
     covered_point_fraction: float
-    robust_rms_gain_m: float
+    rms_gain_m: float
     covered_fraction_gain: float
     observation_point_count: int
     stage_seconds: float
@@ -585,7 +590,6 @@ class CableParticleFilter:
         self.last_visible_nodes = np.zeros(self.node_count, dtype=bool)
         self.last_measurement_point_count = 0
         self.last_support_points = np.empty((0, 3), dtype=np.float32)
-        self.last_support_point_affinities = np.empty(0, dtype=np.float32)
         self._pending_support_diagnostics = None
         self.last_local_proposal_ratio = 0.0
         self.last_endpoint_conditioned_proposal_ratio = 0.0
@@ -603,6 +607,7 @@ class CableParticleFilter:
         self.last_crossing_reward = 0.0
         self.last_crossing_distance_px = np.nan
         self.last_crossing_angle_error_deg = np.nan
+        self.last_crossing_continuation_error_px = np.nan
         self.last_crossing_closest_xy = np.full(2, np.nan, dtype=np.float32)
         self.last_crossing_target_xy = np.full(2, np.nan, dtype=np.float32)
         self.last_crossing_axis_xy = np.full(2, np.nan, dtype=np.float32)
@@ -610,6 +615,8 @@ class CableParticleFilter:
         self.last_union_coverage_selected = False
         self.last_union_coverage_rank = 0
         self.last_union_coverage_rms_m = np.nan
+        self.last_union_coverage_max_m = np.nan
+        self.last_union_huber_cost_m2 = np.nan
         self.last_union_coverage_fraction = np.nan
         self.last_union_coverage_rms_gain_m = np.nan
         self.last_union_coverage_fraction_gain = np.nan
@@ -650,7 +657,6 @@ class CableParticleFilter:
     def _prepare_update(self, measurement, dt, count_lost=True):
         self._reset_stage_seconds()
         self.last_support_points = np.empty((0, 3), dtype=np.float32)
-        self.last_support_point_affinities = np.empty(0, dtype=np.float32)
         self._pending_support_diagnostics = None
         self.last_local_proposal_ratio = 0.0
         self.last_endpoint_conditioned_proposal_ratio = 0.0
@@ -662,6 +668,7 @@ class CableParticleFilter:
         self.last_crossing_reward = 0.0
         self.last_crossing_distance_px = np.nan
         self.last_crossing_angle_error_deg = np.nan
+        self.last_crossing_continuation_error_px = np.nan
         self.last_crossing_closest_xy.fill(np.nan)
         self.last_crossing_target_xy.fill(np.nan)
         self.last_crossing_axis_xy.fill(np.nan)
@@ -669,6 +676,8 @@ class CableParticleFilter:
         self.last_union_coverage_selected = False
         self.last_union_coverage_rank = 0
         self.last_union_coverage_rms_m = np.nan
+        self.last_union_coverage_max_m = np.nan
+        self.last_union_huber_cost_m2 = np.nan
         self.last_union_coverage_fraction = np.nan
         self.last_union_coverage_rms_gain_m = np.nan
         self.last_union_coverage_fraction_gain = np.nan
@@ -944,7 +953,7 @@ class CableParticleFilter:
         self._pending_crossing_diagnostics = None
         if pending is None or self.last_representative_particle_index is None:
             return
-        reward, distance, angle, closest, target_index, targets = pending
+        reward, distance, angle, continuation, closest, target_index, targets = pending
         particle_index = int(self.last_representative_particle_index)
         if self.cuda_state:
             with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
@@ -952,6 +961,7 @@ class CableParticleFilter:
                     reward[particle_index:particle_index + 1],
                     distance[particle_index:particle_index + 1],
                     angle[particle_index:particle_index + 1],
+                    continuation[particle_index:particle_index + 1],
                     closest[particle_index].reshape(-1),
                     target_index[particle_index:particle_index + 1].to(torch.float32),
                 ))
@@ -961,6 +971,7 @@ class CableParticleFilter:
                 reward[particle_index],
                 distance[particle_index],
                 angle[particle_index],
+                continuation[particle_index],
                 closest[particle_index, 0],
                 closest[particle_index, 1],
                 target_index[particle_index],
@@ -968,8 +979,9 @@ class CableParticleFilter:
         self.last_crossing_reward = float(packed[0])
         self.last_crossing_distance_px = float(packed[1])
         self.last_crossing_angle_error_deg = float(packed[2])
-        self.last_crossing_closest_xy = np.ascontiguousarray(packed[3:5], dtype=np.float32)
-        selected_target = int(round(float(packed[5])))
+        self.last_crossing_continuation_error_px = float(packed[3])
+        self.last_crossing_closest_xy = np.ascontiguousarray(packed[4:6], dtype=np.float32)
+        selected_target = int(round(float(packed[6])))
         if 0 <= selected_target < len(targets):
             target = targets[selected_target]
             self.last_crossing_target_xy = np.ascontiguousarray(target.centroid_xy, dtype=np.float32)
@@ -986,6 +998,7 @@ class CableParticleFilter:
         )
         if self.cuda_state:
             with torch.inference_mode(), torch.cuda.stream(self.cuda_stream):
+                velocity_enabled = self._velocity_enabled()
                 probabilities = torch.clamp_min(self.weights, 0.0)
                 probabilities = probabilities / probabilities.sum().clamp_min(1e-12)
                 parent_indices_t = torch.multinomial(
@@ -994,10 +1007,14 @@ class CableParticleFilter:
                     replacement=True,
                     generator=self.torch_generator,
                 )
-                self._ensure_velocity_array()
                 local_particles = self.particles.index_select(0, parent_indices_t[:local_count]).contiguous()
-                local_velocities = self.node_velocities.index_select(0, parent_indices_t[:local_count]).contiguous()
-                if self._velocity_enabled():
+                local_velocities = None
+                if velocity_enabled:
+                    self._ensure_velocity_array()
+                    local_velocities = self.node_velocities.index_select(
+                        0,
+                        parent_indices_t[:local_count],
+                    ).contiguous()
                     damping = float(np.clip(self.config.velocity_damping, 0.0, 1.0))
                     local_velocities.mul_(damping).add_(
                         torch.randn(
@@ -1027,7 +1044,6 @@ class CableParticleFilter:
                             * float(self.last_motion_noise_scale)
                         )
                     )
-                    local_velocities.zero_()
                 local_particles = build_chains_torch(
                     self.last_endpoint_nodes_t[0][None, :].expand(local_count, -1),
                     local_directions,
@@ -1074,12 +1090,18 @@ class CableParticleFilter:
                     (local_particles, conditioned_particles, global_particles),
                     dim=0,
                 ).contiguous()
-                zero_velocities = torch.zeros(
-                    (conditioned_count + global_count, self.node_count, 3),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                self.node_velocities = torch.cat((local_velocities, zero_velocities), dim=0).contiguous()
+                if velocity_enabled:
+                    zero_velocities = torch.zeros(
+                        (conditioned_count + global_count, self.node_count, 3),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    self.node_velocities = torch.cat(
+                        (local_velocities, zero_velocities),
+                        dim=0,
+                    ).contiguous()
+                else:
+                    self.node_velocities = None
                 self.weights = transition_mixture_weights_torch(
                     local_count,
                     conditioned_count,
@@ -1095,9 +1117,14 @@ class CableParticleFilter:
                     generator=self.torch_generator,
                 )
                 self.particles = self.particles.index_select(0, permutation_t).contiguous()
-                self.node_velocities = self.node_velocities.index_select(0, permutation_t).contiguous()
+                if self.node_velocities is not None:
+                    self.node_velocities = self.node_velocities.index_select(
+                        0,
+                        permutation_t,
+                    ).contiguous()
                 self.weights = self.weights.index_select(0, permutation_t).contiguous()
         else:
+            velocity_enabled = self._velocity_enabled()
             probabilities = np.maximum(np.asarray(self.weights, dtype=np.float64), 0.0)
             probabilities /= max(float(np.sum(probabilities)), 1e-12)
             parent_indices_array = self.rng.choice(
@@ -1106,10 +1133,11 @@ class CableParticleFilter:
                 replace=True,
                 p=probabilities,
             )
-            self._ensure_velocity_array()
             local_particles = self.particles[parent_indices_array[:local_count]].copy()
-            local_velocities = self.node_velocities[parent_indices_array[:local_count]].copy()
-            if self._velocity_enabled():
+            local_velocities = None
+            if velocity_enabled:
+                self._ensure_velocity_array()
+                local_velocities = self.node_velocities[parent_indices_array[:local_count]].copy()
                 local_velocities *= float(np.clip(self.config.velocity_damping, 0.0, 1.0))
                 local_velocities += self.rng.normal(
                     0.0,
@@ -1128,7 +1156,6 @@ class CableParticleFilter:
                         (local_count, self.segment_count, 3),
                     )
                 )
-                local_velocities.fill(0.0)
             local_particles = build_chains(
                 np.repeat(np.asarray(self.last_endpoint_nodes[0])[None, :], local_count, axis=0),
                 local_directions,
@@ -1165,13 +1192,19 @@ class CableParticleFilter:
                 (local_particles, conditioned_particles, global_particles),
                 axis=0,
             ))
-            self.node_velocities = np.ascontiguousarray(np.concatenate(
-                (
-                    local_velocities,
-                    np.zeros((conditioned_count + global_count, self.node_count, 3), dtype=np.float64),
-                ),
-                axis=0,
-            ))
+            if velocity_enabled:
+                self.node_velocities = np.ascontiguousarray(np.concatenate(
+                    (
+                        local_velocities,
+                        np.zeros(
+                            (conditioned_count + global_count, self.node_count, 3),
+                            dtype=np.float64,
+                        ),
+                    ),
+                    axis=0,
+                ))
+            else:
+                self.node_velocities = None
             self.weights = transition_mixture_weights(
                 local_count,
                 conditioned_count,
@@ -1182,7 +1215,8 @@ class CableParticleFilter:
             )
             permutation_array = self.rng.permutation(total_count)
             self.particles = self.particles[permutation_array].copy()
-            self.node_velocities = self.node_velocities[permutation_array].copy()
+            if self.node_velocities is not None:
+                self.node_velocities = self.node_velocities[permutation_array].copy()
             self.weights = self.weights[permutation_array].copy()
 
         self.last_local_proposal_ratio = float(local_count) / float(total_count)
@@ -1291,7 +1325,6 @@ class CableParticleFilter:
             segment_length_m=float(self.segment_length_m),
             measurement_point_count=int(self.last_measurement_point_count),
             support_points_xyz=self.last_support_points.copy(),
-            support_point_affinities=self.last_support_point_affinities.copy(),
             visible_segments=self.last_visible_segments.copy(),
             visible_nodes=self.last_visible_nodes.copy(),
             local_proposal_ratio=float(self.last_local_proposal_ratio),
@@ -1311,12 +1344,15 @@ class CableParticleFilter:
             crossing_reward=float(self.last_crossing_reward),
             crossing_distance_px=float(self.last_crossing_distance_px),
             crossing_angle_error_deg=float(self.last_crossing_angle_error_deg),
+            crossing_continuation_error_px=float(self.last_crossing_continuation_error_px),
             crossing_closest_xy=self.last_crossing_closest_xy.copy(),
             crossing_target_xy=self.last_crossing_target_xy.copy(),
             crossing_axis_xy=self.last_crossing_axis_xy.copy(),
             union_coverage_selected=bool(self.last_union_coverage_selected),
             union_coverage_rank=int(self.last_union_coverage_rank),
             union_coverage_rms_m=float(self.last_union_coverage_rms_m),
+            union_coverage_max_m=float(self.last_union_coverage_max_m),
+            union_huber_cost_m2=float(self.last_union_huber_cost_m2),
             union_coverage_fraction=float(self.last_union_coverage_fraction),
             union_coverage_rms_gain_m=float(self.last_union_coverage_rms_gain_m),
             union_coverage_fraction_gain=float(self.last_union_coverage_fraction_gain),
@@ -1710,6 +1746,17 @@ class CableParticleFilter:
         self.last_visible_segments = visible_segments.copy()
         self.last_visible_nodes = node_visibility_from_segments(visible_segments, self.node_count)
 
+
+def huber_distance_loss(distances, delta_m):
+    distances = np.asarray(distances, dtype=np.float64)
+    delta_m = max(1e-12, float(delta_m))
+    return np.where(
+        distances <= delta_m,
+        0.5 * distances * distances,
+        delta_m * (distances - 0.5 * delta_m),
+    )
+
+
 def select_union_coverage_representatives(particle_filters, observation_points):
     """Select one or two independent PF representatives whose union explains the cloud.
 
@@ -1748,8 +1795,8 @@ def select_union_coverage_representatives(particle_filters, observation_points):
             max(1e-5, float(particle_filter.config.measurement_node_std_m))
             for particle_filter in filters
         ])),
-        "robust_distance_m": float(np.mean([
-            max(1e-5, float(particle_filter.config.robust_distance_m))
+        "huber_delta_m": float(np.mean([
+            max(1e-5, float(particle_filter.config.union_huber_delta_m))
             for particle_filter in filters
         ])),
         "visibility_distance_m": float(np.mean([
@@ -1770,9 +1817,11 @@ def select_union_coverage_representatives(particle_filters, observation_points):
         particle_filter.last_representative_particle_index = int(particle_index)
         particle_filter.last_union_coverage_selected = True
         particle_filter.last_union_coverage_rank = int(rank)
-        particle_filter.last_union_coverage_rms_m = float(selection.robust_coverage_rms_m)
+        particle_filter.last_union_coverage_rms_m = float(selection.unexplained_rms_m)
+        particle_filter.last_union_coverage_max_m = float(selection.max_unexplained_distance_m)
+        particle_filter.last_union_huber_cost_m2 = float(selection.huber_cost_m2)
         particle_filter.last_union_coverage_fraction = float(selection.covered_point_fraction)
-        particle_filter.last_union_coverage_rms_gain_m = float(selection.robust_rms_gain_m)
+        particle_filter.last_union_coverage_rms_gain_m = float(selection.rms_gain_m)
         particle_filter.last_union_coverage_fraction_gain = float(selection.covered_fraction_gain)
     return selection
 
@@ -1802,13 +1851,16 @@ def _select_union_coverage_cpu(filters, points, settings):
         top_log_weights.append(np.log(np.maximum(weights[indices], 1e-20)))
         point_squared.append(np.min(distances, axis=1))
 
-    robust_squared = float(settings["robust_distance_m"]) ** 2
     sigma_squared = float(settings["sigma_m"]) ** 2
-    scale = 0.5 * float(settings["weight"]) / max(sigma_squared, 1e-12)
+    huber_delta = float(settings["huber_delta_m"])
+    scale = float(settings["weight"]) / max(sigma_squared, 1e-12)
     if len(filters) == 1:
         union_squared_by_choice = point_squared[0]
         baseline_union_squared = union_squared_by_choice[0]
-        coverage_cost = np.mean(np.minimum(union_squared_by_choice, robust_squared), axis=1)
+        coverage_cost = np.mean(
+            huber_distance_loss(np.sqrt(np.maximum(union_squared_by_choice, 0.0)), huber_delta),
+            axis=1,
+        )
         score = top_log_weights[0] - scale * coverage_cost
         positions = (int(np.argmax(score)),)
         selected_union_squared = union_squared_by_choice[positions[0]]
@@ -1818,7 +1870,10 @@ def _select_union_coverage_cpu(filters, points, settings):
             point_squared[1][None, :, :],
         )
         baseline_union_squared = union_squared_by_pair[0, 0]
-        coverage_cost = np.mean(np.minimum(union_squared_by_pair, robust_squared), axis=2)
+        coverage_cost = np.mean(
+            huber_distance_loss(np.sqrt(np.maximum(union_squared_by_pair, 0.0)), huber_delta),
+            axis=2,
+        )
         score = (
             top_log_weights[0][:, None]
             + top_log_weights[1][None, :]
@@ -1851,18 +1906,24 @@ def _select_union_coverage_cpu(filters, points, settings):
             np.ascontiguousarray(affinity, dtype=np.float32),
         )
 
-    robust_rms = float(np.sqrt(np.mean(np.minimum(selected_union_squared, robust_squared))))
+    selected_distances = np.sqrt(np.maximum(selected_union_squared, 0.0))
+    baseline_distances = np.sqrt(np.maximum(baseline_union_squared, 0.0))
+    huber_cost = float(np.mean(huber_distance_loss(selected_distances, huber_delta)))
+    unexplained_rms = float(np.sqrt(np.mean(selected_union_squared)))
+    max_unexplained = float(np.max(selected_distances))
     covered_fraction = float(np.mean(selected_union_squared <= visibility_squared))
-    baseline_rms = float(np.sqrt(np.mean(np.minimum(baseline_union_squared, robust_squared))))
+    baseline_rms = float(np.sqrt(np.mean(baseline_union_squared)))
     baseline_fraction = float(np.mean(baseline_union_squared <= visibility_squared))
     return UnionCoverageSelection(
         selected_particle_indices=tuple(
             int(indices[position]) for indices, position in zip(top_indices, positions)
         ),
         selected_ranks=tuple(int(position) + 1 for position in positions),
-        robust_coverage_rms_m=robust_rms,
+        huber_cost_m2=huber_cost,
+        unexplained_rms_m=unexplained_rms,
+        max_unexplained_distance_m=max_unexplained,
         covered_point_fraction=covered_fraction,
-        robust_rms_gain_m=baseline_rms - robust_rms,
+        rms_gain_m=baseline_rms - unexplained_rms,
         covered_fraction_gain=covered_fraction - baseline_fraction,
         observation_point_count=int(len(points)),
         stage_seconds=float(time.perf_counter() - started),
@@ -1906,13 +1967,21 @@ def _select_union_coverage_cuda(filters, points, settings):
             top_log_weights_t.append(torch.log(top_weights_t.clamp_min(1e-20)))
             point_squared_t.append(distances_t[0])
 
-        robust_squared = float(settings["robust_distance_m"]) ** 2
         sigma_squared = float(settings["sigma_m"]) ** 2
+        huber_delta = float(settings["huber_delta_m"])
         visibility_squared = float(settings["visibility_distance_m"]) ** 2
-        scale = 0.5 * float(settings["weight"]) / max(sigma_squared, 1e-12)
+        scale = float(settings["weight"]) / max(sigma_squared, 1e-12)
         if len(filters) == 1:
             baseline_union_squared_t = point_squared_t[0][0]
-            coverage_cost_t = torch.mean(torch.clamp(point_squared_t[0], max=robust_squared), dim=1)
+            union_distances_t = torch.sqrt(torch.clamp_min(point_squared_t[0], 0.0))
+            coverage_cost_t = torch.mean(
+                torch.where(
+                    union_distances_t <= huber_delta,
+                    0.5 * union_distances_t.square(),
+                    huber_delta * (union_distances_t - 0.5 * huber_delta),
+                ),
+                dim=1,
+            )
             score_t = top_log_weights_t[0] - scale * coverage_cost_t
             positions_t = (torch.argmax(score_t),)
             selected_union_squared_t = point_squared_t[0][positions_t[0]]
@@ -1922,7 +1991,15 @@ def _select_union_coverage_cuda(filters, points, settings):
                 point_squared_t[1][None, :, :],
             )
             baseline_union_squared_t = union_squared_t[0, 0]
-            coverage_cost_t = torch.mean(torch.clamp(union_squared_t, max=robust_squared), dim=2)
+            union_distances_t = torch.sqrt(torch.clamp_min(union_squared_t, 0.0))
+            coverage_cost_t = torch.mean(
+                torch.where(
+                    union_distances_t <= huber_delta,
+                    0.5 * union_distances_t.square(),
+                    huber_delta * (union_distances_t - 0.5 * huber_delta),
+                ),
+                dim=2,
+            )
             score_t = (
                 top_log_weights_t[0][:, None]
                 + top_log_weights_t[1][None, :]
@@ -1957,9 +2034,16 @@ def _select_union_coverage_cuda(filters, points, settings):
             )
             particle_filter._pending_support_diagnostics = (support_squared_t, affinity_t)
 
-        robust_rms_t = torch.sqrt(torch.mean(torch.clamp(selected_union_squared_t, max=robust_squared)))
+        selected_distances_t = torch.sqrt(torch.clamp_min(selected_union_squared_t, 0.0))
+        huber_cost_t = torch.mean(torch.where(
+            selected_distances_t <= huber_delta,
+            0.5 * selected_distances_t.square(),
+            huber_delta * (selected_distances_t - 0.5 * huber_delta),
+        ))
+        unexplained_rms_t = torch.sqrt(torch.mean(selected_union_squared_t))
+        max_unexplained_t = torch.max(selected_distances_t)
         covered_fraction_t = torch.mean((selected_union_squared_t <= visibility_squared).to(torch.float32))
-        baseline_rms_t = torch.sqrt(torch.mean(torch.clamp(baseline_union_squared_t, max=robust_squared)))
+        baseline_rms_t = torch.sqrt(torch.mean(baseline_union_squared_t))
         baseline_fraction_t = torch.mean((baseline_union_squared_t <= visibility_squared).to(torch.float32))
         packed_t = torch.cat((
             torch.stack([
@@ -1967,22 +2051,27 @@ def _select_union_coverage_cuda(filters, points, settings):
                 for index in range(len(filters))
             ]),
             torch.stack([position.to(torch.float32) + 1.0 for position in positions_t]),
-            robust_rms_t.reshape(1),
+            huber_cost_t.reshape(1),
+            unexplained_rms_t.reshape(1),
+            max_unexplained_t.reshape(1),
             covered_fraction_t.reshape(1),
-            (baseline_rms_t - robust_rms_t).reshape(1),
+            (baseline_rms_t - unexplained_rms_t).reshape(1),
             (covered_fraction_t - baseline_fraction_t).reshape(1),
         ))
         end_event.record(stream)
         packed = packed_t.cpu().numpy().astype(np.float32, copy=False)
 
     count = len(filters)
+    metrics = packed[2 * count:]
     return UnionCoverageSelection(
         selected_particle_indices=tuple(int(round(float(value))) for value in packed[:count]),
         selected_ranks=tuple(int(round(float(value))) for value in packed[count:2 * count]),
-        robust_coverage_rms_m=float(packed[-4]),
-        covered_point_fraction=float(packed[-3]),
-        robust_rms_gain_m=float(packed[-2]),
-        covered_fraction_gain=float(packed[-1]),
+        huber_cost_m2=float(metrics[0]),
+        unexplained_rms_m=float(metrics[1]),
+        max_unexplained_distance_m=float(metrics[2]),
+        covered_point_fraction=float(metrics[3]),
+        rms_gain_m=float(metrics[4]),
+        covered_fraction_gain=float(metrics[5]),
         observation_point_count=int(len(points)),
         stage_seconds=float(time.perf_counter() - started),
         cuda_events=(start_event, end_event),
@@ -2119,12 +2208,13 @@ def cable_crossing_likelihood_update(particle_filter, targets, intrinsics):
         return
     if particle_filter.cuda_state:
         with torch.inference_mode(), torch.cuda.stream(particle_filter.cuda_stream):
-            reward_t, distance_t, angle_t, closest_t, target_index_t = particle_crossing_rewards_torch(
+            reward_t, distance_t, angle_t, continuation_t, closest_t, target_index_t = particle_crossing_rewards_torch(
                 particle_filter.particles,
                 targets,
                 intrinsics,
                 position_sigma_px=float(particle_filter.config.crossing_position_sigma_px),
                 angle_sigma_deg=float(particle_filter.config.crossing_angle_sigma_deg),
+                continuation_sigma_px=float(particle_filter.config.crossing_continuation_sigma_px),
             )
             prior_t = normalize_particle_weights_torch(particle_filter.weights)
             log_weights_t = torch.log(prior_t.clamp_min(1e-20)) + gain * reward_t
@@ -2133,17 +2223,19 @@ def cable_crossing_likelihood_update(particle_filter, targets, intrinsics):
                 reward_t,
                 distance_t,
                 angle_t,
+                continuation_t,
                 closest_t,
                 target_index_t,
                 targets,
             )
     else:
-        reward, distance, angle, closest, target_index = particle_crossing_rewards(
+        reward, distance, angle, continuation, closest, target_index = particle_crossing_rewards(
             particle_filter.particles,
             targets,
             intrinsics,
             position_sigma_px=float(particle_filter.config.crossing_position_sigma_px),
             angle_sigma_deg=float(particle_filter.config.crossing_angle_sigma_deg),
+            continuation_sigma_px=float(particle_filter.config.crossing_continuation_sigma_px),
         )
         prior = normalize_particle_weights(particle_filter.weights)
         log_weights = np.log(np.maximum(prior, 1e-20)) + gain * reward
@@ -2154,6 +2246,7 @@ def cable_crossing_likelihood_update(particle_filter, targets, intrinsics):
             reward,
             distance,
             angle,
+            continuation,
             closest,
             target_index,
             targets,
@@ -2289,26 +2382,19 @@ def _cable_measurement_update_cuda(particle_filter, points):
         map_particle_t = particle_filter.particles.index_select(0, map_index_t)
         map_support_squared_t = support_squared_t.index_select(0, map_index_t)[0]
         visibility_distance = max(float(config.support_visibility_distance_m), 1e-6)
-        if bool(config.point_support_diagnostics_enabled):
-            point_squared_t, _nearest_t = particle_point_distances_cuda(
-                map_particle_t.unsqueeze(0),
-                points_t,
-                stream,
-            )
-            point_affinity_t = torch.exp(
-                -0.5 * point_squared_t[0, 0] / (sigma * sigma)
-            )
-            point_affinity_t = torch.where(
-                point_squared_t[0, 0] <= visibility_distance * visibility_distance,
-                point_affinity_t,
-                torch.zeros_like(point_affinity_t),
-            )
-        else:
-            point_affinity_t = torch.empty(
-                0,
-                dtype=torch.float32,
-                device=particle_filter.device,
-            )
+        point_squared_t, _nearest_t = particle_point_distances_cuda(
+            map_particle_t.unsqueeze(0),
+            points_t,
+            stream,
+        )
+        point_affinity_t = torch.exp(
+            -0.5 * point_squared_t[0, 0] / (sigma * sigma)
+        )
+        point_affinity_t = torch.where(
+            point_squared_t[0, 0] <= visibility_distance * visibility_distance,
+            point_affinity_t,
+            torch.zeros_like(point_affinity_t),
+        )
         particle_filter._pending_support_diagnostics = (
             map_support_squared_t,
             point_affinity_t,
@@ -2398,23 +2484,20 @@ def _cable_measurement_update_cpu(particle_filter, points):
     map_index = int(np.argmax(particle_filter.weights))
     map_particle = particle_filter.particles[map_index:map_index + 1]
     visibility_distance = max(float(config.support_visibility_distance_m), 1e-6)
-    if bool(config.point_support_diagnostics_enabled):
-        point_squared = np.min(
-            point_to_particle_segment_squared_distances(
-                points,
-                map_particle[:, :-1, :],
-                map_particle[:, 1:, :],
-            ),
-            axis=1,
-        )[0]
-        point_affinities = np.exp(-0.5 * point_squared / (sigma * sigma))
-        point_affinities = np.where(
-            point_squared <= visibility_distance * visibility_distance,
-            point_affinities,
-            0.0,
-        )
-    else:
-        point_affinities = np.empty(0, dtype=np.float32)
+    point_squared = np.min(
+        point_to_particle_segment_squared_distances(
+            points,
+            map_particle[:, :-1, :],
+            map_particle[:, 1:, :],
+        ),
+        axis=1,
+    )[0]
+    point_affinities = np.exp(-0.5 * point_squared / (sigma * sigma))
+    point_affinities = np.where(
+        point_squared <= visibility_distance * visibility_distance,
+        point_affinities,
+        0.0,
+    )
     _apply_support_diagnostics(
         particle_filter,
         support_squared[map_index],
@@ -2453,10 +2536,6 @@ def _apply_support_diagnostics(particle_filter, map_support_squared, point_affin
     affinities = np.asarray(point_affinities, dtype=np.float32).reshape(-1)
     particle_filter.last_mean_support_affinity = (
         float(np.mean(affinities)) if len(affinities) else np.nan
-    )
-    particle_filter.last_support_point_affinities = np.ascontiguousarray(
-        affinities,
-        dtype=np.float32,
     )
 
 
@@ -2594,6 +2673,7 @@ def filtered_cable_estimate(measurement, result):
             if np.isfinite(path_support_rms)
             else (polyline_residual(source_points, result.points_xyz) if len(source_points) else 0.0)
         ),
+        observation=getattr(measurement, "observation", None) if measurement is not None else None,
         method=(
             f"raw fixed-length segment particle filter {mode} | {base_method} | "
             f"segment_length={result.segment_length_m:.4f}m ess={result.effective_sample_size:.0f} "

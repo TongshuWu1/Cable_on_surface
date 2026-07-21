@@ -1,39 +1,61 @@
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
-from main import cable_support_colors, draw_crossing_observations, format_tracking_diagnostics
-from zed_split_viewer import ZedDepthGLViewer
+from cable_detection import CableObservation3D
+from main import (
+    draw_crossing_observations,
+    format_tracking_diagnostics,
+    update_viewer_cable,
+)
+from zed_split_viewer import (
+    CABLE_SAMPLE_COLOR,
+    REJECTED_CABLE_SAMPLE_COLOR,
+    ZedDepthGLViewer,
+)
+from zed_spatial import live_point_cloud_to_vertices
 
 
 class ParticleDiagnosticsUiTests(unittest.TestCase):
-    def test_independent_cable_affinities_have_distinct_and_ambiguous_colors(self):
-        colors = cable_support_colors(np.asarray((
-            (0.99, 0.01, 0.50, 0.0),
-            (0.01, 0.99, 0.50, 0.0),
-        ), dtype=np.float32))
+    def test_scene_cloud_preserves_original_zed_rgb(self):
+        packed_colors = np.asarray((0x001E140A, 0x003C3228), dtype=np.uint32).view(np.float32)
+        point_data = np.empty((1, 2, 4), dtype=np.float32)
+        point_data[0, :, :3] = ((0.0, 0.0, 0.5), (0.1, 0.0, 0.5))
+        point_data[0, :, 3] = packed_colors
+        cloud = SimpleNamespace(get_data=lambda: point_data)
 
-        self.assertGreater(float(colors[0, 0]), float(colors[0, 2]))
-        self.assertGreater(float(colors[1, 2]), float(colors[1, 0]))
-        np.testing.assert_allclose(colors[2], (0.68, 0.485, 0.25), atol=1e-6)
-        np.testing.assert_allclose(colors[3], (0.36, 0.39, 0.42), atol=1e-6)
+        vertices = live_point_cloud_to_vertices(
+            cloud,
+            stride=1,
+            depth_min=0.01,
+            depth_max=1.0,
+        )
 
-    def test_support_colors_survive_thread_safe_viewer_handoff(self):
+        np.testing.assert_allclose(
+            vertices[:, 3:],
+            np.asarray(((10, 20, 30), (40, 50, 60)), dtype=np.float32) / 255.0,
+        )
+
+    def test_observation_classes_survive_thread_safe_viewer_handoff(self):
         viewer = ZedDepthGLViewer(640, 480)
         points = np.asarray(((0.0, 0.0, 1.0), (0.1, 0.0, 1.0)), dtype=np.float32)
-        colors = np.asarray(((1.0, 0.0, 0.8), (0.0, 0.8, 1.0)), dtype=np.float32)
+        rejected = np.asarray(((0.2, 0.0, 1.0),), dtype=np.float32)
 
         viewer.update_cable(
             points,
             np.empty((0, 3), dtype=np.float32),
             np.empty(0, dtype=bool),
-            cable_point_colors=colors,
+            rejected_cable_points=rejected,
         )
         viewer._consume_pending_vertices()
 
-        np.testing.assert_allclose(viewer.cable_point_colors, colors)
+        np.testing.assert_allclose(viewer.cable_points, points)
+        np.testing.assert_allclose(viewer.rejected_cable_points, rejected)
+        np.testing.assert_allclose(CABLE_SAMPLE_COLOR, (1.0, 0.58, 0.08))
+        np.testing.assert_allclose(REJECTED_CABLE_SAMPLE_COLOR, (1.0, 0.08, 0.08))
 
     def test_crossing_points_survive_the_thread_safe_viewer_handoff(self):
         viewer = ZedDepthGLViewer(640, 480)
@@ -57,6 +79,57 @@ class ParticleDiagnosticsUiTests(unittest.TestCase):
 
         np.testing.assert_allclose(viewer.crossing_points, crossing_points[:2])
         self.assertEqual(viewer.crossing_proposal_count, 2)
+
+    def test_raw_observation_remains_visible_without_a_pf_estimate(self):
+        viewer = ZedDepthGLViewer(640, 480)
+        accepted = np.asarray(((0.0, 0.0, 1.0),), dtype=np.float32)
+        rejected = np.asarray(((0.2, 0.0, 1.0),), dtype=np.float32)
+        measurement = SimpleNamespace(
+            observation=CableObservation3D(
+                accepted_points_xyz=accepted,
+                rejected_points_xyz=rejected,
+            )
+        )
+
+        update_viewer_cable(
+            viewer,
+            measurement,
+            estimate=None,
+            filter_result=None,
+            max_points=100,
+        )
+        viewer._consume_pending_vertices()
+
+        np.testing.assert_allclose(viewer.cable_points, accepted)
+        np.testing.assert_allclose(viewer.rejected_cable_points, rejected)
+        self.assertEqual(len(viewer.cable_nodes), 0)
+
+    def test_moving_pf_nodes_cannot_reclassify_or_recolor_observations(self):
+        self.assertNotIn(
+            "cable_point_colors",
+            inspect.signature(ZedDepthGLViewer.update_cable).parameters,
+        )
+        accepted = np.asarray(((0.0, 0.0, 1.0),), dtype=np.float32)
+        rejected = np.asarray(((0.2, 0.0, 1.0),), dtype=np.float32)
+        measurement = SimpleNamespace(
+            observation=CableObservation3D(
+                accepted_points_xyz=accepted,
+                rejected_points_xyz=rejected,
+            )
+        )
+        viewer = ZedDepthGLViewer(640, 480)
+        for offset in (0.0, 5.0):
+            estimate = SimpleNamespace(
+                points_xyz=np.asarray(
+                    ((offset, 0.0, 1.0), (offset + 0.1, 0.0, 1.0)),
+                    dtype=np.float32,
+                ),
+                pf_node_runs=(),
+            )
+            update_viewer_cable(viewer, measurement, estimate, None, 100)
+            viewer._consume_pending_vertices()
+            np.testing.assert_allclose(viewer.cable_points, accepted)
+            np.testing.assert_allclose(viewer.rejected_cable_points, rejected)
 
     def test_crossing_diagnostics_report_only_image_likelihood_state(self):
         text = format_tracking_diagnostics({

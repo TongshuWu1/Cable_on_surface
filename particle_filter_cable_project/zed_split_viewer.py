@@ -57,6 +57,7 @@ VISIBLE_COLOR = (0.25, 1.00, 0.48)
 EXTENDED_COLOR = (1.00, 0.82, 0.16)
 OCCLUDED_COLOR = (1.00, 0.18, 0.20)
 CABLE_SAMPLE_COLOR = (1.00, 0.58, 0.08)
+REJECTED_CABLE_SAMPLE_COLOR = (1.00, 0.08, 0.08)
 CROSSING_SAMPLE_COLOR = (0.05, 0.35, 1.00)
 PARTICLE_MAP_COLOR = (1.00, 1.00, 1.00)
 PARTICLE_SPREAD_COLOR = (0.80, 0.52, 1.00)
@@ -128,7 +129,7 @@ class ZedDepthGLViewer:
         self.pending_vertices = None
         self.pending_status = "waiting for frames"
         self.pending_cable_points = None
-        self.pending_cable_point_colors = None
+        self.pending_rejected_cable_points = None
         self.pending_crossing_points = None
         self.pending_crossing_proposal_count = None
         self.pending_cable_nodes = None
@@ -143,7 +144,7 @@ class ZedDepthGLViewer:
         self.vertices = np.empty((0, 6), dtype=np.float32)
         self.vertex_count = 0
         self.cable_points = np.empty((0, 3), dtype=np.float32)
-        self.cable_point_colors = np.empty((0, 3), dtype=np.float32)
+        self.rejected_cable_points = np.empty((0, 3), dtype=np.float32)
         self.crossing_points = np.empty((0, 3), dtype=np.float32)
         self.crossing_proposal_count = 0
         self.cable_nodes = np.empty((0, 3), dtype=np.float32)
@@ -325,10 +326,10 @@ class ZedDepthGLViewer:
         crossing_points=(),
         crossing_proposal_count=0,
         coordinate_frame="camera",
-        cable_point_colors=None,
+        rejected_cable_points=(),
     ):
         cable_points = self._as_points(cable_points)
-        cable_point_colors = self._as_point_colors(cable_point_colors, len(cable_points))
+        rejected_cable_points = self._as_points(rejected_cable_points)
         crossing_points = self._as_points(crossing_points)
         cable_nodes = self._as_node_points(cable_nodes)
         valid_nodes = self._as_node_mask(valid_nodes, len(cable_nodes), False)
@@ -340,7 +341,7 @@ class ZedDepthGLViewer:
 
         with self.lock:
             self.pending_cable_points = cable_points
-            self.pending_cable_point_colors = cable_point_colors
+            self.pending_rejected_cable_points = rejected_cable_points
             self.pending_crossing_points = crossing_points
             self.pending_crossing_proposal_count = max(0, int(crossing_proposal_count))
             self.pending_cable_nodes = cable_nodes
@@ -391,7 +392,7 @@ class ZedDepthGLViewer:
             pending_vertices = self.pending_vertices
             pending_status = self.pending_status
             cable_points = self.pending_cable_points
-            cable_point_colors = self.pending_cable_point_colors
+            rejected_cable_points = self.pending_rejected_cable_points
             crossing_points = self.pending_crossing_points
             crossing_proposal_count = self.pending_crossing_proposal_count
             cable_nodes = self.pending_cable_nodes
@@ -405,7 +406,7 @@ class ZedDepthGLViewer:
             self.pending_rgb_image = None
             self.pending_vertices = None
             self.pending_cable_points = None
-            self.pending_cable_point_colors = None
+            self.pending_rejected_cable_points = None
             self.pending_crossing_points = None
             self.pending_crossing_proposal_count = None
             self.pending_cable_nodes = None
@@ -421,7 +422,8 @@ class ZedDepthGLViewer:
             self.rgb_image = rgb_image
         if cable_points is not None:
             self.cable_points = cable_points
-            self.cable_point_colors = cable_point_colors
+        if rejected_cable_points is not None:
+            self.rejected_cable_points = rejected_cable_points
         if crossing_points is not None:
             self.crossing_points = crossing_points
         if crossing_proposal_count is not None:
@@ -629,22 +631,23 @@ class ZedDepthGLViewer:
 
         if len(self.cable_points) > 0:
             glPointSize(7.0)
+            glColor3f(*CABLE_SAMPLE_COLOR)
             glEnableClientState(GL_VERTEX_ARRAY)
             glVertexPointer(3, GL_FLOAT, 0, np.ascontiguousarray(self.cable_points, dtype=np.float32))
-            use_point_colors = len(self.cable_point_colors) == len(self.cable_points)
-            if use_point_colors:
-                glEnableClientState(GL_COLOR_ARRAY)
-                glColorPointer(
-                    3,
-                    GL_FLOAT,
-                    0,
-                    np.ascontiguousarray(self.cable_point_colors, dtype=np.float32),
-                )
-            else:
-                glColor3f(*CABLE_SAMPLE_COLOR)
             glDrawArrays(GL_POINTS, 0, len(self.cable_points))
-            if use_point_colors:
-                glDisableClientState(GL_COLOR_ARRAY)
+            glDisableClientState(GL_VERTEX_ARRAY)
+
+        if len(self.rejected_cable_points) > 0:
+            glPointSize(9.0)
+            glColor3f(*REJECTED_CABLE_SAMPLE_COLOR)
+            glEnableClientState(GL_VERTEX_ARRAY)
+            glVertexPointer(
+                3,
+                GL_FLOAT,
+                0,
+                np.ascontiguousarray(self.rejected_cable_points, dtype=np.float32),
+            )
+            glDrawArrays(GL_POINTS, 0, len(self.rejected_cable_points))
             glDisableClientState(GL_VERTEX_ARRAY)
 
         if len(self.crossing_points) > 0:
@@ -1390,16 +1393,6 @@ class ZedDepthGLViewer:
         points = points[:, :3]
         valid = np.all(np.isfinite(points), axis=1)
         return np.ascontiguousarray(points[valid], dtype=np.float32)
-
-    @staticmethod
-    def _as_point_colors(colors, point_count):
-        if colors is None:
-            return np.empty((0, 3), dtype=np.float32)
-        colors = np.asarray(colors, dtype=np.float32)
-        if colors.ndim != 2 or colors.shape != (int(point_count), 3):
-            return np.empty((0, 3), dtype=np.float32)
-        colors = np.where(np.isfinite(colors), colors, 0.0)
-        return np.ascontiguousarray(np.clip(colors, 0.0, 1.0), dtype=np.float32)
 
     @staticmethod
     def _as_node_points(points):

@@ -333,6 +333,11 @@ def particle_support_distances(particles, points, samples_per_segment, stream):
 
 _SAMPLER_LOCAL = threading.local()
 
+OBSERVATION_ACCEPTED = 0
+OBSERVATION_INVALID_DEPTH = 1
+OBSERVATION_OUTSIDE_DEPTH_RANGE = 2
+OBSERVATION_POOR_CONFIDENCE = 3
+
 
 def sample_masked_points(
     point_cloud,
@@ -447,3 +452,103 @@ def sample_indexed_points(
     caller_stream.wait_stream(stream)
     output.record_stream(caller_stream)
     return output
+
+
+def sample_indexed_observations(
+    point_cloud,
+    flat_indices,
+    *,
+    depth_min,
+    depth_max,
+    max_confidence,
+):
+    """Gather raw XYZ plus an explicit observation-quality status on CUDA."""
+
+    if not isinstance(point_cloud, CudaPointCloudView):
+        raise TypeError("GPU observation sampling requires CudaPointCloudView.")
+    if point_cloud.pointer <= 0 or point_cloud.step_bytes <= 0:
+        raise ValueError("CUDA point-cloud view has an invalid device pointer or row pitch.")
+    flat_indices = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    if len(flat_indices) == 0:
+        return (
+            torch.empty((0, 3), dtype=torch.float32, device="cuda"),
+            torch.empty(0, dtype=torch.int32, device="cuda"),
+        )
+    pixel_count = int(point_cloud.width) * int(point_cloud.height)
+    if np.any(flat_indices < 0) or np.any(flat_indices >= pixel_count):
+        raise ValueError("Pixel index lies outside the CUDA point-cloud view.")
+    pixel_indices = torch.as_tensor(
+        np.ascontiguousarray(flat_indices),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    stream = getattr(_SAMPLER_LOCAL, "stream", None)
+    if stream is None:
+        stream = torch.cuda.Stream()
+        _SAMPLER_LOCAL.stream = stream
+    caller_stream = torch.cuda.current_stream(pixel_indices.device)
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        stream.wait_stream(caller_stream)
+        pixel_indices.record_stream(stream)
+        output = torch.empty((len(pixel_indices), 3), dtype=torch.float32, device=pixel_indices.device)
+        status = torch.empty(len(pixel_indices), dtype=torch.int32, device=pixel_indices.device)
+        use_confidence = max_confidence is not None
+        if use_confidence and (
+            point_cloud.confidence_pointer <= 0 or point_cloud.confidence_step_bytes <= 0
+        ):
+            raise ValueError("Confidence filtering requested without a CUDA confidence-map view.")
+        cable_cuda_kernels().launch(
+            "gather_indexed_observations_kernel",
+            len(pixel_indices),
+            [
+                ("pointer", point_cloud.pointer),
+                ("int", point_cloud.step_bytes),
+                ("tensor", pixel_indices),
+                ("pointer", point_cloud.confidence_pointer),
+                ("int", point_cloud.confidence_step_bytes),
+                ("tensor", output),
+                ("tensor", status),
+                ("int", point_cloud.width),
+                ("int", len(pixel_indices)),
+                ("float", 0.0 if depth_min is None else depth_min),
+                ("float", float("inf") if depth_max is None else depth_max),
+                ("float", 0.0 if max_confidence is None else max_confidence),
+                ("int", int(use_confidence)),
+            ],
+            stream,
+            block_size=256,
+        )
+    caller_stream.wait_stream(stream)
+    output.record_stream(caller_stream)
+    status.record_stream(caller_stream)
+    return output, status
+
+
+def radius_neighbor_inlier_mask(points, radius_m, minimum_neighbors, stream=None):
+    """Return a CUDA mask using only point-to-point radius support."""
+
+    if not isinstance(points, torch.Tensor) or not points.is_cuda:
+        raise TypeError("CUDA radius filtering requires a CUDA tensor.")
+    points = points.to(dtype=torch.float32).contiguous()
+    minimum_neighbors = max(0, int(minimum_neighbors))
+    if minimum_neighbors == 0:
+        return torch.ones(len(points), dtype=torch.bool, device=points.device)
+    if len(points) == 0:
+        return torch.empty(0, dtype=torch.bool, device=points.device)
+    stream = torch.cuda.current_stream(points.device) if stream is None else stream
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        output = torch.empty(len(points), dtype=torch.uint8, device=points.device)
+        cable_cuda_kernels().launch(
+            "radius_neighbor_inlier_kernel",
+            len(points),
+            [
+                ("tensor", points),
+                ("tensor", output),
+                ("int", len(points)),
+                ("float", float(radius_m) ** 2),
+                ("int", minimum_neighbors),
+            ],
+            stream,
+            block_size=256,
+        )
+    return output.to(dtype=torch.bool)

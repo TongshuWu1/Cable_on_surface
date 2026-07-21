@@ -7,17 +7,19 @@ import numpy as np
 from cable_particle_filter import (
     CableParticleFilter,
     CableParticleFilterConfig,
-    cable_measurement_update,
     transition_population_counts,
     transition_proposal_ratios,
 )
 from main import (
+    AsyncTrackingWorker,
     feature_gate_status,
+    make_runtime_feature_controller,
     make_particle_filter_config,
     parse_args,
 )
 from pf_ablation import (
     RuntimeFeatureController,
+    dependency_safe_feature_toggle,
     feature_state_from_args,
     isolated_feature_state,
     minimal_baseline_state,
@@ -41,8 +43,10 @@ class FeatureGateTests(unittest.TestCase):
         self.assertFalse(args.pf_direction_smoothing)
         self.assertTrue(args.pf_dense_path_support)
         self.assertTrue(args.pf_union_coverage)
+        self.assertTrue(args.cable_spatial_outlier_filter)
         self.assertIn("path-support=1", status)
         self.assertIn("union=1", status)
+        self.assertIn("spatial-outlier=1", status)
 
     def test_one_cable_mode_keeps_the_two_head_neural_schema(self):
         args = self.parse(
@@ -56,6 +60,9 @@ class FeatureGateTests(unittest.TestCase):
 
     def test_algorithmic_features_map_to_real_work(self):
         args = self.parse(
+            "--no-cable-mask-morphology",
+            "--no-cable-component-filter",
+            "--no-depth-confidence-filter",
             "--no-endpoint-association-support",
             "--no-pf-velocity",
             "--no-pf-adaptive-motion",
@@ -69,10 +76,13 @@ class FeatureGateTests(unittest.TestCase):
             "--no-pf-robust-measurement",
             "--no-pf-dense-path-support",
             "--no-pf-union-coverage",
-            "--no-point-support-coloring",
+            "--no-cable-spatial-outlier-filter",
             "--no-particle-diagnostics-overlay",
         )
         config = make_particle_filter_config(args, cable_index=0)
+        self.assertFalse(args.cable_mask_morphology)
+        self.assertFalse(args.cable_component_filter)
+        self.assertFalse(args.depth_confidence_filter)
         self.assertFalse(config.velocity_enabled)
         self.assertFalse(config.adaptive_motion_noise_enabled)
         self.assertEqual(config.max_prediction_frames, 0)
@@ -86,7 +96,7 @@ class FeatureGateTests(unittest.TestCase):
         self.assertFalse(config.robust_measurement_enabled)
         self.assertEqual(config.path_support_weight, 0.0)
         self.assertEqual(config.union_coverage_weight, 0.0)
-        self.assertFalse(config.point_support_diagnostics_enabled)
+        self.assertFalse(args.cable_spatial_outlier_filter)
         self.assertFalse(config.particle_diagnostics_enabled)
 
     def test_disabling_one_population_transfers_only_its_mass_to_local(self):
@@ -127,6 +137,66 @@ class FeatureGateTests(unittest.TestCase):
         self.assertFalse(args.crossing_proposals)
         self.assertFalse(args.crossing_likelihood)
 
+    def test_live_crossing_toggle_reconfigures_and_resets_without_mutating_frozen_config(self):
+        args = self.parse("--pf-scoring-backend", "cpu", "--pf-particles", "8")
+        runtime_features = make_runtime_feature_controller(args)
+        particle_filters = [
+            CableParticleFilter(
+                node_count=args.cable_segments + 1,
+                config=make_particle_filter_config(args, cable_index),
+                seed=17 + cable_index,
+            )
+            for cable_index in range(args.cable_count)
+        ]
+        worker = AsyncTrackingWorker(
+            args,
+            cable_detector=object(),
+            particle_filters=particle_filters,
+            runtime_features=runtime_features,
+        )
+        original_filters = tuple(worker.particle_filters)
+        state = dependency_safe_feature_toggle(
+            runtime_features.snapshot()["features"],
+            "crossing_proposals",
+            False,
+        )
+        revision = runtime_features.apply(state, reset_filter=True)
+        try:
+            worker._apply_runtime_features(runtime_features.snapshot())
+        finally:
+            worker.close()
+
+        self.assertEqual(revision, 1)
+        self.assertEqual(worker.runtime_feature_revision, 1)
+        self.assertFalse(worker.args.crossing_proposals)
+        self.assertFalse(worker.args.crossing_likelihood)
+        self.assertTrue(all(
+            previous is not current
+            for previous, current in zip(original_filters, worker.particle_filters)
+        ))
+
+    def test_live_endpoint_support_toggle_replaces_frozen_association_config(self):
+        args = self.parse("--pf-scoring-backend", "cpu", "--pf-particles", "8")
+        runtime_features = make_runtime_feature_controller(args)
+        worker = AsyncTrackingWorker(
+            args,
+            cable_detector=object(),
+            particle_filters=[],
+            runtime_features=runtime_features,
+        )
+        state = dependency_safe_feature_toggle(
+            runtime_features.snapshot()["features"],
+            "endpoint_association_support",
+            False,
+        )
+        runtime_features.apply(state, reset_filter=False)
+        try:
+            worker._apply_runtime_features(runtime_features.snapshot())
+        finally:
+            worker.close()
+
+        self.assertEqual(worker.endpoint_associator.config.support_weight, 0.0)
+
     def test_isolated_preset_lists_required_parent_algorithms(self):
         args = self.parse()
         initial = feature_state_from_args(args)
@@ -166,23 +236,6 @@ class FeatureGateTests(unittest.TestCase):
             particle_filter.last_endpoint_tangent_confidence,
             np.zeros(2),
         )
-
-    def test_disabled_support_affinity_storage_avoids_point_vector(self):
-        config = CableParticleFilterConfig(
-            particle_count=8,
-            segment_length_m=0.1,
-            scoring_backend="cpu",
-            path_support_weight=0.0,
-            point_support_diagnostics_enabled=False,
-        )
-        chain = np.asarray(((-0.1, 0.0, 1.0), (0.0, 0.0, 1.0), (0.1, 0.0, 1.0)))
-        particle_filter = CableParticleFilter(3, config, seed=1)
-        particle_filter.particles = np.repeat(chain[None, :, :], 8, axis=0)
-        particle_filter.weights = np.full(8, 1.0 / 8.0)
-        particle_filter.last_endpoint_nodes = chain[[0, -1]].copy()
-        particle_filter.initialized = True
-        cable_measurement_update(particle_filter, chain)
-        self.assertEqual(particle_filter.last_support_point_affinities.size, 0)
 
     def test_disabled_particle_overlay_skips_diagnostic_payload(self):
         config = CableParticleFilterConfig(

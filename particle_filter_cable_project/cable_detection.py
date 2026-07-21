@@ -1,15 +1,76 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+import torch
 
-from cable_cuda import CudaPointCloudView, sample_indexed_points, sample_masked_points
+from cable_cuda import (
+    CudaPointCloudView,
+    OBSERVATION_ACCEPTED,
+    OBSERVATION_INVALID_DEPTH,
+    OBSERVATION_OUTSIDE_DEPTH_RANGE,
+    OBSERVATION_POOR_CONFIDENCE,
+    radius_neighbor_inlier_mask,
+    sample_indexed_observations,
+    sample_indexed_points,
+    sample_masked_points,
+)
 
 
 @dataclass
 class CableDetection2D:
     mask: np.ndarray
     component_count: int
+    component_rejected_mask: np.ndarray | None = None
+    morphology_rejected_mask: np.ndarray | None = None
+
+
+OBSERVATION_REJECTION_KEYS = (
+    "invalid_depth",
+    "depth_range",
+    "depth_confidence",
+    "small_component",
+    "mask_morphology",
+    "spatial_isolation",
+)
+
+
+@dataclass
+class CableObservation3D:
+    """One explicit, PF-independent sampled cable observation."""
+
+    accepted_points_xyz: np.ndarray
+    rejected_points_xyz: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    rejected_pixels_xy: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.int32)
+    )
+    rejection_counts: dict = field(default_factory=dict)
+    spatial_filter_applied: bool = False
+
+    def __post_init__(self):
+        self.accepted_points_xyz = normalized_xyz(self.accepted_points_xyz)
+        self.rejected_points_xyz = normalized_xyz(self.rejected_points_xyz)
+        pixels = np.asarray(self.rejected_pixels_xy, dtype=np.int32)
+        self.rejected_pixels_xy = (
+            np.ascontiguousarray(pixels[:, :2], dtype=np.int32)
+            if pixels.ndim == 2 and pixels.shape[1] >= 2
+            else np.empty((0, 2), dtype=np.int32)
+        )
+        supplied = dict(self.rejection_counts or {})
+        self.rejection_counts = {
+            key: max(0, int(supplied.get(key, 0)))
+            for key in OBSERVATION_REJECTION_KEYS
+        }
+
+    @property
+    def accepted_count(self):
+        return int(len(self.accepted_points_xyz))
+
+    @property
+    def rejected_count(self):
+        return int(sum(self.rejection_counts.values()))
 
 
 @dataclass
@@ -18,6 +79,7 @@ class CableEstimate3D:
     source_points: np.ndarray
     residual_m: float
     method: str
+    observation: CableObservation3D | None = None
     endpoint_nodes: np.ndarray | None = None
     endpoint_marker_centers_xyz: np.ndarray | None = None
     endpoint_marker_centers_xy: np.ndarray | None = None
@@ -50,6 +112,34 @@ class EndpointGroupObservations3D:
     areas_px: np.ndarray
 
 
+def normalized_xyz(points):
+    values = np.asarray(points, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] < 3:
+        return np.empty((0, 3), dtype=np.float32)
+    values = values[:, :3]
+    return np.ascontiguousarray(values[np.all(np.isfinite(values), axis=1)], dtype=np.float32)
+
+
+def resize_optional_mask(mask, output_shape):
+    if mask is None:
+        return np.zeros(tuple(output_shape[:2]), dtype=np.uint8)
+    values = np.asarray(mask, dtype=np.uint8)
+    output_h, output_w = int(output_shape[0]), int(output_shape[1])
+    if values.shape[:2] != (output_h, output_w):
+        values = cv2.resize(values, (output_w, output_h), interpolation=cv2.INTER_NEAREST)
+    return np.ascontiguousarray(np.where(values > 0, 255, 0), dtype=np.uint8)
+
+
+def empty_cable_observation(spatial_filter_applied=False):
+    return CableObservation3D(
+        accepted_points_xyz=np.empty((0, 3), dtype=np.float32),
+        rejected_points_xyz=np.empty((0, 3), dtype=np.float32),
+        rejected_pixels_xy=np.empty((0, 2), dtype=np.int32),
+        rejection_counts={},
+        spatial_filter_applied=bool(spatial_filter_applied),
+    )
+
+
 class CableMaskDetector:
     """Shared morphological cleanup for neural cable masks."""
 
@@ -64,19 +154,23 @@ class CableMaskDetector:
         self.close_kernel = odd_kernel_size(close_kernel)
 
     def clean_mask(self, raw_mask):
-        mask = np.asarray(raw_mask, dtype=np.uint8)
+        raw = np.where(np.asarray(raw_mask, dtype=np.uint8) > 0, 255, 0).astype(np.uint8)
+        mask = raw.copy()
         if self.open_kernel > 1:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.open_kernel, self.open_kernel))
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         if self.close_kernel > 1:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.close_kernel, self.close_kernel))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return remove_small_components(
+        morphology_rejected = np.where((raw > 0) & (mask == 0), 255, 0).astype(np.uint8)
+        cleaned, component_count = remove_small_components(
             mask,
             min_area=self.min_area,
             keep_largest_component=False,
             max_components=0,
         )
+        component_rejected = np.where((mask > 0) & (cleaned == 0), 255, 0).astype(np.uint8)
+        return cleaned, component_count, component_rejected, morphology_rejected
 
 
 def resize_detection(detection, output_shape):
@@ -86,9 +180,19 @@ def resize_detection(detection, output_shape):
         return detection
 
     mask = cv2.resize(detection.mask, (output_w, output_h), interpolation=cv2.INTER_NEAREST)
+    component_rejected = resize_optional_mask(
+        detection.component_rejected_mask,
+        (output_h, output_w),
+    )
+    morphology_rejected = resize_optional_mask(
+        detection.morphology_rejected_mask,
+        (output_h, output_w),
+    )
     return CableDetection2D(
         mask=np.ascontiguousarray(mask, dtype=np.uint8),
         component_count=int(detection.component_count),
+        component_rejected_mask=component_rejected,
+        morphology_rejected_mask=morphology_rejected,
     )
 
 
@@ -123,8 +227,15 @@ def cable_measurement_from_mask_points(
 def cable_measurement_from_support_points(
     source_points,
     segment_count=12,
+    observation=None,
 ):
-    source_points = np.asarray(source_points, dtype=np.float32)
+    if observation is not None and not isinstance(observation, CableObservation3D):
+        raise TypeError("observation must be a CableObservation3D instance.")
+    source_points = (
+        observation.accepted_points_xyz
+        if observation is not None
+        else np.asarray(source_points, dtype=np.float32)
+    )
     if source_points.ndim != 2 or source_points.shape[1] < 3:
         return None
     source_points = source_points[np.all(np.isfinite(source_points[:, :3]), axis=1), :3]
@@ -136,6 +247,7 @@ def cable_measurement_from_support_points(
         source_points=np.ascontiguousarray(source_points, dtype=np.float32),
         residual_m=0.0,
         method=f"shared cable point support from RGB mask + ZED points | segments={int(segment_count)}",
+        observation=observation,
     )
 
 
@@ -409,6 +521,309 @@ def sampled_masked_point_cloud_points(
         indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
         points = points[indices]
     return np.ascontiguousarray(points, dtype=np.float32)
+
+
+def sampled_cable_observation(
+    point_cloud,
+    detection,
+    *,
+    depth_min=0.05,
+    depth_max=None,
+    confidence_map=None,
+    max_confidence=None,
+    max_points=1000,
+    spatial_filter_enabled=False,
+    spatial_radius_m=0.015,
+    spatial_min_neighbors=2,
+):
+    """Lift one shared cable observation and retain every rejection decision.
+
+    All decisions use the NN masks, ZED quality values, and the sampled 3D
+    cloud only.  No particle-filter state or estimate is accepted by this API.
+    """
+
+    if detection is None or getattr(detection, "mask", None) is None:
+        return empty_cable_observation(spatial_filter_enabled)
+    max_points = max(1, int(max_points))
+    spatial_radius_m = max(1e-6, float(spatial_radius_m))
+    spatial_min_neighbors = max(0, int(spatial_min_neighbors))
+    if isinstance(point_cloud, CudaPointCloudView):
+        target_shape = (int(point_cloud.height), int(point_cloud.width))
+        point_data = None
+    else:
+        try:
+            point_data = np.asarray(point_cloud.get_data())
+        except Exception:
+            point_data = np.asarray(point_cloud)
+        if point_data.ndim != 3 or point_data.shape[2] < 3:
+            return empty_cable_observation(spatial_filter_enabled)
+        target_shape = point_data.shape[:2]
+
+    accepted_mask = resize_optional_mask(detection.mask, target_shape)
+    component_mask = resize_optional_mask(
+        getattr(detection, "component_rejected_mask", None),
+        target_shape,
+    )
+    morphology_mask = resize_optional_mask(
+        getattr(detection, "morphology_rejected_mask", None),
+        target_shape,
+    )
+    clean_indices = evenly_sample_indices(
+        np.flatnonzero(accepted_mask.reshape(-1)),
+        max_points,
+    )
+    component_indices = evenly_sample_indices(
+        np.flatnonzero(component_mask.reshape(-1)),
+        max_points,
+    )
+    morphology_indices = evenly_sample_indices(
+        np.flatnonzero(morphology_mask.reshape(-1)),
+        max_points,
+    )
+    index_groups = (clean_indices, component_indices, morphology_indices)
+    counts = tuple(len(indices) for indices in index_groups)
+    if not any(counts):
+        return empty_cable_observation(spatial_filter_enabled)
+    combined_indices = np.ascontiguousarray(np.concatenate(index_groups), dtype=np.int64)
+
+    if isinstance(point_cloud, CudaPointCloudView):
+        raw_points_t, status_t = sample_indexed_observations(
+            point_cloud,
+            combined_indices,
+            depth_min=depth_min,
+            depth_max=depth_max,
+            max_confidence=max_confidence,
+        )
+        return _build_cable_observation_cuda(
+            raw_points_t,
+            status_t,
+            index_groups,
+            target_shape[1],
+            spatial_filter_enabled,
+            spatial_radius_m,
+            spatial_min_neighbors,
+        )
+
+    raw_points, status = observation_points_and_status_at_indices(
+        point_data,
+        combined_indices,
+        target_shape[1],
+        depth_min=depth_min,
+        depth_max=depth_max,
+        confidence_map=confidence_map,
+        max_confidence=max_confidence,
+    )
+    return _build_cable_observation_cpu(
+        raw_points,
+        status,
+        index_groups,
+        target_shape[1],
+        spatial_filter_enabled,
+        spatial_radius_m,
+        spatial_min_neighbors,
+    )
+
+
+def _build_cable_observation_cpu(
+    raw_points,
+    status,
+    index_groups,
+    width,
+    spatial_filter_enabled,
+    spatial_radius_m,
+    spatial_min_neighbors,
+):
+    clean_indices, component_indices, morphology_indices = index_groups
+    clean_count, component_count, morphology_count = [len(values) for values in index_groups]
+    clean_points = np.asarray(raw_points[:clean_count], dtype=np.float32)
+    clean_status = np.asarray(status[:clean_count], dtype=np.int32)
+    cursor = clean_count
+    component_points = np.asarray(raw_points[cursor:cursor + component_count], dtype=np.float32)
+    cursor += component_count
+    morphology_points = np.asarray(raw_points[cursor:cursor + morphology_count], dtype=np.float32)
+
+    quality_mask = clean_status == OBSERVATION_ACCEPTED
+    quality_points = np.ascontiguousarray(clean_points[quality_mask], dtype=np.float32)
+    spatial_inliers = (
+        radius_neighbor_inlier_mask_cpu(
+            quality_points,
+            spatial_radius_m,
+            spatial_min_neighbors,
+        )
+        if spatial_filter_enabled
+        else np.ones(len(quality_points), dtype=bool)
+    )
+    accepted_points = quality_points[spatial_inliers]
+    isolated_points = quality_points[~spatial_inliers]
+    quality_indices = clean_indices[quality_mask]
+
+    rejected_finite = [
+        clean_points[(clean_status != OBSERVATION_ACCEPTED) & np.all(np.isfinite(clean_points), axis=1)],
+        isolated_points,
+        component_points[np.all(np.isfinite(component_points), axis=1)],
+        morphology_points[np.all(np.isfinite(morphology_points), axis=1)],
+    ]
+    rejected_points = normalized_xyz(np.vstack([values for values in rejected_finite if len(values)])) if any(
+        len(values) for values in rejected_finite
+    ) else np.empty((0, 3), dtype=np.float32)
+    rejected_indices = np.concatenate((
+        clean_indices[clean_status != OBSERVATION_ACCEPTED],
+        quality_indices[~spatial_inliers],
+        component_indices,
+        morphology_indices,
+    ))
+    return CableObservation3D(
+        accepted_points_xyz=accepted_points,
+        rejected_points_xyz=rejected_points,
+        rejected_pixels_xy=flat_indices_to_xy(rejected_indices, width),
+        rejection_counts=observation_rejection_counts(
+            clean_status,
+            int(np.count_nonzero(~spatial_inliers)),
+            component_count,
+            morphology_count,
+        ),
+        spatial_filter_applied=bool(spatial_filter_enabled),
+    )
+
+
+def _build_cable_observation_cuda(
+    raw_points_t,
+    status_t,
+    index_groups,
+    width,
+    spatial_filter_enabled,
+    spatial_radius_m,
+    spatial_min_neighbors,
+):
+    clean_indices, component_indices, morphology_indices = index_groups
+    clean_count, component_count, morphology_count = [len(values) for values in index_groups]
+    clean_points_t = raw_points_t[:clean_count]
+    clean_status_t = status_t[:clean_count]
+    cursor = clean_count
+    component_points_t = raw_points_t[cursor:cursor + component_count]
+    cursor += component_count
+    morphology_points_t = raw_points_t[cursor:cursor + morphology_count]
+    quality_mask_t = clean_status_t == OBSERVATION_ACCEPTED
+    quality_points_t = clean_points_t[quality_mask_t].contiguous()
+    spatial_inliers_t = (
+        radius_neighbor_inlier_mask(
+            quality_points_t,
+            spatial_radius_m,
+            spatial_min_neighbors,
+        )
+        if spatial_filter_enabled
+        else quality_mask_t.new_ones(len(quality_points_t), dtype=torch.bool)
+    )
+    accepted_points_t = quality_points_t[spatial_inliers_t]
+    rejected_parts_t = []
+    clean_rejected_t = clean_points_t[~quality_mask_t]
+    clean_rejected_t = clean_rejected_t[torch.isfinite(clean_rejected_t).all(dim=1)]
+    if len(clean_rejected_t):
+        rejected_parts_t.append(clean_rejected_t)
+    isolated_t = quality_points_t[~spatial_inliers_t]
+    if len(isolated_t):
+        rejected_parts_t.append(isolated_t)
+    for values_t in (component_points_t, morphology_points_t):
+        finite_t = values_t[torch.isfinite(values_t).all(dim=1)]
+        if len(finite_t):
+            rejected_parts_t.append(finite_t)
+    rejected_points_t = (
+        torch.cat(rejected_parts_t, dim=0)
+        if rejected_parts_t
+        else raw_points_t.new_empty((0, 3))
+    )
+
+    clean_status = clean_status_t.cpu().numpy().astype(np.int32, copy=False)
+    quality_mask = clean_status == OBSERVATION_ACCEPTED
+    spatial_inliers = spatial_inliers_t.cpu().numpy().astype(bool, copy=False)
+    quality_indices = clean_indices[quality_mask]
+    rejected_indices = np.concatenate((
+        clean_indices[~quality_mask],
+        quality_indices[~spatial_inliers],
+        component_indices,
+        morphology_indices,
+    ))
+    return CableObservation3D(
+        accepted_points_xyz=accepted_points_t.cpu().numpy(),
+        rejected_points_xyz=rejected_points_t.cpu().numpy(),
+        rejected_pixels_xy=flat_indices_to_xy(rejected_indices, width),
+        rejection_counts=observation_rejection_counts(
+            clean_status,
+            int(np.count_nonzero(~spatial_inliers)),
+            component_count,
+            morphology_count,
+        ),
+        spatial_filter_applied=bool(spatial_filter_enabled),
+    )
+
+
+def observation_points_and_status_at_indices(
+    point_data,
+    flat_indices,
+    width,
+    *,
+    depth_min,
+    depth_max,
+    confidence_map,
+    max_confidence,
+):
+    flat_indices = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    ys = flat_indices // int(width)
+    xs = flat_indices - ys * int(width)
+    xyz = np.ascontiguousarray(point_data[ys, xs, :3], dtype=np.float32)
+    status = np.full(len(xyz), OBSERVATION_ACCEPTED, dtype=np.int32)
+    finite = np.all(np.isfinite(xyz), axis=1)
+    status[~finite] = OBSERVATION_INVALID_DEPTH
+    distances = np.linalg.norm(np.where(finite[:, None], xyz, 0.0), axis=1)
+    in_range = np.ones(len(xyz), dtype=bool)
+    if depth_min is not None:
+        in_range &= distances >= float(depth_min)
+    if depth_max is not None:
+        in_range &= distances <= float(depth_max)
+    status[finite & ~in_range] = OBSERVATION_OUTSIDE_DEPTH_RANGE
+    confidence = confidence_values_at_pixels(confidence_map, point_data.shape[:2], ys, xs)
+    if confidence is not None and max_confidence is not None:
+        confidence_ok = np.isfinite(confidence) & (confidence <= float(max_confidence))
+        status[(status == OBSERVATION_ACCEPTED) & ~confidence_ok] = OBSERVATION_POOR_CONFIDENCE
+    return xyz, status
+
+
+def radius_neighbor_inlier_mask_cpu(points, radius_m, minimum_neighbors, chunk_size=512):
+    points = normalized_xyz(points)
+    minimum_neighbors = max(0, int(minimum_neighbors))
+    if minimum_neighbors == 0:
+        return np.ones(len(points), dtype=bool)
+    if len(points) == 0:
+        return np.empty(0, dtype=bool)
+    radius_squared = float(radius_m) ** 2
+    output = np.zeros(len(points), dtype=bool)
+    for start in range(0, len(points), max(1, int(chunk_size))):
+        stop = min(len(points), start + max(1, int(chunk_size)))
+        delta = points[start:stop, None, :] - points[None, :, :]
+        counts = np.sum(np.sum(delta * delta, axis=2) <= radius_squared, axis=1) - 1
+        output[start:stop] = counts >= minimum_neighbors
+    return output
+
+
+def observation_rejection_counts(clean_status, isolation_count, component_count, morphology_count):
+    clean_status = np.asarray(clean_status, dtype=np.int32)
+    return {
+        "invalid_depth": int(np.count_nonzero(clean_status == OBSERVATION_INVALID_DEPTH)),
+        "depth_range": int(np.count_nonzero(clean_status == OBSERVATION_OUTSIDE_DEPTH_RANGE)),
+        "depth_confidence": int(np.count_nonzero(clean_status == OBSERVATION_POOR_CONFIDENCE)),
+        "small_component": int(component_count),
+        "mask_morphology": int(morphology_count),
+        "spatial_isolation": int(isolation_count),
+    }
+
+
+def flat_indices_to_xy(flat_indices, width):
+    flat_indices = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    if len(flat_indices) == 0:
+        return np.empty((0, 2), dtype=np.int32)
+    ys = flat_indices // int(width)
+    xs = flat_indices - ys * int(width)
+    return np.ascontiguousarray(np.stack((xs, ys), axis=1), dtype=np.int32)
 
 
 def sampled_masked_point_cloud_point_sets(

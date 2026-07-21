@@ -5,6 +5,7 @@ import numpy as np
 from cable_particle_filter import (
     CableParticleFilter,
     CableParticleFilterConfig,
+    huber_distance_loss,
     select_union_coverage_representatives,
 )
 
@@ -19,6 +20,15 @@ def line(start, end, count=5):
 
 
 class UnionCoverageSelectionTests(unittest.TestCase):
+    def test_huber_loss_keeps_distant_unexplained_points_influential(self):
+        distances = np.asarray((0.0, 0.03, 0.06, 0.12), dtype=np.float64)
+        loss = huber_distance_loss(distances, delta_m=0.03)
+
+        self.assertAlmostEqual(loss[0], 0.0)
+        self.assertGreater(loss[2], loss[1])
+        self.assertGreater(loss[3], loss[2])
+        self.assertAlmostEqual(loss[3] - loss[2], 0.03 * 0.06)
+
     @staticmethod
     def _scene(backend="cpu"):
         horizontal = line((-0.10, 0.0, 1.0), (0.10, 0.0, 1.0))
@@ -68,9 +78,11 @@ class UnionCoverageSelectionTests(unittest.TestCase):
 
         self.assertEqual(selection.selected_particle_indices, (1, 0))
         self.assertEqual(selection.selected_ranks, (2, 1))
-        self.assertAlmostEqual(selection.robust_coverage_rms_m, 0.0, places=7)
+        self.assertAlmostEqual(selection.unexplained_rms_m, 0.0, places=7)
+        self.assertAlmostEqual(selection.max_unexplained_distance_m, 0.0, places=7)
+        self.assertAlmostEqual(selection.huber_cost_m2, 0.0, places=7)
         self.assertAlmostEqual(selection.covered_point_fraction, 1.0, places=7)
-        self.assertGreater(selection.robust_rms_gain_m, 0.0)
+        self.assertGreater(selection.rms_gain_m, 0.0)
         self.assertGreater(selection.covered_fraction_gain, 0.0)
         np.testing.assert_array_equal(first.weights, first_weights)
         np.testing.assert_array_equal(second.weights, second_weights)
@@ -105,9 +117,15 @@ class UnionCoverageSelectionTests(unittest.TestCase):
 
         self.assertEqual(gpu.selected_particle_indices, cpu.selected_particle_indices)
         self.assertEqual(gpu.selected_ranks, cpu.selected_ranks)
-        self.assertAlmostEqual(gpu.robust_coverage_rms_m, cpu.robust_coverage_rms_m, places=5)
+        self.assertAlmostEqual(gpu.unexplained_rms_m, cpu.unexplained_rms_m, places=5)
+        self.assertAlmostEqual(
+            gpu.max_unexplained_distance_m,
+            cpu.max_unexplained_distance_m,
+            places=5,
+        )
+        self.assertAlmostEqual(gpu.huber_cost_m2, cpu.huber_cost_m2, places=5)
         self.assertAlmostEqual(gpu.covered_point_fraction, cpu.covered_point_fraction, places=5)
-        self.assertAlmostEqual(gpu.robust_rms_gain_m, cpu.robust_rms_gain_m, places=5)
+        self.assertAlmostEqual(gpu.rms_gain_m, cpu.rms_gain_m, places=5)
         self.assertAlmostEqual(gpu.covered_fraction_gain, cpu.covered_fraction_gain, places=5)
 
 

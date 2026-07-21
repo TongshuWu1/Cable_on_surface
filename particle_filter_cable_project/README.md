@@ -18,10 +18,10 @@ Start the ZED 3D viewer and tracker:
 
 Every optional estimator stage has one boolean in `[features]` in
 `config.toml`. Numeric values stay fixed when a stage is disabled. The separate
-**Cable PF Ablation Control** window can apply the configured system, a minimal
-PF baseline, one feature plus its declared dependencies, or the configured
-system with one feature removed. Applying a revision resets both PFs so the
-previous posterior cannot contaminate the comparison.
+**Feature Controls** window contains only feature switches and one **Apply**
+button. Enabling a feature automatically enables its required parents;
+disabling a parent visibly disables its dependents. Applying a revision resets
+both PFs so the previous posterior cannot contaminate the comparison.
 
 The switches cover mask morphology and component rejection, ZED confidence,
 endpoint-pair support, velocity and adaptive motion, occlusion prediction,
@@ -37,10 +37,9 @@ same-channel endpoint identity, normalized weights, and the measured endpoints.
 PF1 and PF2 do not share particle indices, ancestors, random draws, weights, or
 estimates. These are model invariants, not optional heuristics.
 
-Enable **Record self-describing JSONL experiment** to store configuration and
-checkpoint hashes, seeds, physical values, exact feature state, per-frame
-diagnostics, and stage timings. After holding each revision for a useful number
-of frames, summarize it with:
+The experiment recorder remains available programmatically to store
+configuration and checkpoint hashes, seeds, physical values, exact feature
+state, per-frame diagnostics, and stage timings. Summarize a recorded run with:
 
 ```powershell
 ..\.venv\Scripts\python.exe tools\summarize_ablation.py experiments\pf_ablation_20260721T120000.000000Z.jsonl --warmup-frames 10
@@ -81,27 +80,40 @@ channel, so marking a crossing does not erase cable or endpoint annotations.
 
 The crossing head predicts only an RGB crossing probability; it never predicts
 cable ownership, depth order, or physical contact. Cable-mask pixels in an
-annulus around each proposal estimate two unoriented image axes. The axes are
-assigned to PF1/PF2 from their previous calibrated projections (or their own
-endpoint chord during initialization). Every PF remains independent and gains
-a bounded log-weight reward when its projected particle passes through the RGB
-crossing region with the assigned local angle. No 3D gap, radius, contact, or
-depth-order term is present.
+annulus around each proposal estimate two unoriented image axes. The endpoint
+channels identify PF1/PF2 but do not label the crossing axes. Each independent
+PF therefore evaluates both local axes and uses the better axis hypothesis for
+each crossing. Neither a straight endpoint chord nor the previous PF estimate
+is allowed to label an axis: the chord is not a local tangent for a curved
+cable, while the previous PF would make a wrong branch self-reinforcing. A PF
+gains a bounded log-weight reward only when its projected particle passes
+through the RGB crossing region and continues along one observed axis on both
+sides. No 3D gap, radius, contact, or depth-order term is present.
 
 For particle `k`, the crossing reward is
 
 ```text
 R_cross(k) = gamma exp(-d_rgb(k)^2 / (2 sigma_p^2)
-                       -d_angle(k)^2 / (2 sigma_angle^2)).
+                       -d_angle(k)^2 / (2 sigma_angle^2)
+                       -d_two_side(k)^2 / (2 sigma_side^2)).
 log w(k) <- log w(k) + lambda_cross R_cross(k).
 ```
+
+`d_two_side` is the larger of the projected-polyline distances to two probe
+points placed on opposite sides of the crossing centroid. A path that touches
+the centroid but turns onto the other cable's outgoing branch therefore cannot
+receive the maximum crossing reward.
 
 The two PFs apply this equation separately. Crossing evidence changes ranking
 only; it does not create a joint particle state or crossing-conditioned proposal.
 
 Deterministic mask indices are sampled directly from the ZED GPU depth buffer
-into one compact shared, unlabeled 3D support cloud. The cloud is never hard
-split or deleted. For PF `a`, segment `j`, and dense sample `m`, let
+into one explicit, shared, unlabeled 3D observation. Observation acceptance is
+independent of both PFs: the only rejection reasons are invalid/range depth,
+poor ZED confidence, configured 2D mask cleanup, or insufficient local 3D
+radius support. The spatial filter has its own ablation switch. A PF estimate
+is never used to remove or relabel an observation point. For PF `a`, segment
+`j`, and dense sample `m`, let
 `x_a,k,j,m` be a point on particle `k`. Its measurement cost is
 
 ```text
@@ -120,26 +132,33 @@ constraints. Each PF combines this likelihood only with its own temporal prior.
 
 After those independent posteriors are scored, a separate final-estimate layer
 compares the top `K` particles from each PF. It selects the pair whose *union*
-best explains the raw cable cloud while retaining the independent posterior
+best explains the accepted observation cloud while retaining the independent posterior
 probabilities:
 
 ```text
 score(k,l) = log w1(k) + log w2(l)
-             - lambda_union/(2 sigma^2) mean_y rho(
-                   min(d(y, X1(k))^2, d(y, X2(l))^2)).
+             - lambda_union/sigma^2 mean_y rho_H(
+                   min(d(y, X1(k)), d(y, X2(l)))).
+
+rho_H(r) = 0.5 r^2                         if r <= delta
+           delta (r - 0.5 delta)           otherwise.
 ```
 
 For one configured cable the same equation has one candidate index. This stage
 does not change weights, resample particles, couple motion models, or assign
 cloud points permanently. It only chooses the final representative(s) from
-already plausible particles. The runtime reports each selected rank, robust
-coverage RMS, covered fraction, and the signed gain relative to selecting both
-independent rank-1 particles.
+already plausible particles. Unlike the per-PF truncated path loss, Huber loss
+does not become flat: a legitimate distant loop continues to influence final
+selection, while one extreme point grows only linearly. The runtime reports
+each selected rank, unexplained-point RMS and maximum distance, Huber cost,
+covered fraction, and signed gain relative to independent rank-1 selection.
 
-The UI computes per-cloud-point proximity to each union-selected final estimate
-strictly for diagnostics. It does not assign points, remove measurements, or
-affect weights. PF1/PF2 support is magenta/cyan, support near both is orange,
-and unsupported points are gray.
+The UI has fixed semantic-overlay colors that do not depend on PF proximity:
+accepted NN cable observations are orange, observation-quality rejections are
+red, and crossing-head observations are blue. Ordinary scene points retain
+their original ZED RGB values.
+Invalid-depth rejected pixels can appear red in RGB but have no finite 3D point
+to draw. The PF cannot turn an accepted orange point gray.
 
 This formulation has an explicit identifiability limit: if two routes between
 the same endpoints have equal fixed length, equal endpoint tangents, and equal
@@ -176,8 +195,8 @@ local/endpoint/global proposal fractions are reported per PF. Press `P` to
 toggle this layer.
 Blue samples are lifted independently from the NN crossing mask. Post-estimate
 contact geometry is intentionally not computed. The RGB panel draws the two
-observed axes, each PF's assigned axis, projected closest point, pixel distance,
-angle error, and crossing reward.
+observed axis hypotheses, each PF's selected axis, projected closest point, centroid
+distance, angle error, two-sided continuation error, and crossing reward.
 
 The same layer draws the two measured inward endpoint tangents. Local RANSAC
 selects a narrow endpoint-connected directional consensus, PCA/eigendecomposition

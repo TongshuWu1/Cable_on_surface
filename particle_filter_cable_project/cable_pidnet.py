@@ -450,10 +450,12 @@ class PidNetCableDetector(CableMaskDetector):
         )
 
     def _detection_from_raw_mask(self, raw_mask):
-        mask, component_count = self.clean_mask(raw_mask)
+        mask, component_count, component_rejected, morphology_rejected = self.clean_mask(raw_mask)
         return CableDetection2D(
             mask=mask,
             component_count=component_count,
+            component_rejected_mask=component_rejected,
+            morphology_rejected_mask=morphology_rejected,
         )
 
 

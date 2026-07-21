@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import math
+import multiprocessing
 import statistics
 import threading
 
@@ -24,6 +25,7 @@ FEATURE_SPECS = (
     FeatureSpec("endpoint_mask_morphology", "Endpoint-mask morphology", "Preprocess"),
     FeatureSpec("endpoint_component_filter", "Endpoint component filter", "Preprocess"),
     FeatureSpec("depth_confidence_filter", "ZED confidence filter", "Preprocess"),
+    FeatureSpec("cable_spatial_outlier_filter", "3D spatial outlier filter", "Preprocess"),
     FeatureSpec("endpoint_association_support", "Endpoint support cost", "Observation"),
     FeatureSpec("pf_velocity", "Velocity transition", "Motion", ("particle_filter",)),
     FeatureSpec("pf_adaptive_motion", "Adaptive motion noise", "Motion", ("particle_filter",)),
@@ -62,13 +64,6 @@ FEATURE_SPECS = (
         ("particle_filter", "crossing_proposals"),
     ),
     FeatureSpec(
-        "point_support_coloring",
-        "Point support colors",
-        "Visualization",
-        ("particle_filter",),
-        algorithmic=False,
-    ),
-    FeatureSpec(
         "particle_diagnostics_overlay",
         "Particle diagnostics",
         "Visualization",
@@ -83,9 +78,6 @@ FEATURE_BY_KEY = {spec.key: spec for spec in FEATURE_SPECS}
 def minimal_baseline_state(initial_state):
     state = {key: False for key in FEATURE_BY_KEY}
     state["particle_filter"] = True
-    state["point_support_coloring"] = bool(
-        initial_state.get("point_support_coloring", True)
-    )
     state["particle_diagnostics_overlay"] = bool(
         initial_state.get("particle_diagnostics_overlay", True)
     )
@@ -136,6 +128,44 @@ def validate_feature_state(state):
                 missing.append(f"{spec.key} requires {dependency}")
     if missing:
         raise ValueError("Invalid ablation state: " + "; ".join(missing))
+
+
+def dependency_safe_feature_toggle(state, feature_key, enabled):
+    """Return the valid feature state produced by one explicit UI toggle.
+
+    Enabling a feature enables its required parents. Disabling a feature
+    disables every active dependent. This keeps dependencies visible in the
+    checkboxes while ensuring the Apply button can never submit a structurally
+    invalid feature combination.
+    """
+    if feature_key not in FEATURE_BY_KEY:
+        raise KeyError(f"Unknown ablation feature: {feature_key}")
+    candidate = {
+        key: bool(state.get(key, False))
+        for key in FEATURE_BY_KEY
+    }
+    candidate[feature_key] = bool(enabled)
+    if enabled:
+        pending = list(FEATURE_BY_KEY[feature_key].requires)
+        while pending:
+            dependency = pending.pop()
+            if candidate[dependency]:
+                continue
+            candidate[dependency] = True
+            pending.extend(FEATURE_BY_KEY[dependency].requires)
+    else:
+        changed = True
+        while changed:
+            changed = False
+            for spec in FEATURE_SPECS:
+                if candidate[spec.key] and any(
+                    not candidate[dependency]
+                    for dependency in spec.requires
+                ):
+                    candidate[spec.key] = False
+                    changed = True
+    validate_feature_state(candidate)
+    return candidate
 
 
 class RuntimeFeatureController:
@@ -444,194 +474,243 @@ def _json_default(value):
     raise TypeError(f"Cannot serialize {type(value).__name__}")
 
 
+def _run_feature_control_window(connection, initial_state):
+    """Run Tk in a dedicated process where it owns the process main thread."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    root = tk.Tk()
+    root.title("Cable Tracker Features")
+    root.geometry("500x760")
+    root.minsize(440, 560)
+
+    try:
+        ttk.Style(root).theme_use("vista")
+    except tk.TclError:
+        pass
+
+    outer = ttk.Frame(root, padding=16)
+    outer.pack(fill="both", expand=True)
+    ttk.Label(
+        outer,
+        text="Feature Controls",
+        font=("Segoe UI", 17, "bold"),
+    ).pack(anchor="w")
+    ttk.Label(
+        outer,
+        text="Turn features on or off, then click Apply. Applying resets both particle filters.",
+        wraplength=450,
+    ).pack(anchor="w", pady=(3, 12))
+
+    list_border = ttk.Frame(outer)
+    list_border.pack(fill="both", expand=True)
+    canvas = tk.Canvas(list_border, highlightthickness=0, borderwidth=0)
+    scrollbar = ttk.Scrollbar(list_border, orient="vertical", command=canvas.yview)
+    feature_frame = ttk.Frame(canvas, padding=(4, 2, 10, 10))
+    feature_window = canvas.create_window((0, 0), window=feature_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    feature_frame.bind(
+        "<Configure>",
+        lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+    )
+    canvas.bind(
+        "<Configure>",
+        lambda event: canvas.itemconfigure(feature_window, width=event.width),
+    )
+    canvas.bind_all(
+        "<MouseWheel>",
+        lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"),
+    )
+
+    current_state = {
+        key: bool(initial_state.get(key, False))
+        for key in FEATURE_BY_KEY
+    }
+    applied_state = dict(current_state)
+    variables = {
+        key: tk.BooleanVar(root, value=value)
+        for key, value in current_state.items()
+    }
+    checkbuttons = []
+    status_var = tk.StringVar(root, value="No unapplied changes")
+
+    footer = ttk.Frame(outer)
+    footer.pack(fill="x", pady=(12, 0))
+    ttk.Separator(footer).pack(fill="x", pady=(0, 10))
+    status_label = ttk.Label(footer, textvariable=status_var, wraplength=330)
+    status_label.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    apply_button = ttk.Button(footer, text="Apply")
+    apply_button.pack(side="right", ipadx=18, ipady=4)
+
+    def set_controls_enabled(enabled):
+        widget_state = "normal" if enabled else "disabled"
+        for widget in checkbuttons:
+            widget.configure(state=widget_state)
+        apply_button.configure(state=widget_state)
+
+    def show_pending_status(automatic_changes=0):
+        if current_state == applied_state:
+            status_var.set("No unapplied changes")
+            apply_button.configure(state="disabled")
+        else:
+            suffix = ""
+            if automatic_changes:
+                suffix = f" ({automatic_changes} dependencies adjusted)"
+            status_var.set("Changes ready" + suffix)
+            apply_button.configure(state="normal")
+
+    def toggle_feature(feature_key):
+        nonlocal current_state
+        requested = bool(variables[feature_key].get())
+        previous = dict(current_state)
+        current_state = dependency_safe_feature_toggle(
+            current_state,
+            feature_key,
+            requested,
+        )
+        for key, value in current_state.items():
+            variables[key].set(value)
+        automatic_changes = sum(
+            previous[key] != current_state[key]
+            for key in current_state
+            if key != feature_key
+        )
+        show_pending_status(automatic_changes)
+
+    last_group = None
+    for spec in FEATURE_SPECS:
+        if spec.group != last_group:
+            ttk.Label(
+                feature_frame,
+                text=spec.group,
+                font=("Segoe UI", 10, "bold"),
+            ).pack(anchor="w", pady=(12 if last_group is not None else 4, 3))
+            last_group = spec.group
+        checkbox = ttk.Checkbutton(
+            feature_frame,
+            text=spec.label,
+            variable=variables[spec.key],
+            command=lambda key=spec.key: toggle_feature(key),
+        )
+        checkbox.pack(anchor="w", fill="x", pady=2)
+        checkbuttons.append(checkbox)
+
+    def apply_state():
+        set_controls_enabled(False)
+        status_var.set("Applying...")
+        try:
+            connection.send({"type": "apply", "features": dict(current_state)})
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            set_controls_enabled(True)
+            status_var.set(f"Tracker connection lost: {exc}")
+
+    apply_button.configure(command=apply_state, state="disabled")
+
+    def poll_connection():
+        nonlocal applied_state
+        try:
+            while connection.poll():
+                message = connection.recv()
+                message_type = message.get("type")
+                if message_type == "shutdown":
+                    root.destroy()
+                    return
+                if message_type != "apply_result":
+                    continue
+                set_controls_enabled(True)
+                if message.get("ok"):
+                    applied_state = dict(message["features"])
+                    status_var.set(
+                        f"Applied revision {message['revision']} - particle filters reset"
+                    )
+                    apply_button.configure(state="disabled")
+                else:
+                    status_var.set(f"Could not apply: {message.get('error', 'unknown error')}")
+        except (BrokenPipeError, EOFError, OSError):
+            root.destroy()
+            return
+        root.after(50, poll_connection)
+
+    def close_window():
+        try:
+            connection.close()
+        finally:
+            root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_window)
+    root.after(50, poll_connection)
+    root.mainloop()
+
+
 class AblationControlPanel:
-    """Small independent Tk window for explicit, resettable live ablations."""
+    """Process-isolated feature switches connected to a runtime controller."""
 
     def __init__(self, controller):
         self.controller = controller
-        self._thread = threading.Thread(target=self._run, name="pf-ablation-ui", daemon=True)
-        self._stop = threading.Event()
-        self._root = None
+        self._process = None
+        self._connection = None
 
     def start(self):
-        self._thread.start()
+        if self._process is not None and self._process.is_alive():
+            return
+        context = multiprocessing.get_context("spawn")
+        parent_connection, child_connection = context.Pipe(duplex=True)
+        process = context.Process(
+            target=_run_feature_control_window,
+            args=(child_connection, self.controller.snapshot()["features"]),
+            name="pf-feature-ui",
+            daemon=True,
+        )
+        process.start()
+        child_connection.close()
+        self._connection = parent_connection
+        self._process = process
+
+    def poll(self):
+        connection = self._connection
+        if connection is None:
+            return
+        try:
+            while connection.poll():
+                message = connection.recv()
+                if message.get("type") != "apply":
+                    continue
+                state = message.get("features", {})
+                try:
+                    revision = self.controller.apply(state, reset_filter=True)
+                    response = {
+                        "type": "apply_result",
+                        "ok": True,
+                        "revision": revision,
+                        "features": dict(state),
+                    }
+                except Exception as exc:
+                    response = {
+                        "type": "apply_result",
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                connection.send(response)
+        except (BrokenPipeError, EOFError, OSError):
+            connection.close()
+            self._connection = None
 
     def close(self):
-        self._stop.set()
-        self._thread.join(timeout=2.0)
-
-    def _run(self):
-        import tkinter as tk
-        from tkinter import messagebox, ttk
-
-        root = tk.Tk()
-        self._root = root
-        root.title("Cable PF Ablation Control")
-        root.geometry("620x820")
-        root.minsize(560, 620)
-
-        outer = ttk.Frame(root, padding=12)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(
-            outer,
-            text="Research Ablation Control",
-            font=("Segoe UI", 16, "bold"),
-        ).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Changes apply together and reset the PF so posterior history does not contaminate comparisons.",
-            wraplength=570,
-        ).pack(anchor="w", pady=(2, 10))
-
-        variables = {
-            key: tk.BooleanVar(value=value)
-            for key, value in self.controller.snapshot()["features"].items()
-        }
-        notebook = ttk.Notebook(outer)
-        notebook.pack(fill="both", expand=True)
-        groups = {}
-        for spec in FEATURE_SPECS:
-            frame = groups.get(spec.group)
-            if frame is None:
-                frame = ttk.Frame(notebook, padding=10)
-                notebook.add(frame, text=spec.group)
-                groups[spec.group] = frame
-            text = spec.label
-            if spec.requires:
-                text += "  [requires " + ", ".join(
-                    FEATURE_BY_KEY[key].label for key in spec.requires
-                ) + "]"
-            ttk.Checkbutton(frame, text=text, variable=variables[spec.key]).pack(anchor="w", pady=3)
-
-        controls = ttk.Frame(outer)
-        controls.pack(fill="x", pady=(10, 4))
-        status_var = tk.StringVar(value="Configured state loaded")
-
-        def load_state(state, message):
-            for key, value in state.items():
-                variables[key].set(bool(value))
-            status_var.set(message)
-
-        def apply_state():
-            state = {key: variable.get() for key, variable in variables.items()}
+        connection = self._connection
+        process = self._process
+        if connection is not None:
             try:
-                revision = self.controller.apply(state, reset_filter=True)
-            except Exception as exc:
-                messagebox.showerror("Invalid ablation", str(exc), parent=root)
-                return
-            status_var.set(f"Applied revision {revision}; PF reset requested")
-
-        ttk.Button(controls, text="Apply + reset PF", command=apply_state).pack(side="left")
-        ttk.Button(
-            controls,
-            text="Configured",
-            command=lambda: load_state(self.controller.initial_state, "Configured preset loaded; press Apply"),
-        ).pack(side="left", padx=6)
-        ttk.Button(
-            controls,
-            text="Minimal baseline",
-            command=lambda: load_state(
-                minimal_baseline_state(self.controller.initial_state),
-                "Minimal baseline loaded; press Apply",
-            ),
-        ).pack(side="left")
-
-        isolation = ttk.Frame(outer)
-        isolation.pack(fill="x", pady=4)
-        algorithm_specs = [
-            spec for spec in FEATURE_SPECS
-            if spec.algorithmic and spec.key != "particle_filter"
-        ]
-        algorithm_labels = [spec.label for spec in algorithm_specs]
-        key_by_label = {spec.label: spec.key for spec in algorithm_specs}
-        isolated_var = tk.StringVar(value=algorithm_labels[0])
-        ttk.Label(isolation, text="Isolate:").pack(side="left")
-        ttk.Combobox(
-            isolation,
-            textvariable=isolated_var,
-            values=algorithm_labels,
-            state="readonly",
-            width=31,
-        ).pack(side="left", padx=6)
-        ttk.Button(
-            isolation,
-            text="Load isolated preset",
-            command=lambda: load_state(
-                isolated_feature_state(
-                    self.controller.initial_state,
-                    key_by_label[isolated_var.get()],
-                ),
-                f"Isolated {isolated_var.get()} with explicit dependencies; press Apply",
-            ),
-        ).pack(side="left")
-
-        leave_out = ttk.Frame(outer)
-        leave_out.pack(fill="x", pady=4)
-        leave_out_var = tk.StringVar(value=algorithm_labels[0])
-        ttk.Label(leave_out, text="Remove:").pack(side="left")
-        ttk.Combobox(
-            leave_out,
-            textvariable=leave_out_var,
-            values=algorithm_labels,
-            state="readonly",
-            width=31,
-        ).pack(side="left", padx=6)
-        ttk.Button(
-            leave_out,
-            text="Load leave-one-out",
-            command=lambda: load_state(
-                leave_one_out_state(
-                    self.controller.initial_state,
-                    key_by_label[leave_out_var.get()],
-                ),
-                f"Removed {leave_out_var.get()} and required dependents; press Apply",
-            ),
-        ).pack(side="left")
-
-        recording_var = tk.BooleanVar(value=False)
-
-        def toggle_recording():
-            self.controller.set_recording(recording_var.get())
-            status_var.set("Recording enabled" if recording_var.get() else "Recording stopped")
-
-        ttk.Checkbutton(
-            outer,
-            text="Record self-describing JSONL experiment",
-            variable=recording_var,
-            command=toggle_recording,
-        ).pack(anchor="w", pady=(8, 2))
-        metrics_var = tk.StringVar(value="Waiting for live diagnostics")
-        ttk.Label(outer, textvariable=metrics_var, justify="left", font=("Consolas", 10)).pack(
-            fill="x", pady=(8, 2)
-        )
-        ttk.Label(outer, textvariable=status_var, foreground="#2060a0", wraplength=570).pack(
-            fill="x", pady=(4, 0)
-        )
-
-        def refresh():
-            if self._stop.is_set():
-                root.destroy()
-                return
-            snapshot = self.controller.snapshot()
-            metrics = snapshot["metrics"]
-            lines = [f"revision={snapshot['revision']}  recording={int(snapshot['recording'])}"]
-            for key in (
-                "tracking_fps",
-                "filter_ms",
-                "effective_sample_size",
-                "path_support_rms_m",
-                "estimate_temporal_delta_m",
-                "mean_node_spread_m",
-                "crossing_reward",
-                "crossing_distance_px",
-                "crossing_angle_error_deg",
-            ):
-                if key in metrics:
-                    lines.append(f"{key}={metrics[key]}")
-            metrics_var.set("\n".join(lines))
-            root.after(250, refresh)
-
-        root.protocol("WM_DELETE_WINDOW", root.withdraw)
-        root.after(250, refresh)
-        root.mainloop()
-        self._root = None
+                connection.send({"type": "shutdown"})
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        if process is not None:
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+        if connection is not None:
+            connection.close()
+        self._connection = None
+        self._process = None

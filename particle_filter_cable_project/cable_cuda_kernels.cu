@@ -237,3 +237,88 @@ extern "C" __global__ void gather_indexed_points_kernel(
         output[3 * output_index + 2] = nanf("");
     }
 }
+
+// Observation gather status values. Keep these synchronized with cable_cuda.py.
+// The raw XYZ value is retained whenever the ZED buffer contains finite values,
+// even when the sample is rejected by range or confidence filtering.
+extern "C" __global__ void gather_indexed_observations_kernel(
+    const unsigned char* point_cloud,
+    int point_step_bytes,
+    const long long* pixel_indices,
+    const unsigned char* confidence,
+    int confidence_step_bytes,
+    float* output,
+    int* status,
+    int width,
+    int candidate_count,
+    float depth_min,
+    float depth_max,
+    float max_confidence,
+    int use_confidence
+) {
+    const int output_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (output_index >= candidate_count) {
+        return;
+    }
+    const long long pixel = pixel_indices[output_index];
+    const int y = pixel / width;
+    const int x = pixel - y * width;
+    const float* point = reinterpret_cast<const float*>(point_cloud + y * point_step_bytes) + 4 * x;
+    const float px = point[0];
+    const float py = point[1];
+    const float pz = point[2];
+    output[3 * output_index] = px;
+    output[3 * output_index + 1] = py;
+    output[3 * output_index + 2] = pz;
+
+    if (!(isfinite(px) && isfinite(py) && isfinite(pz))) {
+        status[output_index] = 1;
+        return;
+    }
+    const float distance = sqrtf(px * px + py * py + pz * pz);
+    if (!(distance >= depth_min && distance <= depth_max)) {
+        status[output_index] = 2;
+        return;
+    }
+    if (use_confidence != 0) {
+        const float* confidence_row = reinterpret_cast<const float*>(confidence + y * confidence_step_bytes);
+        const float value = confidence_row[x];
+        if (!(isfinite(value) && value <= max_confidence)) {
+            status[output_index] = 3;
+            return;
+        }
+    }
+    status[output_index] = 0;
+}
+
+extern "C" __global__ void radius_neighbor_inlier_kernel(
+    const float* points,
+    unsigned char* inlier,
+    int point_count,
+    float radius_squared,
+    int minimum_neighbors
+) {
+    const int point_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (point_index >= point_count) {
+        return;
+    }
+    const float px = points[3 * point_index];
+    const float py = points[3 * point_index + 1];
+    const float pz = points[3 * point_index + 2];
+    int neighbor_count = 0;
+    for (int other_index = 0; other_index < point_count; ++other_index) {
+        if (other_index == point_index) {
+            continue;
+        }
+        const float dx = px - points[3 * other_index];
+        const float dy = py - points[3 * other_index + 1];
+        const float dz = pz - points[3 * other_index + 2];
+        if (dx * dx + dy * dy + dz * dz <= radius_squared) {
+            ++neighbor_count;
+            if (neighbor_count >= minimum_neighbors) {
+                break;
+            }
+        }
+    }
+    inlier[point_index] = static_cast<unsigned char>(neighbor_count >= minimum_neighbors);
+}

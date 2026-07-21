@@ -67,6 +67,53 @@ def initialized_cpu_filter(particles, *, weights=None, tangents=None):
 
 class IndependentCableMeasurementTests(unittest.TestCase):
 
+    @staticmethod
+    def _stationary_measurement():
+        endpoints = np.asarray(((-0.10, 0.0, 1.0), (0.10, 0.0, 1.0)), dtype=np.float32)
+        return CableEstimate3D(
+            points_xyz=np.empty((0, 3), dtype=np.float32),
+            source_points=np.linspace(endpoints[0], endpoints[1], 80, dtype=np.float32),
+            residual_m=0.0,
+            method="velocity ablation test",
+            endpoint_nodes=endpoints,
+        )
+
+    def test_cpu_transition_without_velocity_keeps_velocity_state_absent(self):
+        config = CableParticleFilterConfig(
+            particle_count=32,
+            segment_length_m=0.05,
+            scoring_backend="cpu",
+            velocity_enabled=False,
+            endpoint_constraint_iterations=32,
+        )
+        particle_filter = CableParticleFilter(5, config, seed=17)
+        measurement = self._stationary_measurement()
+
+        particle_filter.step(measurement)
+        result = particle_filter.step(measurement)
+
+        self.assertIsNone(particle_filter.node_velocities)
+        self.assertTrue(result.measurement_used)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for velocity-ablation validation")
+    def test_cuda_transition_without_velocity_keeps_velocity_state_absent(self):
+        config = CableParticleFilterConfig(
+            particle_count=32,
+            segment_length_m=0.05,
+            scoring_backend="cuda",
+            velocity_enabled=False,
+            endpoint_constraint_iterations=32,
+        )
+        particle_filter = CableParticleFilter(5, config, seed=17)
+        measurement = self._stationary_measurement()
+
+        particle_filter.step(measurement)
+        result = particle_filter.step(measurement)
+        particle_filter.cuda_stream.synchronize()
+
+        self.assertIsNone(particle_filter.node_velocities)
+        self.assertTrue(result.measurement_used)
+
     def test_distant_points_from_the_other_cable_do_not_change_path_likelihood(self):
         supported = np.asarray((
             (-0.10, 0.0, 1.0),

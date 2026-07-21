@@ -15,6 +15,7 @@ cable_component_filter = true
 endpoint_mask_morphology = true
 endpoint_component_filter = true
 depth_confidence_filter = true
+cable_spatial_outlier_filter = true
 endpoint_association_support = true
 velocity_prediction = true
 adaptive_motion_noise = true
@@ -32,7 +33,6 @@ union_coverage_selection = true
 bend_regularization = false
 crossing_proposals = true
 crossing_likelihood = true
-point_support_coloring = true
 particle_diagnostics_overlay = true
 
 [camera]
@@ -121,6 +121,11 @@ min_axis_separation_deg = 25.0
 min_axis_support_px = 12
 position_sigma_px = 14.0
 angle_sigma_deg = 20.0
+# Test the assigned image axis on both sides of the crossing.  This prevents a
+# particle from receiving a strong reward for touching the centroid and then
+# leaving on the other cable's branch.
+continuation_offset_px = 18.0
+continuation_sigma_px = 8.0
 # Maximum additive log-weight reward for one perfectly aligned crossing target.
 log_reward = 4.0
 
@@ -169,6 +174,13 @@ max_visual_points = 4000
 # ZED confidence max for accepted cable depth samples. Use a negative value to
 # disable confidence filtering.
 confidence_max = 90.0
+
+[observation_outliers]
+# Conservative observation-only 3D filter. A sampled cable point must have at
+# least this many other sampled cable points inside the physical radius. This
+# stage never reads endpoints, particles, weights, or prior estimates.
+radius_m = 0.015
+min_neighbors = 2
 
 [particle_filter]
 # RTX 4080 profile. PF1 and PF2 retain independent states, weights, ancestors,
@@ -257,6 +269,9 @@ path_support_samples_per_segment = 5
 # cable cloud. This does not change weights or couple populations/motion models.
 union_coverage_top_particles = 30
 union_coverage_weight = 1.0
+# Quadratic-to-linear transition for observation-to-union Huber distance.
+# Unlike robust_distance_m above, this loss never becomes flat.
+union_huber_delta_m = 0.03
 
 # Bend penalty is off so tight measured cable bends can be followed. Fixed
 # segment lengths, endpoints, and raw support points provide the constraints.

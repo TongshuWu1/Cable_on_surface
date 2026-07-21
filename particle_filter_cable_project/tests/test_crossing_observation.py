@@ -72,7 +72,7 @@ class CrossingObservationTests(unittest.TestCase):
         self.assertGreater(float(np.max(alignments)), 0.95)
         self.assertLess(float(np.min(alignments)), 0.15)
 
-    def test_axes_are_assigned_to_independent_pfs_from_previous_projections(self):
+    def test_both_latent_axes_are_given_to_each_independent_pf(self):
         proposal = estimate_crossing_axes((self._proposal(),), self._x_mask())[0]
         intrinsics = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=60.0)
         horizontal = np.asarray([[-0.4, 0.0, 1.0], [0.4, 0.0, 1.0]], dtype=np.float32)
@@ -81,13 +81,15 @@ class CrossingObservationTests(unittest.TestCase):
         targets = assign_crossing_targets(
             (proposal,),
             (horizontal, vertical),
-            (horizontal, vertical),
             intrinsics,
         )
 
-        self.assertEqual([len(items) for items in targets], [1, 1])
-        self.assertGreater(abs(float(targets[0][0].axis_xy[0])), 0.95)
-        self.assertGreater(abs(float(targets[1][0].axis_xy[1])), 0.95)
+        self.assertEqual([len(items) for items in targets], [2, 2])
+        for cable_targets in targets:
+            horizontal_alignment = [abs(float(target.axis_xy[0])) for target in cable_targets]
+            vertical_alignment = [abs(float(target.axis_xy[1])) for target in cable_targets]
+            self.assertGreater(max(horizontal_alignment), 0.95)
+            self.assertGreater(max(vertical_alignment), 0.95)
 
     def test_zed_negative_z_camera_coordinates_project_in_front_of_camera(self):
         intrinsics = CameraIntrinsics(
@@ -114,10 +116,31 @@ class CrossingObservationTests(unittest.TestCase):
         targets = assign_crossing_targets(
             (proposal,),
             (horizontal,),
-            (horizontal,),
             intrinsics,
         )
-        self.assertEqual(len(targets[0]), 1)
+        self.assertEqual(len(targets[0]), 2)
+
+    def test_alternative_axes_of_one_crossing_are_not_double_counted(self):
+        intrinsics = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=60.0)
+        targets = (
+            CrossingProjectionTarget(1, np.asarray([80, 60], np.float32), np.asarray([1, 0], np.float32), 1.0),
+            CrossingProjectionTarget(1, np.asarray([80, 60], np.float32), np.asarray([0, 1], np.float32), 1.0),
+        )
+        particles = np.asarray([
+            [[-0.4, 0.0, 1.0], [0.0, 0.0, 1.0], [0.4, 0.0, 1.0]],
+            [[0.0, -0.4, 1.0], [0.0, 0.0, 1.0], [0.0, 0.4, 1.0]],
+        ], dtype=np.float32)
+
+        reward, *_rest = particle_crossing_rewards(
+            particles,
+            targets,
+            intrinsics,
+            position_sigma_px=14.0,
+            angle_sigma_deg=20.0,
+            continuation_sigma_px=8.0,
+        )
+
+        np.testing.assert_allclose(reward, [1.0, 1.0], atol=1e-5)
 
     def test_reward_prefers_particles_that_pass_through_with_the_right_angle(self):
         intrinsics = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=60.0)
@@ -133,12 +156,13 @@ class CrossingObservationTests(unittest.TestCase):
             [[0.0, -0.4, 1.0], [0.0, 0.0, 1.0], [0.0, 0.4, 1.0]],
         ], dtype=np.float32)
 
-        reward, distance, angle, closest, _target_index = particle_crossing_rewards(
+        reward, distance, angle, continuation, closest, _target_index = particle_crossing_rewards(
             particles,
             (target,),
             intrinsics,
             position_sigma_px=14.0,
             angle_sigma_deg=20.0,
+            continuation_sigma_px=8.0,
         )
 
         self.assertGreater(reward[0], 0.99)
@@ -146,7 +170,36 @@ class CrossingObservationTests(unittest.TestCase):
         self.assertGreater(reward[0], reward[2])
         self.assertAlmostEqual(distance[0], 0.0, places=5)
         self.assertAlmostEqual(angle[0], 0.0, places=5)
+        self.assertAlmostEqual(continuation[0], 0.0, places=5)
         np.testing.assert_allclose(closest[0], [80.0, 60.0], atol=1e-5)
+
+    def test_two_sided_reward_rejects_a_particle_that_turns_onto_the_other_branch(self):
+        intrinsics = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=60.0)
+        target = CrossingProjectionTarget(
+            proposal_id=1,
+            centroid_xy=np.asarray([80.0, 60.0], dtype=np.float32),
+            axis_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+            confidence=1.0,
+            continuation_offset_px=18.0,
+        )
+        particles = np.asarray([
+            [[-0.4, 0.0, 1.0], [0.0, 0.0, 1.0], [0.4, 0.0, 1.0]],
+            [[-0.4, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.4, 1.0]],
+        ], dtype=np.float32)
+
+        reward, distance, angle, continuation, *_rest = particle_crossing_rewards(
+            particles,
+            (target,),
+            intrinsics,
+            position_sigma_px=14.0,
+            angle_sigma_deg=20.0,
+            continuation_sigma_px=8.0,
+        )
+
+        self.assertAlmostEqual(distance[1], 0.0, places=5)
+        self.assertAlmostEqual(angle[1], 0.0, places=5)
+        self.assertGreater(continuation[1], 10.0)
+        self.assertGreater(reward[0], 4.0 * reward[1])
 
     def test_reward_uses_projection_only_and_does_not_compare_depths(self):
         intrinsics = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=60.0)
@@ -167,6 +220,7 @@ class CrossingObservationTests(unittest.TestCase):
             intrinsics,
             position_sigma_px=14.0,
             angle_sigma_deg=20.0,
+            continuation_sigma_px=8.0,
         )
 
         np.testing.assert_allclose(reward, [1.0, 1.0], atol=1e-6)
@@ -204,6 +258,7 @@ class CrossingObservationTests(unittest.TestCase):
         self.assertGreater(result.crossing_reward, 0.99)
         self.assertAlmostEqual(result.crossing_distance_px, 0.0, places=5)
         self.assertAlmostEqual(result.crossing_angle_error_deg, 0.0, places=5)
+        self.assertAlmostEqual(result.crossing_continuation_error_px, 0.0, places=5)
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA unavailable")
     def test_cuda_crossing_geometry_matches_cpu_batch(self):
@@ -214,10 +269,16 @@ class CrossingObservationTests(unittest.TestCase):
         intrinsics = CameraIntrinsics(fx=700.0, fy=700.0, cx=640.0, cy=360.0)
         targets = (
             CrossingProjectionTarget(1, np.asarray([640, 360], np.float32), np.asarray([1, 0], np.float32), 0.9),
+            CrossingProjectionTarget(1, np.asarray([640, 360], np.float32), np.asarray([0, 1], np.float32), 0.9),
             CrossingProjectionTarget(2, np.asarray([600, 330], np.float32), np.asarray([0.6, 0.8], np.float32), 0.8),
         )
         cpu = particle_crossing_rewards(
-            particles, targets, intrinsics, position_sigma_px=14, angle_sigma_deg=20
+            particles,
+            targets,
+            intrinsics,
+            position_sigma_px=14,
+            angle_sigma_deg=20,
+            continuation_sigma_px=8,
         )
         gpu = particle_crossing_rewards_torch(
             torch.as_tensor(particles, device="cuda"),
@@ -225,13 +286,15 @@ class CrossingObservationTests(unittest.TestCase):
             intrinsics,
             position_sigma_px=14,
             angle_sigma_deg=20,
+            continuation_sigma_px=8,
         )
 
         np.testing.assert_allclose(gpu[0].cpu().numpy(), cpu[0], atol=2e-6, rtol=2e-5)
         np.testing.assert_allclose(gpu[1].cpu().numpy(), cpu[1], atol=1e-3, rtol=1e-4)
         np.testing.assert_allclose(gpu[2].cpu().numpy(), cpu[2], atol=0.02, rtol=1e-4)
         np.testing.assert_allclose(gpu[3].cpu().numpy(), cpu[3], atol=1e-3, rtol=1e-4)
-        np.testing.assert_array_equal(gpu[4].cpu().numpy(), cpu[4])
+        np.testing.assert_allclose(gpu[4].cpu().numpy(), cpu[4], atol=1e-3, rtol=1e-4)
+        np.testing.assert_array_equal(gpu[5].cpu().numpy(), cpu[5])
 
 
 if __name__ == "__main__":
